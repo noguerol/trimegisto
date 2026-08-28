@@ -1,3 +1,9 @@
+<div align="center">
+
+![Trimegisto banner](docs/banner.png)
+
+</div>
+
 # Trimegisto — Multi-Agent Orchestration for pi
 
 Trimegisto turns pi into a multi-agent runtime. It launches **parallel sub-agent processes** organized in four tiers, lets you (or the main LLM) delegate work to them, and keeps the whole swarm under control with a loop supervisor, advisory file locks, a context broker and a live dashboard — without ever replacing pi's native UI.

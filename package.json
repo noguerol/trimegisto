@@ -1,6 +1,6 @@
 {
   "name": "trimegisto",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Multi-agent orchestration for pi: parallel sub-agents in tiers (active/t1/t2/t3), @mention steering, loop supervisor, advisory file locks, context broker and a live dashboard. Installs as a pi package with one extension + three tier skills.",
   "keywords": [
     "pi-package",
@@ -26,7 +26,8 @@
     ],
     "skills": [
       "./agents"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/noguerol/trimegisto/main/docs/preview.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
