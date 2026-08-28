@@ -1,0 +1,55 @@
+{
+  "_note": "EXAMPLE ONLY — Trimegisto does not read this file. The real config is created automatically at ~/.pi/agent/trimegisto/config.json (or via /tmg-config). Copy the structure below to that file if you want to pre-configure tiers. Model values are placeholders: use any 'provider/model' id from your pi model registry, or point at a local server (ollama, vLLM, LM Studio, llama.cpp, ...) as a custom provider.",
+  "active": {
+    "model": "",
+    "tools": ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn"],
+    "extraArgs": [],
+    "maxParallel": 4,
+    "compactionThreshold": 85,
+    "enabled": true,
+    "redundantModels": []
+  },
+  "t1": {
+    "model": "anthropic/claude-opus-4-20250514",
+    "tools": ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn"],
+    "extraArgs": [],
+    "maxParallel": 1,
+    "compactionThreshold": 65,
+    "enabled": true,
+    "redundantModels": []
+  },
+  "t2": {
+    "model": "anthropic/claude-sonnet-4-20250514",
+    "tools": ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn"],
+    "extraArgs": [],
+    "maxParallel": 4,
+    "compactionThreshold": 75,
+    "enabled": true,
+    "redundantModels": []
+  },
+  "t3": {
+    "model": "anthropic/claude-haiku-4-5",
+    "tools": ["read", "bash", "grep", "find", "ls", "trimegisto_spawn"],
+    "extraArgs": [],
+    "maxParallel": 4,
+    "compactionThreshold": 85,
+    "enabled": true,
+    "redundantModels": []
+  },
+  "enabled": true,
+  "autoSpawn": true,
+  "useActiveModel": true,
+  "spawnOnlyOnActive": false,
+  "redundantAgents": false,
+  "dashboardVisible": true,
+  "loopSupervisor": {
+    "enabled": true,
+    "maxRepeatedOutputs": 3,
+    "maxSpawnDepth": 5,
+    "maxAgentTurns": 50,
+    "turnLimitGrace": 15,
+    "tierCooldownMs": 60000,
+    "similarityThreshold": 0.92,
+    "minRepeatableOutputChars": 80
+  }
+}
