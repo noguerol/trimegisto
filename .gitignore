@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Personal config (if ever created inside the repo)
+config.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+
+# Local pi project config
+.pi/
