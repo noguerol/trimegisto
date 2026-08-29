@@ -222,7 +222,7 @@ Inspect with `/tmg loops`, tune with `/tmg loops sensitivity <0.5..1>` (higher =
 - **IPC** — sub-agents write spawn requests as JSON files; the main extension polls (500 ms), launches, and writes response files. All communication lives under a **per-instance directory** (`~/.pi/agent/trimegisto/instances/pid-<pid>-<ts>/`), so multiple pi processes running Trimegisto at the same time never interfere.
 - **Auto-spawn** — with `autoSpawn` on, agents can spawn other agents via `trimegisto_spawn` (batch mode preferred: `{tasks: [...]}` runs everything in parallel). Spawning is **non-blocking** (async polling, no frozen process) and depth/cooldown-limited by the supervisor.
 - **File locks** — advisory, 60 s stale timeout. Agents call `file_lock` before write/edit and `file_unlock` after; conflicts return the lock owner so agents can wait or move on. Locks are released automatically when an agent finishes, is killed or halted. Inspect with `/tmg locks`.
-- **Context broker** — when an agent modifies a file, other agents that previously read it (via `file_read_track`) get a system message: "⚠️ Context Invalidation: `x.ts` was modified by `t3a` — re-read before changing it."
+- **Context broker** — when an agent modifies a file, other agents that previously read it (via `file_read_track`) get a compact system alert: "⚠️ Stale file: `x.ts` changed by `t3a` — re-read before editing."
 - **Proactive compaction** — Trimegisto watches the **main session's** context usage and triggers pi compaction proactively when it crosses the lowest enabled tier threshold (60 s cooldown), so long orchestration sessions stay under the limit.
 - **Failover** — with `redundantAgents` on, t1/t2 spawn on the least-loaded model of their pool; if a model/provider fails before doing real work (429/quota/overload, no first response in 2 min, spawn error), the same agent ID is retried on the next pool model.
 
@@ -244,7 +244,11 @@ Orphan instance directories from dead pi processes are cleaned up on every start
 
 ## The Three Tier Skills
 
-The package ships `agents/t1.md`, `t2.md`, `t3.md` as pi skills. They teach the main LLM each tier's role, its cost-optimization rules ("T1 plans, T2 solves, T3 executes — never cross roles") and the batch-spawn etiquette, so delegation quality is high even with a model that has never seen Trimegisto before.
+The package ships compact `agents/t1.md`, `t2.md`, `t3.md` skills. They teach each tier's role, cost discipline ("T1 plans, T2 solves, T3 executes") and batch-spawn etiquette without adding long prompt payloads.
+
+## Load Footprint
+
+The extension keeps startup lean: `src/index.ts` registers public commands/tools immediately, while command handlers, the dashboard renderer and `/tmg-config` UI are lazy-loaded on first use. Runtime strings and tier skill prompts are intentionally compact; keep long explanations in this README, not in loaded prompt/tool metadata.
 
 ## Package Structure
 
@@ -253,7 +257,7 @@ trimegisto/
 ├── package.json            # pi manifest: 1 extension + 3 skills, peer deps on pi core
 ├── config.example.json     # template for ~/.pi/agent/trimegisto/config.json
 ├── src/
-│   ├── index.ts                # main extension: tool, commands, dashboard, lifecycle
+│   ├── index.ts                # startup shell: tool, lifecycle, lazy command/UI hooks
 │   ├── agent-manager.ts        # spawn/track/kill, model pools, failover
 │   ├── subagent-extension.ts   # injected into every sub-agent process
 │   ├── loop-supervisor.ts      # loop detection, strikes, cooldowns
@@ -261,8 +265,9 @@ trimegisto/
 │   ├── context-broker.ts       # cross-agent file-change notifications
 │   ├── ipc.ts                  # file-based request/response IPC
 │   ├── config.ts               # tier config + agent-file discovery
-│   ├── dashboard.ts            # TUI status line + widgets
-│   ├── commands.ts             # /tmg*, /t0..t3, @mention, shortcut
+│   ├── dashboard.ts            # lazy TUI status line + widgets
+│   ├── commands.ts             # lazy /tmg*, /t0..t3, @mention, shortcut handlers
+│   ├── config-ui.ts            # lazy /tmg-config UI
 │   └── types.ts
 ├── agents/
 │   ├── t1.md  t2.md  t3.md     # tier skills
