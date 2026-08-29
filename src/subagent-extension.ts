@@ -283,8 +283,7 @@ function pollContextAlerts(agentId: string): ContextAlert[] {
         filePath: notif.filePath,
         modifiedBy: notif.modifiedBy,
         timestamp: notif.timestamp,
-        message: `⚠️ **Context Invalidation**: \`${path.basename(notif.filePath)}\` was modified by agent \`${notif.modifiedBy}\` (${notif.operation}). ` +
-          `Your knowledge of this file may be stale — re-read it before making further changes.`,
+        message: `⚠️ Stale file: \`${path.basename(notif.filePath)}\` changed by \`${notif.modifiedBy}\` (${notif.operation}). Re-read before editing.`,
       });
       processed.push(notif.notificationId);
     } catch { /* corrupt */ }
@@ -302,47 +301,47 @@ function pollContextAlerts(agentId: string): ContextAlert[] {
 // ── Registered tools ──────────────────────────────────────
 
 const TierEnum = StringEnum(["active", "t1", "t2", "t3"] as const, {
-  description: "Type of agent to spawn. DEFAULT: 'active' (same model as main session). T2=solver, T3=worker, T1=deep thinking only.",
+  description: "Tier. Default active. T3 work, T2 solve, T1 plan.",
 });
 
 /** Single spawn task (kept for backward compatibility in arrays) */
 const SpawnTaskItem = Type.Object({
   tier: Type.Optional(TierEnum),
-  task: Type.String({ description: "Clear, specific task description for the agent to execute" }),
-  cwd: Type.Optional(Type.String({ description: "Working directory (defaults to current)" })),
+  task: Type.String({ description: "Agent task" }),
+  cwd: Type.Optional(Type.String({ description: "Agent cwd" })),
 });
 
 /** Legacy single-task params (kept for backward compatibility) */
 const SpawnParams = Type.Object({
   tier: TierEnum,
-  task: Type.String({ description: "Clear, specific task description for the agent to execute" }),
-  cwd: Type.Optional(Type.String({ description: "Working directory (defaults to current)" })),
+  task: Type.String({ description: "Agent task" }),
+  cwd: Type.Optional(Type.String({ description: "Agent cwd" })),
 });
 
 /** Array-based spawn params (preferred — allows parallel spawning) */
 const SpawnBatchParams = Type.Object({
   tasks: Type.Array(SpawnTaskItem, {
-    description: "Array of tasks to spawn. Use this to launch multiple sub-agents in parallel.",
+    description: "Spawn tasks. Batch for parallelism.",
     minItems: 1,
   }),
-  cwd: Type.Optional(Type.String({ description: "Working directory for all tasks (defaults to current)" })),
+  cwd: Type.Optional(Type.String({ description: "Shared cwd" })),
 });
 
 const LockOpEnum = StringEnum(["write", "edit", "bash"] as const, {
-  description: "The type of file operation you are about to perform.",
+  description: "Operation type.",
 });
 
 const FileLockParams = Type.Object({
-  file_path: Type.String({ description: "Path to the file you want to lock for writing" }),
+  file_path: Type.String({ description: "File path" }),
   operation: LockOpEnum,
 });
 
 const FileUnlockParams = Type.Object({
-  lock_id: Type.String({ description: "The lock ID returned by file_lock" }),
+  lock_id: Type.String({ description: "Lock ID" }),
 });
 
 const FileReadTrackParams = Type.Object({
-  file_path: Type.String({ description: "Path to the file you just read" }),
+  file_path: Type.String({ description: "Read file path" }),
 });
 
 // ── Extension entry point ─────────────────────────────────
@@ -360,25 +359,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "trimegisto_spawn",
     label: "Trimegisto Spawn",
-    description: [
-      "Spawn one or more Trimegisto sub-agents to handle tasks. NON-BLOCKING: agents run in parallel.",
-      "",
-      "BY DEFAULT spawned agents use the ACTIVE pi model (tier 'active', useActiveModel=true),",
-      "so parallel agents share the same local server and its speculative-decoding pool",
-      "(ngram/MTP batching). Spawn as many 'active' agents as the task allows.",
-      "",
-      "PREFER BATCH MODE: pass {tasks: [{tier, task}, ...]} to spawn multiple agents at once.",
-      "Single-task mode {tier, task} also works for backward compatibility.",
-      "",
-      "Tiers:",
-      "- active (t0, DEFAULT): same model as the main session — mass parallel spawn.",
-      "- t3: minor mechanical tasks, if t3 is configured.",
-      "- t2: deeper reasoning tasks the active model can't handle, if t2 is configured.",
-      "- t1: DEEP THINKING/planning ONLY (may be an expensive cloud model). Never for routine work.",
-      "",
-      "NOTE: If Trimegisto is disabled, this tool will return an error.",
-    ].join("\n"),
-    promptSnippet: "Spawn agents with the active model: trimegisto_spawn({tasks: [{tier:'active', task:'...'}, ...]})",
+    description: "Spawn Trimegisto sub-agents in parallel. Non-blocking. Prefer batch {tasks:[...]}. Default active/t0 = main pi model. Roles: T3 mechanical, T2 reasoning, T1 planning only. Disabled Trimegisto returns error.",
+    promptSnippet: "Spawn batch: trimegisto_spawn({tasks:[{tier:'active',task:'...'}]})",
     parameters: SpawnBatchParams,
 
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -548,17 +530,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "file_lock",
     label: "File Lock (Trimegisto)",
-    description: [
-      "Acquire an advisory lock on a file before modifying it.",
-      "Use this BEFORE calling write or edit on any file to prevent",
-      "concurrent modification conflicts with other Trimegisto agents.",
-      "If the file is locked by another agent, this returns the conflict info.",
-      "You should then wait and retry, or skip that file.",
-      "",
-      "IMPORTANT: Always call file_lock before write/edit when working",
-      "alongside other Trimegisto agents. Call file_unlock when done.",
-    ].join("\n"),
-    promptSnippet: "Lock file before writing: file_lock(path, 'write')",
+    description: "Advisory file lock before write/edit/bash. If locked, wait/retry or choose another file. Unlock when done.",
+    promptSnippet: "Before write/edit: file_lock(path,'write')",
     parameters: FileLockParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -568,7 +541,7 @@ export default function (pi: ExtensionAPI) {
         return {
           content: [{
             type: "text",
-            text: `✓ Lock acquired on \`${params.file_path}\` (lock_id: \`${result.lockId}\`). You can now safely modify this file. Remember to call file_unlock when done.`,
+            text: `✓ Locked \`${params.file_path}\` (lock_id: \`${result.lockId}\`). Unlock when done.`,
           }],
           details: { lockId: result.lockId, filePath: params.file_path, operation: params.operation },
         };
@@ -577,7 +550,7 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `⚠️ Cannot acquire lock on \`${params.file_path}\` — currently locked by agent \`${result.conflict?.agentId}\`. Wait for them to finish, or work on a different file.`,
+          text: `⚠️ Locked: \`${params.file_path}\` by \`${result.conflict?.agentId}\`. Wait/retry or use another file.`,
         }],
         details: { conflict: result.conflict },
         isError: true,
@@ -590,11 +563,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "file_unlock",
     label: "File Unlock (Trimegisto)",
-    description: [
-      "Release a file lock previously acquired with file_lock.",
-      "Call this after you're done writing/editing a file.",
-    ].join("\n"),
-    promptSnippet: "Unlock file after writing: file_unlock(lock_id)",
+    description: "Release a file_lock lock.",
+    promptSnippet: "After write/edit: file_unlock(lock_id)",
     parameters: FileUnlockParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
@@ -616,16 +586,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "file_read_track",
     label: "Track File Read (Trimegisto)",
-    description: [
-      "Register a file you've read for context invalidation tracking.",
-      "If another agent modifies this file, you'll receive a notification",
-      "that your context is stale and you should re-read the file.",
-      "Call this after using the read tool on any file you'll reference later.",
-      "",
-      "This is optional but recommended for long-running tasks where",
-      "other agents may modify shared files.",
-    ].join("\n"),
-    promptSnippet: "Track file for context invalidation: file_read_track(path)",
+    description: "Track read file; alerts if another agent changes it. Re-read on alert.",
+    promptSnippet: "After read: file_read_track(path)",
     parameters: FileReadTrackParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
@@ -635,7 +597,7 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `✓ Now tracking \`${path.basename(params.file_path)}\` for context changes. You'll be alerted if another agent modifies it.`,
+          text: `✓ Tracking \`${path.basename(params.file_path)}\` for changes.`,
         }],
         details: { tracked: params.file_path, totalTracked: myReadFiles.size },
       };
