@@ -1,7 +1,7 @@
 {
   "name": "trimegisto",
   "version": "1.0.2",
-  "description": "Multi-agent orchestration for pi: parallel sub-agents in tiers (active/t1/t2/t3), @mention steering, loop supervisor, advisory file locks, context broker and a live dashboard. Installs as a pi package with one extension + three tier skills.",
+  "description": "Pi multi-agent orchestration: tiered parallel sub-agents, @mentions, loop guard, file locks, context broker, dashboard.",
   "keywords": [
     "pi-package",
     "multi-agent",

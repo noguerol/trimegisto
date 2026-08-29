@@ -1,53 +1,29 @@
-/**
- * Trimegisto — Multi-Agent Orchestration for pi
- *
- * Three agent tiers:
- *
- *   T1 — Coordinator & planner, 1 instance
- *   T2 — Complex problem solver, up to 4 parallel
- *   T3 — Fast worker / heavy lifter, up to 4 parallel
- *
- * Agent IDs: t1a, t1b, t2a, t2b, t3a, t3c...
- *   t = trimegisto, number = tier, letter = instance
- *
- * Features:
- *   - Launch agents with specific tasks and tier-appropriate models
- *   - Compact status line (does NOT replace pi's native footer)
- *   - Verbose agent logs visible in chat (per-agent progress)
- *   - @mention syntax: @t2b do something → send instruction to agent
- *   - Kill individual agents or halt all at once
- *   - Auto-spawning: agents can launch other agents via trimegisto_spawn tool
- *   - Configurable models, prompts, and tools per tier
- */
+/** Trimegisto: tiered parallel sub-agents for pi. */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { Container, getKeybindings, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { AgentTier, TierConfig, TrimegistoConfig, AgentLogEntry, AgentInstance } from "./types.ts";
+import type { AgentTier, TrimegistoConfig, AgentLogEntry, AgentInstance } from "./types.ts";
 import {
   buildTierConfig,
   getDefaultConfig,
   formatTierLabel,
-  parseAgentId,
 } from "./config.ts";
 import {
   launchAgent,
-  killAgent,
   haltAll,
-  getAgents,
   getAgent,
   getAgentCounts,
   getActiveAgents,
   canSpawnPooled,
   getModelPool,
   selectAvailableModel,
-  startAutoSpawnPolling,
   stopAutoSpawnPolling,
   setStateChangeCallback,
   setSubagentExtensionPath,
@@ -55,20 +31,11 @@ import {
   setAgentLogCallback,
   processSpawnRequests,
   sendToAgent,
-  notifyFileChange,
   setLoopSupervisor,
-  getLoopSupervisor,
 } from "./agent-manager.ts";
-import {
-  createStatusLine,
-  createDashboardWidget,
-  createCompactWidget,
-} from "./dashboard.ts";
-import { registerCommands } from "./commands.ts";
 import { saveConfig as persistConfig, loadConfig } from "./persistence.ts";
-import { getActiveLocks } from "./file-lock.ts";
-import { broadcastFileChange, cleanupOldNotifications } from "./context-broker.ts";
-import { LoopSupervisor, DEFAULT_LOOP_CONFIG, type LoopSupervisorConfig, type LoopAlert } from "./loop-supervisor.ts";
+import { cleanupOldNotifications } from "./context-broker.ts";
+import { LoopSupervisor, type LoopAlert } from "./loop-supervisor.ts";
 
 // ── Configuration entry type ────────────────────────────
 const CONFIG_ENTRY = "trimegisto-config-v1";
@@ -119,13 +86,13 @@ function findSubagentExtensionPath(): string {
 
 // ── The Trimegisto tool (exposed to the main LLM) ────────
 const TierEnum = StringEnum(["active", "t1", "t2", "t3"] as const, {
-  description: "Agent tier. DEFAULT: 'active' (same model as the main session, mass parallel). t2/t3: minor/adjacent tasks if configured. t1: deep thinking only (may be an expensive cloud model).",
+  description: "Tier. Default active. Use only enabled tiers.",
 });
 
 const TrimegistoTaskItem = Type.Object({
   tier: Type.Optional(TierEnum),
-  task: Type.String({ description: "Task description for this agent" }),
-  cwd: Type.Optional(Type.String({ description: "Working directory for this agent" })),
+  task: Type.String({ description: "Agent task" }),
+  cwd: Type.Optional(Type.String({ description: "Agent cwd" })),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -284,27 +251,29 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function updateDashboard(): void {
+  let dashboardImport: Promise<typeof import("./dashboard.ts")> | null = null;
+  function loadDashboard() {
+    return dashboardImport ??= import("./dashboard.ts");
+  }
+
+  async function updateDashboard(): Promise<void> {
     try {
       if (!ctxRef?.hasUI) return;
-
-      // NOTE: We do NOT replace pi's native footer.
-      // Instead we use setWidget (above/below editor) and the status bar.
-
+      ctxRef.ui.setFooter(undefined);
+      if (dashboardMode === "off") {
+        ctxRef.ui.setWidget("trimegisto", undefined);
+        ctxRef.ui.setWidget("trimegisto-compact", undefined);
+        return;
+      }
+      const { createDashboardWidget, createCompactWidget } = await loadDashboard();
       if (dashboardMode === "compact") {
-        ctxRef.ui.setFooter(undefined); // ensure we don't override native footer
         ctxRef.ui.setWidget("trimegisto", undefined);
         ctxRef.ui.setWidget("trimegisto-compact", createCompactWidget(ctxRef), { placement: "belowEditor" });
-      } else if (dashboardMode === "widget") {
-        ctxRef.ui.setFooter(undefined);
+      } else {
         ctxRef.ui.setWidget("trimegisto", createDashboardWidget(ctxRef));
         ctxRef.ui.setWidget("trimegisto-compact", undefined);
-      } else {
-        ctxRef.ui.setFooter(undefined);
-        ctxRef.ui.setWidget("trimegisto", undefined);
-        ctxRef.ui.setWidget("trimegisto-compact", undefined);
       }
-    } catch { /* ctx stale after session reload */ }
+    } catch { /* stale ctx/reload */ }
   }
 
   // ── Launch helper (for commands and tool) ──────────────
@@ -541,29 +510,15 @@ export default function (pi: ExtensionAPI) {
 
   function buildToolDescription(): string {
     return [
-      "Launch Trimegisto sub-agents to handle tasks in parallel.",
-      "",
-      "AVAILABLE TIERS RIGHT NOW:",
+      "Launch parallel Trimegisto sub-agents.",
+      "Tiers now:",
       tierStatusLine("active"),
       tierStatusLine("t1"),
       tierStatusLine("t2"),
       tierStatusLine("t3"),
-      "",
-      "DEFAULT: tier 'active' (t0) — the SAME model as the main session. Parallel",
-      "active-agents hit the same local server and share its speculative-decoding",
-      "pool (ngram/MTP batching). Prefer spawning several active agents on the",
-      "SAME repo/task family so their code output feeds each other's drafts.",
-      "",
-      "Tier roles:",
-      "- active (t0, DEFAULT): same model as pi — MASS PARALLEL spawn. Use for almost everything.",
-      "- t3: minor mechanical tasks (parsing, formatting, translation) — only if listed ENABLED.",
-      "- t2: deeper reasoning — only if listed ENABLED.",
-      "- t1: DEEP THINKING / planning ONLY (expensive model) — only if listed ENABLED.",
-      "",
-      "⚠️ NEVER spawn a tier listed as ✗ unavailable — it will fail. Only use the ✓ ENABLED tiers.",
-      "Each agent runs in isolation with its own context window. Agent IDs: t0a, t0b, t1a, t2b, t3c...",
-      "",
-      "NOTE: If Trimegisto is disabled, this tool will return an error.",
+      "Default active/t0 = main pi model; prefer several active agents for same repo/task family.",
+      "Roles: active=t0 mass worker; t3=mechanical; t2=reasoning; t1=deep planning only.",
+      "Only spawn ✓ ENABLED tiers; ✗ unavailable fails. IDs: t0a,t1a,t2b,t3c... Disabled tool returns error.",
     ].join("\n");
   }
 
@@ -573,18 +528,18 @@ export default function (pi: ExtensionAPI) {
     name: "trimegisto",
     label: "Trimegisto Multi-Agent",
     description: buildToolDescription(),
-    promptSnippet: "Launch Trimegisto sub-agents for parallel task execution. DEFAULT: tier 'active'. Only use tiers marked ENABLED in the description.",
+    promptSnippet: "Spawn parallel agents. Default tier active. Use only ENABLED tiers.",
     parameters: Type.Object({
       tasks: Type.Array(TrimegistoTaskItem, {
-        description: "Array of tasks to execute. Max 8 total tasks across all tiers. Tier defaults to 'active'. Per-tier limits configurable (active: 4, T1: 1, T2: 4, T3: 4).",
+        description: "Tasks. Max 8. Default tier active.",
       }),
-      cwd: Type.Optional(Type.String({ description: "Working directory for all tasks" })),
+      cwd: Type.Optional(Type.String({ description: "Shared cwd" })),
     }),
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       if (!config.enabled) {
         return {
-          content: [{ type: "text", text: "Trimegisto is currently disabled. Use /tmg enable to activate it." }],
+          content: [{ type: "text", text: "Trimegisto disabled. Use /tmg enable." }],
           details: { enabled: false },
           isError: true,
         };
@@ -893,46 +848,62 @@ export default function (pi: ExtensionAPI) {
   pi.registerMessageRenderer("trimegisto-results", suppressHeader);
   pi.registerMessageRenderer("trimegisto-command", suppressHeader);
 
-  // ── Register commands ──────────────────────────────────
-  registerCommands(
-    pi,
-    { active: config.active, t1: config.t1, t2: config.t2, t3: config.t3 },
-    doLaunch,
-    process.cwd(),
-    {
-      isEnabled: () => config.enabled,
-      setEnabled: (v: boolean) => {
-        config.enabled = v;
-        if (v) {
-          updateDashboard();
-          try { if (ctxRef) ctxRef.ui.setStatus("trimegisto", "◇ Trimegisto active"); } catch { /* stale */ }
-        } else {
-          haltAll();
-          try {
-            if (ctxRef) {
-              ctxRef.ui.setFooter(undefined);
-              ctxRef.ui.setWidget("trimegisto", undefined);
-              ctxRef.ui.setWidget("trimegisto-compact", undefined);
-              ctxRef.ui.setStatus("trimegisto", "◇ Trimegisto disabled");
-            }
-          } catch { /* ctx stale after session reload */ }
-        }
-        saveConfig();
-      },
-      haltAll,
-      sendToAgent: (agentId: string, instruction: string) => {
-        return sendToAgent(
-          agentId,
-          instruction,
-          { active: config.active, t1: config.t1, t2: config.t2, t3: config.t3 },
-          ctxRef?.cwd || process.cwd(),
-          spawnModelOverride("active"),
-          config.spawnOnlyOnActive,
-          config.redundantAgents,
-        );
-      },
+  // ── Register commands (lazy handlers) ───────────────────
+  const commandRuntime = () => ({
+    configs: { active: config.active, t1: config.t1, t2: config.t2, t3: config.t3 },
+    launchFn: doLaunch,
+    cwd: process.cwd(),
+    isEnabled: () => config.enabled,
+    setEnabled: (v: boolean) => {
+      config.enabled = v;
+      if (v) {
+        updateDashboard();
+        try { if (ctxRef) ctxRef.ui.setStatus("trimegisto", "◇ Trimegisto active"); } catch {}
+      } else {
+        haltAll();
+        try {
+          if (ctxRef) {
+            ctxRef.ui.setFooter(undefined);
+            ctxRef.ui.setWidget("trimegisto", undefined);
+            ctxRef.ui.setWidget("trimegisto-compact", undefined);
+            ctxRef.ui.setStatus("trimegisto", "◇ Trimegisto disabled");
+          }
+        } catch {}
+      }
+      saveConfig();
     },
-  );
+    haltAll,
+    sendToAgent: (agentId: string, instruction: string) => sendToAgent(
+      agentId,
+      instruction,
+      { active: config.active, t1: config.t1, t2: config.t2, t3: config.t3 },
+      ctxRef?.cwd || process.cwd(),
+      spawnModelOverride("active"),
+      config.spawnOnlyOnActive,
+      config.redundantAgents,
+    ),
+    toggleDashboard: (pi as any)._trimegistoToggleDashboard,
+  });
+
+  pi.registerCommand("tmg", {
+    description: "Trimegisto control",
+    handler: async (args, ctx) => (await import("./commands.ts")).handleTmgCommand(pi, args, ctx, commandRuntime()),
+  });
+  for (const tier of ["active", "t1", "t2", "t3"] as const) {
+    const cmd = tier === "active" ? "t0" : tier;
+    pi.registerCommand(cmd, {
+      description: `Launch ${formatTierLabel(tier)} agent`,
+      handler: async (args, ctx) => (await import("./commands.ts")).handleTierCommand(tier, cmd, args, ctx, commandRuntime()),
+    });
+  }
+  pi.registerCommand("@", {
+    description: "Send to Trimegisto agent",
+    handler: async (args, ctx) => (await import("./commands.ts")).handleMentionCommand(args, ctx, commandRuntime()),
+  });
+  pi.registerShortcut("ctrl+alt+h", {
+    description: "Trimegisto: halt agents",
+    handler: async ctx => (await import("./commands.ts")).handleHaltShortcut(ctx, commandRuntime()),
+  });
 
   // ── Session lifecycle ──────────────────────────────────
   // Keep the active model fresh when the user switches models mid-session
@@ -1101,12 +1072,12 @@ export default function (pi: ExtensionAPI) {
       if (usagePercent >= threshold) {
         compactionInProgress = true;
         ctx.compact({
-          customInstructions: `Trimegisto proactive compaction triggered at ${usagePercent.toFixed(1)}% context usage (threshold: ${threshold}%). Prioritize keeping recent tool outputs and file changes.`,
+          customInstructions: `Trimegisto compaction at ${usagePercent.toFixed(1)}% (threshold ${threshold}%). Keep recent tool outputs/file changes.`,
           onComplete: () => {
             compactionInProgress = false;
             if (ctx.hasUI) {
               ctx.ui.notify(
-                `Trimegisto: proactive compaction completed (was at ${usagePercent.toFixed(0)}%, threshold ${threshold}%)`,
+                `Trimegisto: compaction done (${usagePercent.toFixed(0)}%/${threshold}%)`,
                 "info",
               );
             }
@@ -1119,7 +1090,7 @@ export default function (pi: ExtensionAPI) {
 
         if (ctx.hasUI) {
           ctx.ui.notify(
-            `Trimegisto: triggering proactive compaction (${usagePercent.toFixed(0)}% ≥ ${threshold}%)`,
+            `Trimegisto: compacting (${usagePercent.toFixed(0)}% ≥ ${threshold}%)`,
             "info",
           );
         }
@@ -1146,7 +1117,7 @@ export default function (pi: ExtensionAPI) {
     return {
       message: {
         customType: "trimegisto-context",
-        content: `[Trimegisto Active Agents: ${activeAgents.length}]\n${agentList}\n\n⚠️ COST OPTIMIZATION: You are the most expensive agent. Use the trimegisto tool to DELEGATE as much work as possible to cheaper T3 and T2 agents. Never do work yourself that a cheaper agent can handle. T3 = cheapest (use for all mechanical tasks), T2 = medium (use for reasoning T3 can't do), T1 = expensive (avoid unless truly needed for planning).\n\nUse /tmg for manual control. Use @t2b <instruction> to send instructions to a specific agent.`,
+        content: `Tmg active agents (${activeAgents.length}):\n${agentList}\n\nAdvisory: delegate work via trimegisto. Prefer cheaper capable tiers: T3 mechanical, T2 reasoning, T1 only hard planning. Manual: /tmg, @t2b <instruction>.`,
         display: false,
       },
     };
@@ -1202,283 +1173,22 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // ── Configuration command ──────────────────────────────
+  // ── Configuration command (lazy UI) ──────────────────
   pi.registerCommand("tmg-config", {
-    description: "Configure Trimegisto agent models and settings",
+    description: "Configure Trimegisto",
     handler: async (_args, ctx) => {
-      const models = await ctx.modelRegistry.getAvailable();
-      const modelList = models.map(m => `${m.provider}/${m.id} — ${m.name || m.id}`);
-
-      // Scrollable model picker — returns "provider/id" or undefined
-      const pickModel = async (title: string): Promise<string | undefined> => {
-        if (modelList.length === 0) {
-          ctx.ui.notify("No models available. Configure API keys first.", "error");
-          return undefined;
-        }
-        const choice = await ctx.ui.custom<string | undefined>(
-          (tui, theme, keybindings, done) => {
-            const maxVisible = 10;
-            const items: string[] = modelList;
-            let selectedIndex = 0;
-
-            const listContainer = new Container();
-
-            const render = () => {
-              listContainer.clear();
-              const len = items.length;
-              const start = Math.max(0, Math.min(
-                selectedIndex - Math.floor(maxVisible / 2),
-                len - maxVisible
-              ));
-              const end = Math.min(start + maxVisible, len);
-
-              for (let i = start; i < end; i++) {
-                const isSelected = i === selectedIndex;
-                listContainer.addChild(new Text(
-                  isSelected
-                    ? theme.fg("accent", `→ ${items[i]}`)
-                    : `  ${items[i]}`,
-                  1, 0
-                ));
-              }
-
-              if (start > 0 || end < len) {
-                listContainer.addChild(new Spacer(1));
-                listContainer.addChild(new Text(
-                  theme.fg("muted", `  (${selectedIndex + 1}/${len})`),
-                  1, 0
-                ));
-              }
-            };
-
-            const root = new Container();
-            root.addChild(new Spacer(1));
-            root.addChild(new Text(
-              theme.fg("accent", theme.bold(title)),
-              1, 0
-            ));
-            root.addChild(new Spacer(1));
-            root.addChild(listContainer);
-            root.addChild(new Spacer(1));
-            root.addChild(new Text(
-              theme.fg("muted", `  ↑↓ scroll  Enter select  Esc cancel  (${items.length} models)`),
-              1, 0
-            ));
-
-            render();
-
-            (root as any).handleInput = (keyData: string) => {
-              const kb = getKeybindings();
-              if (kb.matches(keyData, "tui.select.up") || keyData === "k") {
-                selectedIndex = selectedIndex === 0 ? items.length - 1 : selectedIndex - 1;
-                render();
-              } else if (kb.matches(keyData, "tui.select.down") || keyData === "j") {
-                selectedIndex = selectedIndex === items.length - 1 ? 0 : selectedIndex + 1;
-                render();
-              } else if (kb.matches(keyData, "tui.select.confirm") || keyData === "\n") {
-                if (items[selectedIndex]) done(items[selectedIndex]);
-              } else if (kb.matches(keyData, "tui.select.cancel")) {
-                done(undefined);
-              }
-            };
-
-            return root;
-          },
-        );
-        return choice ? choice.split(" — ")[0].trim() : undefined;
-      };
-
-      const tier = await ctx.ui.select("Select tier to configure:", [
-        `Active (t0, same model as pi): ${config.active.enabled ? "ENABLED" : "DISABLED"} | max:${config.active.maxParallel} | compact@${config.active.compactionThreshold}%`,
-        `T1 (deep thinking): ${config.t1.enabled ? "ENABLED" : "DISABLED"} | ${config.t1.model || "(not set)"} | max:${config.t1.maxParallel} | compact@${config.t1.compactionThreshold}%`,
-        `T2 (solver): ${config.t2.enabled ? "ENABLED" : "DISABLED"} | ${config.t2.model || "(not set)"} | max:${config.t2.maxParallel} | compact@${config.t2.compactionThreshold}%`,
-        `T3 (worker): ${config.t3.enabled ? "ENABLED" : "DISABLED"} | ${config.t3.model || "(not set)"} | max:${config.t3.maxParallel} | compact@${config.t3.compactionThreshold}%`,
-        "Enabled: " + (config.enabled ? "ON" : "OFF"),
-        "Auto-spawn: " + (config.autoSpawn ? "ON" : "OFF"),
-        "Active model for agents: " + (config.useActiveModel ? "ON (same as pi)" : "OFF (per-tier models)"),
-        "Spawn only on active (t0): " + (config.spawnOnlyOnActive ? "ON" : "OFF"),
-        "Redundant agents: " + (config.redundantAgents ? "YES" : "NO"),
-        "Dashboard: " + dashboardMode,
-        "Done",
-      ]);
-
-      if (!tier || tier === "Done") return;
-
-      if (tier.startsWith("Active model for agents")) {
-        config.useActiveModel = !config.useActiveModel;
-        ctx.ui.notify(
-          `Trimegisto: agents will use ${config.useActiveModel ? `the ACTIVE model (${activeModel || "?"})` : "per-tier configured models"}`,
-          "info",
-        );
-        saveConfig();
-        registerMainTool();
-        return;
-      }
-
-      if (tier.startsWith("Spawn only on active")) {
-        config.spawnOnlyOnActive = !config.spawnOnlyOnActive;
-        ctx.ui.notify(
-          config.spawnOnlyOnActive
-            ? "Spawn only on active: ON — all agents will spawn on t0 (the pi active model)"
-            : "Spawn only on active: OFF — tiers t1/t2/t3 spawn with their configured models",
-          "info",
-        );
-        saveConfig();
-        registerMainTool(); // refresh tool description so the coordinator sees the new availability
-        return;
-      }
-
-      if (tier.startsWith("Enabled")) {
-        config.enabled = !config.enabled;
-        ctx.ui.notify(`Trimegisto: ${config.enabled ? "ENABLED" : "DISABLED"}`, config.enabled ? "info" : "warning");
-        registerMainTool();
-        if (config.enabled) {
-          updateDashboard();
-          try { if (ctxRef) ctxRef.ui.setStatus("trimegisto", "◇ Trimegisto active"); } catch { /* stale */ }
-        } else {
-          haltAll();
-          try {
-            if (ctxRef) {
-              ctxRef.ui.setFooter(undefined);
-              ctxRef.ui.setWidget("trimegisto", undefined);
-              ctxRef.ui.setWidget("trimegisto-compact", undefined);
-              ctxRef.ui.setStatus("trimegisto", "◇ Trimegisto disabled");
-            }
-          } catch { /* ctx stale after session reload */ }
-        }
-        saveConfig();
-        return;
-      }
-
-      if (tier.startsWith("Auto-spawn")) {
-        config.autoSpawn = !config.autoSpawn;
-        ctx.ui.notify(`Auto-spawn: ${config.autoSpawn ? "ON" : "OFF"}`, "info");
-        saveConfig();
-        return;
-      }
-
-      if (tier.startsWith("Redundant agents")) {
-        config.redundantAgents = !config.redundantAgents;
-        ctx.ui.notify(
-          config.redundantAgents
-            ? "Redundant agents: YES — t1/t2 spawn on the least-loaded model of their pool and fail over on provider errors"
-            : "Redundant agents: NO — t1/t2 spawn only on their primary model",
-          "info",
-        );
-        saveConfig();
-        registerMainTool(); // refresh tool description (redundant model counts)
-        return;
-      }
-
-      if (tier.startsWith("Dashboard")) {
-        const modes: Array<"widget" | "compact" | "off"> = ["compact", "widget", "off"];
-        const idx = modes.indexOf(dashboardMode);
-        dashboardMode = modes[(idx + 1) % modes.length];
-        config.dashboardVisible = dashboardMode !== "off";
-        updateDashboard();
-        ctx.ui.notify(`Dashboard: ${dashboardMode}`, "info");
-        saveConfig();
-        return;
-      }
-
-      // Tier model selection
-      const tierKey = tier.startsWith("Active")
-        ? "active"
-        : tier.startsWith("T1") ? "t1" : tier.startsWith("T2") ? "t2" : "t3";
-
-      const subOptions = [
-        `Enabled: ${config[tierKey].enabled ? "ON" : "OFF"}`,
-        `Model: ${config[tierKey].model || "(not set)"}`,
-        ...((tierKey === "t1" || tierKey === "t2")
-          ? [`Redundant models: ${(config[tierKey].redundantModels ?? []).length} configured`]
-          : []),
-        `Max Parallel: ${config[tierKey].maxParallel}`,
-        `Compaction Threshold: ${config[tierKey].compactionThreshold}%`,
-        "Back",
-      ];
-
-      // Sub-menu: what to configure for this tier
-      const subAction = await ctx.ui.select(
-        `Configure ${formatTierLabel(tierKey)}:`,
-        subOptions,
-      );
-
-      if (!subAction || subAction === "Back") return;
-
-      if (subAction.startsWith("Enabled")) {
-        config[tierKey].enabled = !config[tierKey].enabled;
-        ctx.ui.notify(`${formatTierLabel(tierKey)}: ${config[tierKey].enabled ? "ENABLED" : "DISABLED"}`, "info");
-        saveConfig();
-        registerMainTool(); // refresh tool description so the coordinator sees the new availability
-        return;
-      }
-
-      if (subAction.startsWith("Model")) {
-        const providerId = await pickModel(`Select model for ${formatTierLabel(tierKey)}:`);
-        if (providerId) {
-          config[tierKey].model = providerId;
-          ctx.ui.notify(`${formatTierLabel(tierKey)} model: ${providerId}`, "info");
-          saveConfig();
-        }
-      } else if (subAction.startsWith("Redundant models")) {
-        const rm = config[tierKey].redundantModels ?? (config[tierKey].redundantModels = []);
-        const rmChoice = await ctx.ui.select(
-          `Redundant models for ${formatTierLabel(tierKey)} (pool for load-balancing + failover when "Redundant agents" is YES):`,
-          [
-            ...rm.map(m => `\u2715 Remove: ${m}`),
-            "\uFF0B Add model...",
-            "Back",
-          ],
-        );
-        if (!rmChoice || rmChoice === "Back") return;
-
-        if (rmChoice === "\uFF0B Add model...") {
-          const providerId = await pickModel(`Add redundant model for ${formatTierLabel(tierKey)}:`);
-          if (providerId) {
-            if (providerId === config[tierKey].model || rm.includes(providerId)) {
-              ctx.ui.notify(`${providerId} is already in the ${formatTierLabel(tierKey)} pool`, "warning");
-            } else {
-              rm.push(providerId);
-              ctx.ui.notify(`${formatTierLabel(tierKey)} redundant model added: ${providerId} (${rm.length} total)`, "info");
-              saveConfig();
-              registerMainTool(); // refresh tool description (redundant counts)
-            }
-          }
-        } else if (rmChoice.startsWith("\u2715 Remove: ")) {
-          const m = rmChoice.slice("\u2715 Remove: ".length);
-          config[tierKey].redundantModels = rm.filter(x => x !== m);
-          ctx.ui.notify(`${formatTierLabel(tierKey)} redundant model removed: ${m}`, "info");
-          saveConfig();
-          registerMainTool();
-        }
-        return;
-      } else if (subAction.startsWith("Max Parallel")) {
-        const value = await ctx.ui.select(
-          `Max parallel agents for ${formatTierLabel(tierKey)} (currently: ${config[tierKey].maxParallel}):`,
-          ["1", "2", "3", "4", "5", "6", "7", "8"],
-        );
-        if (value) {
-          const num = parseInt(value, 10);
-          if (!isNaN(num) && num >= 1 && num <= 8) {
-            config[tierKey].maxParallel = num;
-            ctx.ui.notify(`${formatTierLabel(tierKey)} max parallel: ${num}`, "info");
-            saveConfig();
-          }
-        }
-      } else if (subAction.startsWith("Compaction Threshold")) {
-        const value = await ctx.ui.select(
-          `Compaction threshold for ${formatTierLabel(tierKey)} (currently: ${config[tierKey].compactionThreshold}%). Lower = compact sooner.`,
-          ["50%", "55%", "60%", "65%", "70%", "75%", "80%", "85%", "90%", "95%"],
-        );
-        if (value) {
-          const num = parseInt(value, 10);
-          if (!isNaN(num) && num >= 50 && num <= 95) {
-            config[tierKey].compactionThreshold = num;
-            ctx.ui.notify(`${formatTierLabel(tierKey)} compaction threshold: ${num}%`, "info");
-            saveConfig();
-          }
-        }
-      }
+      const { runConfigUI } = await import("./config-ui.ts");
+      return runConfigUI(ctx, {
+        config,
+        dashboardMode,
+        setDashboardMode: (mode) => { dashboardMode = mode; },
+        activeModel,
+        ctxRef,
+        updateDashboard,
+        haltAll,
+        saveConfig,
+        registerMainTool,
+      });
     },
   });
 }

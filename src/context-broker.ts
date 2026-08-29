@@ -148,7 +148,7 @@ export function pollContextAlerts(
         filePath: notification.filePath,
         modifiedBy: notification.modifiedBy,
         timestamp: notification.timestamp,
-        message: `⚠️ **Context Invalidation**: \`${path.basename(notification.filePath)}\` was modified by agent \`${notification.modifiedBy}\` (${notification.operation}). Your knowledge of this file may be stale — re-read it before making further changes.`,
+        message: `⚠️ Stale file: \`${path.basename(notification.filePath)}\` changed by \`${notification.modifiedBy}\` (${notification.operation}). Re-read before editing.`,
       });
 
       // Mark as processed
