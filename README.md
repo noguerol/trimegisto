@@ -1,6 +1,6 @@
 <div align="center">
 
-![Trimegisto banner](docs/banner.jpeg)
+![Trimegisto banner](https://raw.githubusercontent.com/noguerol/trimegisto/main/docs/banner.jpeg)
 
 </div>
 
