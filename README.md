@@ -1,6 +1,6 @@
 <div align="center">
 
-![Trimegisto banner](docs/banner.png)
+![Trimegisto banner](docs/banner.jpeg)
 
 </div>
 

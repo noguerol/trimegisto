@@ -27,7 +27,7 @@
     "skills": [
       "./agents"
     ],
-    "image": "https://raw.githubusercontent.com/noguerol/trimegisto/main/docs/preview.png"
+    "image": "https://raw.githubusercontent.com/noguerol/trimegisto/main/docs/preview.jpeg"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
