@@ -77,6 +77,22 @@ pi update --extensions      # reconcile pinned git refs
 
 Results stream into the chat as each agent finishes, with per-agent logs, token/cost usage and a `✓ n/m done` summary.
 
+### Live throughput in the dashboard
+
+While agents run, the dashboard shows **continuous prefill and generation speeds** for every target (each sub-agent plus the main session), updating ~every 500 ms without any input from you:
+
+```text
+◇ Trimegisto 3 active ↓246.7t/s ↑1890t/s T2 2r T3 1r · ⌁ main ↓38.1t/s
+```
+
+- `↓NNNt/s` — decode/generation (summed across agents), **live** while streaming
+- `↑NNNt/s` — prefill/prompt-processing throughput (averaged), only when the prompt is big enough that compute dominates the round trip
+- `↑817ms` — a small prompt: time-to-first-token is shown instead of a fake throughput (TTFT includes network latency)
+- `↑…2.1s` — the model is still chewing on the prompt, nothing generated yet
+- `⌁ main` — the main session's own speed, while it answers in between agent results
+
+The values are measured from the token stream itself (provider-agnostic), calibrated per model from real usage, and smoothed with an EMA so bursts don't flicker.
+
 ## Usage
 
 ### The `trimegisto` tool (LLM-facing)
@@ -265,13 +281,15 @@ trimegisto/
 │   ├── context-broker.ts       # cross-agent file-change notifications
 │   ├── ipc.ts                  # file-based request/response IPC
 │   ├── config.ts               # tier config + agent-file discovery
-│   ├── dashboard.ts            # lazy TUI status line + widgets
+│   ├── speed.ts                # prefill/decode telemetry (token stream, provider-agnostic)
+│   ├── dashboard.ts            # lazy TUI widgets: live ↑prefill / ↓decode speeds
 │   ├── commands.ts             # lazy /tmg*, /t0..t3, @mention, shortcut handlers
 │   ├── config-ui.ts            # lazy /tmg-config UI
 │   └── types.ts
 ├── agents/
 │   ├── t1.md  t2.md  t3.md     # tier skills
-└── test-loop.ts                # loop-supervisor unit tests
+├── test-loop.ts                # loop-supervisor unit tests
+└── test-speed.ts               # speed-tracker unit tests
 ```
 
 ## Development
@@ -280,7 +298,8 @@ trimegisto/
 git clone https://github.com/noguerol/trimegisto
 cd trimegisto
 pi install .                 # local-path install
-node --experimental-strip-types test-loop.ts   # run supervisor tests
+node --experimental-strip-types test-loop.ts    # loop-supervisor tests
+node --experimental-strip-types test-speed.ts   # speed-tracker tests
 ```
 
 ## License

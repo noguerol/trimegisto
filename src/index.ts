@@ -36,6 +36,7 @@ import {
 import { saveConfig as persistConfig, loadConfig } from "./persistence.ts";
 import { cleanupOldNotifications } from "./context-broker.ts";
 import { LoopSupervisor, type LoopAlert } from "./loop-supervisor.ts";
+import { speed, MAIN_TARGET } from "./speed.ts";
 
 // ── Configuration entry type ────────────────────────────
 const CONFIG_ENTRY = "trimegisto-config-v1";
@@ -1026,6 +1027,7 @@ export default function (pi: ExtensionAPI) {
     persistConfig(config);
     clearInterval(spawnPollInterval);
     clearInterval(dashboardRefreshInterval);
+    clearInterval(speedRefreshInterval);
     stopAutoSpawnPolling();
     haltAll();
     ctxRef = null;
@@ -1123,22 +1125,30 @@ export default function (pi: ExtensionAPI) {
     };
   });
 
+  /** Total running/waiting agents across every tier, the active tier included. */
+  function liveAgentCount(): number {
+    const c = getAgentCounts();
+    return c.active.running + c.active.waiting +
+      c.t1.running + c.t1.waiting +
+      c.t2.running + c.t2.waiting +
+      c.t3.running + c.t3.waiting;
+  }
+
   // ── Periodically refresh status bar ────────────────────
   const dashboardRefreshInterval = setInterval(() => {
     if (disposed || !config.enabled) return;
     try {
+      speed.prune(); // drop long-idle targets from the telemetry map
       if (ctxRef?.hasUI) {
         const counts = getAgentCounts();
-        const active = counts.t1.running + counts.t1.waiting +
-          counts.t2.running + counts.t2.waiting +
-          counts.t3.running + counts.t3.waiting;
+        const active = liveAgentCount();
 
         if (active > 0) {
           ctxRef.ui.setStatus("trimegisto", `◇ Trimegisto: ${active} active`);
         } else {
-          const total = counts.t1.total + counts.t2.total + counts.t3.total;
+          const total = counts.active.total + counts.t1.total + counts.t2.total + counts.t3.total;
           if (total > 0) {
-            const done = counts.t1.done + counts.t2.done + counts.t3.done;
+            const done = counts.active.done + counts.t1.done + counts.t2.done + counts.t3.done;
             ctxRef.ui.setStatus("trimegisto", `◇ Trimegisto: ${done} completed`);
           } else {
             ctxRef.ui.setStatus("trimegisto", "◇ Trimegisto");
@@ -1147,6 +1157,54 @@ export default function (pi: ExtensionAPI) {
       }
     } catch { /* ctx stale after session reload */ }
   }, 3000);
+
+  // ── Streaming speed ticker ─────────────────────────────
+  // pi only redraws widgets when something invalidates the UI. A main session
+  // waiting on sub-agents never does, so prefill/decode speeds would freeze at
+  // whatever the last keystroke showed. Tick while anything is streaming.
+  const speedRefreshInterval = setInterval(() => {
+    if (disposed || !config.enabled) return;
+    try {
+      if (!ctxRef?.hasUI) return;
+      if (liveAgentCount() === 0 && !speed.hasLiveActivity()) return;
+      // dashboard.ts is lazy-loaded; Node caches it after the first import.
+      import("./dashboard.ts")
+        .then((m) => m.requestDashboardRender())
+        .catch(() => { /* module or UI unavailable */ });
+    } catch { /* ignore */ }
+  }, 500);
+
+  // ── Main session telemetry ─────────────────────────────
+  // The main session talks to its provider just like the sub-agents do: the
+  // same events carry its prefill/decode timings.
+  pi.on("turn_start", () => {
+    speed.startRequest(MAIN_TARGET);
+  });
+
+  pi.on("message_update", (event: any) => {
+    if (event?.message?.role !== "assistant") return;
+    const ev = event.assistantMessageEvent;
+    if (!ev || (ev.type !== "text_delta" && ev.type !== "thinking_delta" && ev.type !== "toolcall_delta")) return;
+    speed.noteDelta(MAIN_TARGET, typeof ev.delta === "string" ? ev.delta.length : 0);
+    // Some providers already report usage while streaming; that beats estimating.
+    if (event.message.usage?.output) speed.noteLiveUsage(MAIN_TARGET, event.message.usage.output);
+  });
+
+  pi.on("message_end", (event: any) => {
+    const msg = event?.message;
+    if (msg?.role !== "assistant" || !msg.usage) return;
+    speed.endRequest(MAIN_TARGET, {
+      input: msg.usage.input || 0,
+      cacheRead: msg.usage.cacheRead || 0,
+      cacheWrite: msg.usage.cacheWrite || 0,
+      output: msg.usage.output || 0,
+    });
+  });
+
+  // Nothing in flight any more: keep the last measurements, stop live phases.
+  pi.on("agent_settled", () => {
+    speed.finalize(MAIN_TARGET);
+  });
 
   // ── Persist config ─────────────────────────────────────
   function saveConfig(): void {
