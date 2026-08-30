@@ -26,6 +26,7 @@ import { scanSpawnRequests, writeSpawnResponse, cleanupStaleFiles, setInstanceDi
 import { releaseAllAgentLocks, setInstanceDir as setLockInstanceDir } from "./file-lock.ts";
 import { broadcastFileChange, clearAgentContext, setInstanceDir as setContextInstanceDir } from "./context-broker.ts";
 import { type LoopSupervisor, type LoopAlert } from "./loop-supervisor.ts";
+import { speed } from "./speed.ts";
 
 /** Path to the sub-agent extension that provides trimegisto_spawn tool */
 let subagentExtensionPath: string | null = null;
@@ -391,6 +392,8 @@ export function launchAgent(
 
       let buffer = "";
 
+      let thinkingLogged = false; // one "thinking" entry per attempt, no log scan per token
+
       const processLine = (line: string) => {
         if (!line.trim()) return;
         let event: any;
@@ -412,6 +415,13 @@ export function launchAgent(
           instance.usage.turns++;
           const usage = msg.usage;
           if (usage) {
+            // Authoritative prefill/decode throughput for the request that just finished.
+            speed.endRequest(id, {
+              input: usage.input || 0,
+              cacheRead: usage.cacheRead || 0,
+              cacheWrite: usage.cacheWrite || 0,
+              output: usage.output || 0,
+            });
             instance.usage.input += usage.input || 0;
             instance.usage.output += usage.output || 0;
             instance.usage.cacheRead += usage.cacheRead || 0;
@@ -490,9 +500,25 @@ export function launchAgent(
           notifyAgentLog(id, resultEntry);
         }
 
-        // Message updates for streaming/thinking
-        if (event.type === "message_update" && event.message?.role === "assistant") {
-          if (!instance.log.some(e => e.text === "💭 thinking...")) {
+        // ── Speed telemetry ──────────────────────────────────────────
+        // turn_start = a provider request begins: prefill phase starts here.
+        if (event.type === "turn_start") {
+          speed.startRequest(id);
+        }
+
+        // Message updates: streaming deltas. pi's JSON stream carries only
+        // `usage` + `assistantMessageEvent` here — there is no `message` field,
+        // so nothing may be gated on the message role in this branch.
+        if (event.type === "message_update") {
+          // Every streamed delta feeds the live decode estimate.
+          const ev = event.assistantMessageEvent;
+          if (ev && (ev.type === "text_delta" || ev.type === "thinking_delta" || ev.type === "toolcall_delta")) {
+            speed.noteDelta(id, typeof ev.delta === "string" ? ev.delta.length : 0);
+          }
+          // Incremental usage, when the provider reports it, beats estimating.
+          if (event.usage?.output) speed.noteLiveUsage(id, event.usage.output);
+          if (!thinkingLogged) {
+            thinkingLogged = true;
             const thinkingEntry: AgentLogEntry = {
               ts: Date.now(),
               level: "info",
@@ -556,6 +582,8 @@ export function launchAgent(
         releaseAllAgentLocks(id);
         // Clean up context tracking data
         clearAgentContext(id);
+        // Freeze speed telemetry: keep last measured values, drop live phases
+        speed.finalize(id);
 
         notifyStateChange();
 
@@ -605,6 +633,7 @@ export function launchAgent(
         releaseAllAgentLocks(id);
         // Clean up context tracking data
         clearAgentContext(id);
+        speed.finalize(id);
 
         notifyStateChange();
         instance.resolve?.(buildResult());
