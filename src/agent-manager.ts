@@ -986,7 +986,7 @@ export function processSpawnRequests(
           task: request.task,
           status: "error",
           output: "",
-          stderr: `Cannot spawn ${formatTierLabel(tier)}: max parallel limit reached (${running}/${capacity} agents active across ${poolSize} model(s)). Wait for running agents to complete, or increase the limit via /tmg-config.`,
+          stderr: `Cannot spawn ${formatTierLabel(tier)}: max parallel limit reached (${running}/${capacity} agents active across ${poolSize} model(s)). Wait for running agents to complete, or increase the limit via /tmg config.`,
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
           log: [],
         },

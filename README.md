@@ -22,7 +22,7 @@ Every sub-agent is a real `pi` process (`pi -p --mode json`), so agents run in c
 | **t3** | Fast, cheap worker for mechanical tasks (parsing, formatting, translation, file ops). | configured | 4 | 85% | `t3a`, `t3b`... |
 
 - The **active** tier is always available (it uses the model pi is currently running, captured live — even if you switch models mid-session with `/model`).
-- **t1/t2/t3** are only available once you give each tier a model via `/tmg-config` (or a config file / agent file). Unavailable tiers are reported to the LLM so it never tries to spawn them.
+- **t1/t2/t3** are only available once you give each tier a model via `/tmg config` (or a config file / agent file). Unavailable tiers are reported to the LLM so it never tries to spawn them.
 - Agent IDs: `t` + tier number + instance letter (`t0a`, `t2b`, `t3c`...).
 
 ## Install
@@ -57,7 +57,7 @@ pi update --extensions      # reconcile pinned git refs
 
 ```
 # Open the interactive config (pick a model for each tier, tune limits)
-/tmg-config
+/tmg config
 
 # Launch agents from the prompt
 /t0 analyze the CSVs in ./data and summarize the columns
@@ -72,7 +72,7 @@ pi update --extensions      # reconcile pinned git refs
 /tmg list
 /tmg dashboard
 /tmg halt            # or Ctrl+Alt+H
-/tmg-config          # ...
+/tmg config          # ...
 ```
 
 Results are harvested into the chat as each agent finishes, with per-agent logs, token/cost usage and a `✓ n/m done` summary. The main agent is explicitly instructed not to `sleep`/poll waiting for workers; it can call `trimegisto_harvest` for an instant non-blocking snapshot instead.
@@ -134,7 +134,7 @@ When Trimegisto is enabled, a hidden orchestration directive is injected before 
 | `/tmg loops` | Show Loop Supervisor state (strikes, cooldowns, alerts) |
 | `/tmg loops sensitivity <0.5..1>` | Tune similarity threshold at runtime |
 | `/tmg reset-loops [active\|t1\|t2\|t3]` | Reset loop strikes for a tier (or all) |
-| `/tmg-config` | Interactive configuration (models, limits, flags) |
+| `/tmg config` | Interactive configuration (models, limits, flags) |
 
 ### Steering
 
@@ -142,7 +142,7 @@ Because each agent is a separate process, "steering" means **replacing**: Trimeg
 
 ## Configuration
 
-### `/tmg-config` (interactive)
+### `/tmg config` (interactive)
 
 Menu → per-tier submenu:
 
@@ -265,7 +265,7 @@ The package ships compact `agents/t1.md`, `t2.md`, `t3.md` skills. They teach ea
 
 ## Load Footprint
 
-The extension keeps startup lean: `src/index.ts` registers public commands/tools immediately, while command handlers, the dashboard renderer and `/tmg-config` UI are lazy-loaded on first use. Runtime strings and tier skill prompts are intentionally compact; keep long explanations in this README, not in loaded prompt/tool metadata.
+The extension keeps startup lean: `src/index.ts` registers public commands/tools immediately, while command handlers, the dashboard renderer and `/tmg config` UI are lazy-loaded on first use. Runtime strings and tier skill prompts are intentionally compact; keep long explanations in this README, not in loaded prompt/tool metadata.
 
 ## Package Structure
 
@@ -285,7 +285,7 @@ trimegisto/
 │   ├── speed.ts                # prefill/decode telemetry (token stream, provider-agnostic)
 │   ├── dashboard.ts            # lazy TUI widgets: live ↑prefill / ↓decode speeds
 │   ├── commands.ts             # lazy /tmg*, /t0..t3, @mention, shortcut handlers
-│   ├── config-ui.ts            # lazy /tmg-config UI
+│   ├── config-ui.ts            # lazy /tmg config UI
 │   └── types.ts
 ├── agents/
 │   ├── t1.md  t2.md  t3.md     # tier skills

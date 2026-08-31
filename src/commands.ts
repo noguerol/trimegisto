@@ -15,6 +15,7 @@ export interface CommandRuntime {
   haltAll?: () => number;
   sendToAgent?: (agentId: string, instruction: string) => any | Promise<any>;
   toggleDashboard?: () => void;
+  openConfig?: (ctx: any) => void | Promise<void>;
 }
 
 const TIERS = ["active", "t1", "t2", "t3"] as const;
@@ -35,6 +36,12 @@ export async function handleTmgCommand(pi: ExtensionAPI, args: string | undefine
   const sub = parts[0]?.toLowerCase();
 
   switch (sub) {
+    case "config":
+    case "cfg":
+      if (rt.openConfig) await rt.openConfig(ctx);
+      else ctx.ui.notify("Config UI unavailable.", "warning");
+      return;
+
     case "enable":
     case "on":
       rt.setEnabled ? (rt.setEnabled(true), ctx.ui.notify("Trimegisto: ON", "info")) : ctx.ui.notify("Enable unavailable", "warning");
@@ -164,6 +171,7 @@ export async function handleTmgCommand(pi: ExtensionAPI, args: string | undefine
       return;
     }
 
+    case "dashboard":
     case "dash":
     case "d":
       if (!enabled(rt, ctx)) return;
@@ -173,6 +181,7 @@ export async function handleTmgCommand(pi: ExtensionAPI, args: string | undefine
     default:
       ctx.ui.notify(
         "Trimegisto commands:\n" +
+        "  /tmg config\n" +
         "  /tmg launch <active|t1|t2|t3> <task>\n" +
         "  /tmg tell <agent-id> <msg>\n" +
         "  /tmg kill <id> | halt | list | switch <id>\n" +
