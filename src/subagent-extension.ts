@@ -359,8 +359,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "trimegisto_spawn",
     label: "Trimegisto Spawn",
-    description: "Spawn Trimegisto sub-agents in parallel. Non-blocking. Prefer batch {tasks:[...]}. Default active/t0 = main pi model. Roles: T3 mechanical, T2 reasoning, T1 planning only. Disabled Trimegisto returns error.",
-    promptSnippet: "Spawn batch: trimegisto_spawn({tasks:[{tier:'active',task:'...'}]})",
+    description: "Spawn Trimegisto sub-agents in parallel. Non-blocking. PROACTIVE POLICY: if your assigned task has 2+ independent subtasks/files/checks, call this first with batch {tasks:[...]} before doing serial work. Skip only trivial or indivisible work. Default active/t0 = main pi model. Roles: T3 mechanical, T2 reasoning, T1 planning only. Disabled Trimegisto returns error.",
+    promptSnippet: "For decomposable work, first call trimegisto_spawn({tasks:[{tier:'active',task:'...'}, ...]}). Skip only single indivisible tasks.",
     parameters: SpawnBatchParams,
 
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {

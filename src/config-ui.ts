@@ -1,6 +1,7 @@
 import { Container, getKeybindings, Spacer, Text } from "@earendil-works/pi-tui";
 import { formatTierLabel } from "./config.ts";
 import type { AgentTier, TrimegistoConfig } from "./types.ts";
+import { formatTmgStatus } from "./branding.ts";
 
 export interface ConfigUIRuntime {
   config: TrimegistoConfig;
@@ -93,8 +94,8 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
     config.enabled = !config.enabled;
     ctx.ui.notify(`Trimegisto: ${config.enabled ? "ON" : "OFF"}`, config.enabled ? "info" : "warning");
     rt.registerMainTool();
-    if (config.enabled) { await rt.updateDashboard(); try { rt.ctxRef?.ui.setStatus("trimegisto", "◇ Trimegisto active"); } catch {} }
-    else { rt.haltAll(); try { rt.ctxRef?.ui.setFooter(undefined); rt.ctxRef?.ui.setWidget("trimegisto", undefined); rt.ctxRef?.ui.setWidget("trimegisto-compact", undefined); rt.ctxRef?.ui.setStatus("trimegisto", "◇ Trimegisto disabled"); } catch {} }
+    if (config.enabled) { await rt.updateDashboard(); try { rt.ctxRef?.ui.setStatus("trimegisto", formatTmgStatus(true)); } catch {} }
+    else { rt.haltAll(); try { rt.ctxRef?.ui.setFooter(undefined); rt.ctxRef?.ui.setWidget("trimegisto", undefined); rt.ctxRef?.ui.setWidget("trimegisto-compact", undefined); rt.ctxRef?.ui.setStatus("trimegisto", formatTmgStatus(false)); } catch {} }
     rt.saveConfig(); return;
   }
   if (tier.startsWith("Auto-spawn")) { config.autoSpawn = !config.autoSpawn; ctx.ui.notify(`Auto-spawn: ${config.autoSpawn ? "ON" : "OFF"}`, "info"); rt.saveConfig(); return; }

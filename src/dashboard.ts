@@ -15,6 +15,7 @@ import {
 } from "./agent-manager.ts";
 import { formatTierLabel } from "./config.ts";
 import { speed, MAIN_TARGET, type SpeedSnapshot } from "./speed.ts";
+import { TMG_SHORT, formatTmgStatus } from "./branding.ts";
 
 /** Status dot colors (using theme color names) */
 type ThemeColor = "success" | "accent" | "warning" | "error" | "dim" | "muted";
@@ -147,7 +148,7 @@ export function createDashboardWidget(ctx: ExtensionContext) {
           .sort((a, b) => b.startedAt - a.startedAt);
 
         const lines: string[] = [];
-        lines.push(theme.fg("muted", theme.bold("◇ Trimegisto Agents")));
+        lines.push(theme.fg("muted", theme.bold(`${TMG_SHORT} agents`)));
 
         // Helper: format token count
         const fmtTokens = (n: number): string => {
@@ -165,9 +166,9 @@ export function createDashboardWidget(ctx: ExtensionContext) {
         if (agentList.length === 0) {
           // No sub-agents yet: the main session row still shows live speeds.
           const solo = speedSuffix(speed.snapshot(MAIN_TARGET), fmtSpeed);
-          if (!solo) return [theme.fg("dim", "◇ Trimegisto: no active agents")];
+          if (!solo) return [theme.fg("dim", formatTmgStatus(true, "idle"))];
           return [
-            theme.fg("muted", theme.bold("◇ Trimegisto")),
+            theme.fg("muted", theme.bold(formatTmgStatus(true))),
             theme.fg("muted", `  ⌁ main${solo}`),
           ].map((l) => truncateToWidth(l, width));
         }
@@ -289,7 +290,7 @@ export function createCompactWidget(ctx: ExtensionContext) {
 
         if (active === 0 && done > 0) {
           // Idle: show session totals
-          let line = theme.fg("dim", `◇ Trimegisto: ${done} done`);
+          let line = theme.fg("dim", formatTmgStatus(true, `${done}✓`));
           if (session.totalOutput > 0) {
             line += ` · 📥${fmtTokens(session.totalInput)} 📤${fmtTokens(session.totalOutput)}`;
           }
@@ -303,7 +304,7 @@ export function createCompactWidget(ctx: ExtensionContext) {
         }
 
         // Active: aggregate metrics FIRST
-        let line = theme.fg("muted", "◇ Trimegisto ");
+        let line = theme.fg("muted", `${formatTmgStatus(true)} `);
 
         const aggParts: string[] = [];
         aggParts.push(theme.fg("accent", `${active} active`));
