@@ -64,9 +64,9 @@ pi update --extensions      # reconcile pinned git refs
 /t2b fix the failing test in src/parser.ts
 @t3c translate the docs to Spanish
 
-# Or just ask the main LLM — it has the `trimegisto` tool
-"Launch 4 active agents to review the diff in parallel,
- one per file, and 1 t2 to merge the findings."
+# Or just ask normally — when enabled, the main LLM is instructed to
+# spawn first for any decomposable/parallelizable request.
+"Review the diff, run the relevant tests, and summarize risks."
 
 # Inspect & control
 /tmg list
@@ -82,7 +82,7 @@ Results stream into the chat as each agent finishes, with per-agent logs, token/
 While agents run, the dashboard shows **continuous prefill and generation speeds** for every target (each sub-agent plus the main session), updating ~every 500 ms without any input from you:
 
 ```text
-◇ Trimegisto 3 active ↓246.7t/s ↑1890t/s T2 2r T3 1r · ⌁ main ↓38.1t/s
+🧙 Tmg:on 3 active ↓246.7t/s ↑1890t/s T2 2r T3 1r · ⌁ main ↓38.1t/s
 ```
 
 - `↓NNNt/s` — decode/generation (summed across agents), **live** while streaming
@@ -97,7 +97,7 @@ The values are measured from the token stream itself (provider-agnostic), calibr
 
 ### The `trimegisto` tool (LLM-facing)
 
-The main model can delegate work in a single non-blocking call:
+When Trimegisto is enabled, a hidden orchestration directive is injected before each main-agent turn: decomposable work must be delegated first, and the main agent should keep coordination/synthesis. The main model can delegate work in a single non-blocking call:
 
 ```json
 {
@@ -156,7 +156,7 @@ Global flags in the main menu:
 | Flag | Default | Effect |
 |------|---------|--------|
 | `enabled` | `true` | Master switch for the whole extension |
-| `autoSpawn` | `true` | Sub-agents can spawn other agents (`trimegisto_spawn`) |
+| `autoSpawn` | `true` | Enables proactive delegation guidance and lets sub-agents spawn other agents (`trimegisto_spawn`) |
 | `useActiveModel` | `true` | `active` tier agents use the pi active model (OFF → pi default model) |
 | `spawnOnlyOnActive` | `false` | Force **all** spawns onto the `active` tier (t0); t1/t2/t3 never spawn |
 | `redundantAgents` | `false` | t1/t2 spawn on the least-loaded model of their pool and fail over on provider errors/exhaustion/timeouts |
@@ -236,7 +236,7 @@ Inspect with `/tmg loops`, tune with `/tmg loops sensitivity <0.5..1>` (higher =
 ```
 
 - **IPC** — sub-agents write spawn requests as JSON files; the main extension polls (500 ms), launches, and writes response files. All communication lives under a **per-instance directory** (`~/.pi/agent/trimegisto/instances/pid-<pid>-<ts>/`), so multiple pi processes running Trimegisto at the same time never interfere.
-- **Auto-spawn** — with `autoSpawn` on, agents can spawn other agents via `trimegisto_spawn` (batch mode preferred: `{tasks: [...]}` runs everything in parallel). Spawning is **non-blocking** (async polling, no frozen process) and depth/cooldown-limited by the supervisor.
+- **Auto-spawn** — with `autoSpawn` on, the main agent receives a strong hidden policy to spawn first for decomposable work, and sub-agents can spawn more agents via `trimegisto_spawn` (batch mode preferred: `{tasks: [...]}` runs everything in parallel). Spawning is **non-blocking** (async polling, no frozen process) and depth/cooldown-limited by the supervisor.
 - **File locks** — advisory, 60 s stale timeout. Agents call `file_lock` before write/edit and `file_unlock` after; conflicts return the lock owner so agents can wait or move on. Locks are released automatically when an agent finishes, is killed or halted. Inspect with `/tmg locks`.
 - **Context broker** — when an agent modifies a file, other agents that previously read it (via `file_read_track`) get a compact system alert: "⚠️ Stale file: `x.ts` changed by `t3a` — re-read before editing."
 - **Proactive compaction** — Trimegisto watches the **main session's** context usage and triggers pi compaction proactively when it crosses the lowest enabled tier threshold (60 s cooldown), so long orchestration sessions stay under the limit.

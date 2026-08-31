@@ -37,6 +37,7 @@ import { saveConfig as persistConfig, loadConfig } from "./persistence.ts";
 import { cleanupOldNotifications } from "./context-broker.ts";
 import { LoopSupervisor, type LoopAlert } from "./loop-supervisor.ts";
 import { speed, MAIN_TARGET } from "./speed.ts";
+import { formatTmgStatus } from "./branding.ts";
 
 // ── Configuration entry type ────────────────────────────
 const CONFIG_ENTRY = "trimegisto-config-v1";
@@ -240,7 +241,7 @@ export default function (pi: ExtensionAPI) {
       // Force TUI re-render so messages appear immediately
       try {
         if (ctxRef?.hasUI) {
-          ctxRef.ui.setStatus("trimegisto", `◇ Trimegisto: ${formatTierLabel(getAgent(agentId)?.tier || "?")} ${agentId} active`);
+          ctxRef.ui.setStatus("trimegisto", formatTmgStatus(true, `${formatTierLabel(getAgent(agentId)?.tier || "?")} ${agentId} active`));
         }
       } catch { /* ctx stale after session reload */ }
     }
@@ -512,6 +513,7 @@ export default function (pi: ExtensionAPI) {
   function buildToolDescription(): string {
     return [
       "Launch parallel Trimegisto sub-agents.",
+      "PROACTIVE POLICY: when Trimegisto is enabled, decompose and call this tool FIRST for any request with 2+ independent subtasks/files/areas. Skip only for a single indivisible/non-parallelizable/trivial task or explicit user opt-out. If unsure, spawn 2 active scouts and synthesize.",
       "Tiers now:",
       tierStatusLine("active"),
       tierStatusLine("t1"),
@@ -529,7 +531,7 @@ export default function (pi: ExtensionAPI) {
     name: "trimegisto",
     label: "Trimegisto Multi-Agent",
     description: buildToolDescription(),
-    promptSnippet: "Spawn parallel agents. Default tier active. Use only ENABLED tiers.",
+    promptSnippet: "TRIMEGISTO ACTIVE: spawn parallel agents before solving any decomposable task. Skip only single indivisible/non-parallelizable tasks. Default tier active; use only ENABLED tiers.",
     parameters: Type.Object({
       tasks: Type.Array(TrimegistoTaskItem, {
         description: "Tasks. Max 8. Default tier active.",
@@ -859,7 +861,7 @@ export default function (pi: ExtensionAPI) {
       config.enabled = v;
       if (v) {
         updateDashboard();
-        try { if (ctxRef) ctxRef.ui.setStatus("trimegisto", "◇ Trimegisto active"); } catch {}
+        try { if (ctxRef) ctxRef.ui.setStatus("trimegisto", formatTmgStatus(true)); } catch {}
       } else {
         haltAll();
         try {
@@ -867,7 +869,7 @@ export default function (pi: ExtensionAPI) {
             ctxRef.ui.setFooter(undefined);
             ctxRef.ui.setWidget("trimegisto", undefined);
             ctxRef.ui.setWidget("trimegisto-compact", undefined);
-            ctxRef.ui.setStatus("trimegisto", "◇ Trimegisto disabled");
+            ctxRef.ui.setStatus("trimegisto", formatTmgStatus(false));
           }
         } catch {}
       }
@@ -1003,12 +1005,12 @@ export default function (pi: ExtensionAPI) {
 
     if (config.enabled) {
       updateDashboard();
-      ctx.ui.setStatus("trimegisto", "◇ Trimegisto active");
+      ctx.ui.setStatus("trimegisto", formatTmgStatus(true));
     } else {
       ctx.ui.setFooter(undefined);
       ctx.ui.setWidget("trimegisto", undefined);
       ctx.ui.setWidget("trimegisto-compact", undefined);
-      ctx.ui.setStatus("trimegisto", "◇ Trimegisto disabled");
+      ctx.ui.setStatus("trimegisto", formatTmgStatus(false));
     }
   });
 
@@ -1110,16 +1112,32 @@ export default function (pi: ExtensionAPI) {
     if (!config.enabled) return;
 
     const activeAgents = getActiveAgents();
-    if (activeAgents.length === 0) return;
+    const agentList = activeAgents.length > 0
+      ? activeAgents
+          .map(a => `- ${a.id} [${a.status}]: ${a.task.slice(0, 80)}`)
+          .join("\n")
+      : "- none";
 
-    const agentList = activeAgents
-      .map(a => `- ${a.id} [${a.status}]: ${a.task.slice(0, 80)}`)
-      .join("\n");
+    const availableTiers = (["active", "t1", "t2", "t3"] as const)
+      .filter(tierAvailable)
+      .map(t => t === "active" ? "active/t0" : t.toUpperCase())
+      .join(", ") || "none";
+
+    const proactivePolicy = config.autoSpawn
+      ? [
+          "TRIMEGISTO IS ACTIVE: you are operating in multi-agent mode.",
+          "For every user request, first decide whether it has 2+ independent subtasks/files/areas/checks.",
+          "If it is decomposable, your FIRST assistant action MUST be a `trimegisto` batch tool call that launches parallel agents; then do only coordination and synthesis while they run.",
+          "Do NOT solve decomposable work entirely in the main agent before spawning. Use the main agent for orchestration, final integration, and genuinely single-threaded steps.",
+          "Skip spawning only when the task is trivial, a single indivisible/non-parallelizable step, or the user explicitly asks not to delegate.",
+          "If unsure, spawn at least two active/t0 scout workers with complementary angles and synthesize their findings.",
+        ].join("\n")
+      : "Trimegisto is enabled but auto-spawn is OFF: delegate only when explicitly requested or clearly useful.";
 
     return {
       message: {
         customType: "trimegisto-context",
-        content: `Tmg active agents (${activeAgents.length}):\n${agentList}\n\nAdvisory: delegate work via trimegisto. Prefer cheaper capable tiers: T3 mechanical, T2 reasoning, T1 only hard planning. Manual: /tmg, @t2b <instruction>.`,
+        content: `${proactivePolicy}\n\nAvailable tiers: ${availableTiers}. Prefer active/t0 for mass parallel work; T3 mechanical, T2 reasoning, T1 only hard planning.\nActive agents (${activeAgents.length}):\n${agentList}\n\nManual controls: /tmg, /t0, /t1, /t2, /t3, @t2b <instruction>.`,
         display: false,
       },
     };
@@ -1144,14 +1162,14 @@ export default function (pi: ExtensionAPI) {
         const active = liveAgentCount();
 
         if (active > 0) {
-          ctxRef.ui.setStatus("trimegisto", `◇ Trimegisto: ${active} active`);
+          ctxRef.ui.setStatus("trimegisto", formatTmgStatus(true, `${active}↻`));
         } else {
           const total = counts.active.total + counts.t1.total + counts.t2.total + counts.t3.total;
           if (total > 0) {
             const done = counts.active.done + counts.t1.done + counts.t2.done + counts.t3.done;
-            ctxRef.ui.setStatus("trimegisto", `◇ Trimegisto: ${done} completed`);
+            ctxRef.ui.setStatus("trimegisto", formatTmgStatus(true, `${done}✓`));
           } else {
-            ctxRef.ui.setStatus("trimegisto", "◇ Trimegisto");
+            ctxRef.ui.setStatus("trimegisto", formatTmgStatus(true));
           }
         }
       }
