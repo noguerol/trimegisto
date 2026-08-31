@@ -292,7 +292,7 @@ export default function (pi: ExtensionAPI) {
         task,
         status: "error" as const,
         output: "",
-        stderr: `Tier ${formatTierLabel(tier)} is not available (disabled or no model configured). Enable it or set a model via /tmg-config.`,
+        stderr: `Tier ${formatTierLabel(tier)} is not available (disabled or no model configured). Enable it or set a model via /tmg config.`,
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
         log: [] as AgentLogEntry[],
       };
@@ -307,7 +307,7 @@ export default function (pi: ExtensionAPI) {
         task,
         status: "error" as const,
         output: "",
-        stderr: `No model configured for ${formatTierLabel(tier)} tier. Use /tmg-config to set one.`,
+        stderr: `No model configured for ${formatTierLabel(tier)} tier. Use /tmg config to set one.`,
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
         log: [] as AgentLogEntry[],
       };
@@ -338,7 +338,7 @@ export default function (pi: ExtensionAPI) {
     const task = slashMatch[3].trim();
 
     if (!config[tier].model) {
-      ctx.ui.notify(`No model configured for ${formatTierLabel(tier)}. Use /tmg-config.`, "error");
+      ctx.ui.notify(`No model configured for ${formatTierLabel(tier)}. Use /tmg config.`, "error");
       return { action: "handled" as const };
     }
 
@@ -406,7 +406,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (!config[tier].model) {
-      ctx.ui.notify(`No model configured for ${formatTierLabel(tier)}. Use /tmg-config.`, "error");
+      ctx.ui.notify(`No model configured for ${formatTierLabel(tier)}. Use /tmg config.`, "error");
       return { action: "handled" as const };
     }
 
@@ -589,7 +589,7 @@ export default function (pi: ExtensionAPI) {
         return {
           content: [{
             type: "text",
-            text: `❌ Cannot spawn tier(s): ${bad} — not available right now (disabled or no model configured).\nAvailable tiers: ${["active","t1","t2","t3"].filter(tierAvailable).join(", ")}.\nConfigure with /tmg-config.`,
+            text: `❌ Cannot spawn tier(s): ${bad} — not available right now (disabled or no model configured).\nAvailable tiers: ${["active","t1","t2","t3"].filter(tierAvailable).join(", ")}.\nConfigure with /tmg config.`,
           }],
           details: { unavailable: bad, available: ["active","t1","t2","t3"].filter(tierAvailable) },
           isError: true,
@@ -947,10 +947,30 @@ export default function (pi: ExtensionAPI) {
       config.redundantAgents,
     ),
     toggleDashboard: (pi as any)._trimegistoToggleDashboard,
+    openConfig: async (ctx: any) => {
+      const { runConfigUI } = await import("./config-ui.ts");
+      return runConfigUI(ctx, {
+        config,
+        dashboardMode,
+        setDashboardMode: (mode) => { dashboardMode = mode; },
+        activeModel,
+        ctxRef,
+        updateDashboard,
+        haltAll,
+        saveConfig,
+        registerMainTool,
+      });
+    },
   });
 
   pi.registerCommand("tmg", {
     description: "Trimegisto control",
+    getArgumentCompletions: (prefix: string) => {
+      const first = prefix.trim().split(/\s+/)[0]?.toLowerCase() || "";
+      const subs = ["config", "enable", "disable", "launch", "tell", "kill", "halt", "list", "switch", "dashboard", "locks", "loops", "reset-loops"];
+      const items = subs.filter(s => s.startsWith(first)).map(s => ({ value: s, label: s }));
+      return items.length > 0 ? items : null;
+    },
     handler: async (args, ctx) => (await import("./commands.ts")).handleTmgCommand(pi, args, ctx, commandRuntime()),
   });
   for (const tier of ["active", "t1", "t2", "t3"] as const) {
@@ -1199,7 +1219,7 @@ export default function (pi: ExtensionAPI) {
     return {
       message: {
         customType: "trimegisto-context",
-        content: `${proactivePolicy}\n\nAvailable tiers: ${availableTiers}. Prefer active/t0 for mass parallel work; T3 mechanical, T2 reasoning, T1 only hard planning.\nActive agents (${activeAgents.length}):\n${agentList}\n\nManual controls: /tmg, /t0, /t1, /t2, /t3, @t2b <instruction>.`,
+        content: `${proactivePolicy}\n\nAvailable tiers: ${availableTiers}. Prefer active/t0 for mass parallel work; T3 mechanical, T2 reasoning, T1 only hard planning.\nActive agents (${activeAgents.length}):\n${agentList}\n\nManual controls: /tmg config, /tmg list, /t0, /t1, /t2, /t3, @t2b <instruction>.`,
         display: false,
       },
     };
@@ -1311,22 +1331,4 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // ── Configuration command (lazy UI) ──────────────────
-  pi.registerCommand("tmg-config", {
-    description: "Configure Trimegisto",
-    handler: async (_args, ctx) => {
-      const { runConfigUI } = await import("./config-ui.ts");
-      return runConfigUI(ctx, {
-        config,
-        dashboardMode,
-        setDashboardMode: (mode) => { dashboardMode = mode; },
-        activeModel,
-        ctxRef,
-        updateDashboard,
-        haltAll,
-        saveConfig,
-        registerMainTool,
-      });
-    },
-  });
 }
