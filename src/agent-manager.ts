@@ -69,8 +69,14 @@ const agents = new Map<string, AgentInstance>();
 /** Patterns in stderr that signal provider-side exhaustion (quota, rate limit, overload) */
 const PROVIDER_EXHAUSTION_PATTERN = /429|rate.?limit|quota|insufficient|overload|exhausted|capacity|503|payment|billing|usage limit|limit reached|402/i;
 
-/** Wait for the first assistant message before considering the model unresponsive (failover trigger) */
-const FIRST_RESPONSE_TIMEOUT_MS = 120_000;
+/**
+ * Watchdogs keep background workers from blocking orchestration forever.
+ * Defaults are intentionally bounded: agents are scouts/workers, not a second
+ * unbounded main session. Env overrides are useful while testing locally.
+ */
+const FIRST_RESPONSE_TIMEOUT_MS = parseInt(process.env.TRIMEGISTO_FIRST_RESPONSE_TIMEOUT_MS || "90000", 10);
+const AGENT_IDLE_TIMEOUT_MS = parseInt(process.env.TRIMEGISTO_AGENT_IDLE_TIMEOUT_MS || "120000", 10);
+const AGENT_MAX_RUNTIME_MS = parseInt(process.env.TRIMEGISTO_AGENT_MAX_RUNTIME_MS || "300000", 10);
 
 /**
  * Build the ordered model pool for a tier: primary model first, then redundant models.
@@ -249,7 +255,16 @@ export function launchAgent(
   }
   let attemptIndex = 0;
   let responseTimer: ReturnType<typeof setTimeout> | null = null;
+  let idleTimer: ReturnType<typeof setInterval> | null = null;
+  let runtimeTimer: ReturnType<typeof setTimeout> | null = null;
   let gotFirstResponse = false;
+  let lastProgressAt = Date.now();
+
+  function clearAttemptWatchdogs(): void {
+    if (responseTimer) { clearTimeout(responseTimer); responseTimer = null; }
+    if (idleTimer) { clearInterval(idleTimer); idleTimer = null; }
+    if (runtimeTimer) { clearTimeout(runtimeTimer); runtimeTimer = null; }
+  }
 
   agents.set(id, instance);
   notifyStateChange();
@@ -314,6 +329,7 @@ export function launchAgent(
       const exhausted = PROVIDER_EXHAUSTION_PATTERN.test(instance.stderr);
       if (!noWork && !exhausted) return false;
 
+      clearAttemptWatchdogs();
       const nextModel = modelsToTry[++attemptIndex];
       const failoverEntry: AgentLogEntry = {
         ts: Date.now(),
@@ -330,6 +346,7 @@ export function launchAgent(
       instance.stderr = "";
       instance.proc = undefined;
       gotFirstResponse = false;
+      lastProgressAt = Date.now();
       notifyStateChange();
 
       startAttempt(nextModel);
@@ -368,27 +385,72 @@ export function launchAgent(
       instance.proc = proc;
       notifyStateChange();
 
-      // First-response watchdog: if the model never answers, kill and fail over.
-      // Only armed when there are redundant models to fall back to.
+      let partialAssistantText = "";
+
+      const terminateForWatchdog = (stopReason: string, message: string) => {
+        if (instance.status !== "running") return;
+        const timeoutEntry: AgentLogEntry = {
+          ts: Date.now(),
+          level: "error",
+          text: message,
+        };
+        instance.log.push(timeoutEntry);
+        notifyAgentLog(id, timeoutEntry);
+        if (partialAssistantText.trim()) {
+          const partial = partialAssistantText.trim();
+          instance.output += partial + "\n";
+          const partialEntry: AgentLogEntry = {
+            ts: Date.now(),
+            level: "output",
+            text: `[partial before timeout]\n${partial}`,
+          };
+          instance.log.push(partialEntry);
+          notifyAgentLog(id, partialEntry);
+          partialAssistantText = "";
+        }
+        instance.stderr += `\n${message}`;
+        instance.status = "error";
+        instance.stopReason = stopReason;
+        clearAttemptWatchdogs();
+        proc.kill("SIGTERM");
+        setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 5000);
+      };
+
+      const markProgress = () => {
+        lastProgressAt = Date.now();
+      };
+
+      // First-response watchdog: always armed. With redundant agents ON the
+      // close handler may fail over; otherwise this resolves the worker quickly
+      // instead of leaving the main session waiting forever.
       gotFirstResponse = false;
-      if (redundantAgents && modelsToTry.length > 1) {
-        responseTimer = setTimeout(() => {
-          if (!gotFirstResponse && instance.status === "running") {
-            const timeoutEntry: AgentLogEntry = {
-              ts: Date.now(),
-              level: "error",
-              text: `⏱ No response from ${model || "default model"} within ${Math.round(FIRST_RESPONSE_TIMEOUT_MS / 1000)}s`,
-            };
-            instance.log.push(timeoutEntry);
-            notifyAgentLog(id, timeoutEntry);
-            instance.stderr += `\nNo response within ${Math.round(FIRST_RESPONSE_TIMEOUT_MS / 1000)}s`;
-            instance.status = "error";
-            instance.stopReason = "unresponsive";
-            proc.kill("SIGTERM");
-            setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 5000);
-          }
-        }, FIRST_RESPONSE_TIMEOUT_MS);
-      }
+      lastProgressAt = Date.now();
+      responseTimer = setTimeout(() => {
+        if (!gotFirstResponse && instance.status === "running") {
+          terminateForWatchdog(
+            "first_response_timeout",
+            `⏱ No first response from ${model || "default model"} within ${Math.round(FIRST_RESPONSE_TIMEOUT_MS / 1000)}s`,
+          );
+        }
+      }, FIRST_RESPONSE_TIMEOUT_MS);
+
+      idleTimer = setInterval(() => {
+        if (instance.status !== "running") return;
+        const idleMs = Date.now() - lastProgressAt;
+        if (idleMs >= AGENT_IDLE_TIMEOUT_MS) {
+          terminateForWatchdog(
+            "idle_timeout",
+            `⏱ No agent progress for ${Math.round(idleMs / 1000)}s (idle timeout ${Math.round(AGENT_IDLE_TIMEOUT_MS / 1000)}s)`,
+          );
+        }
+      }, Math.min(15_000, Math.max(1_000, Math.floor(AGENT_IDLE_TIMEOUT_MS / 3))));
+
+      runtimeTimer = setTimeout(() => {
+        terminateForWatchdog(
+          "max_runtime_timeout",
+          `⏱ Agent exceeded max runtime ${Math.round(AGENT_MAX_RUNTIME_MS / 1000)}s`,
+        );
+      }, AGENT_MAX_RUNTIME_MS);
 
       let buffer = "";
 
@@ -402,6 +464,7 @@ export function launchAgent(
         } catch {
           return;
         }
+        markProgress();
 
         // Track output from assistant messages
         if (event.type === "message_end" && event.message?.role === "assistant") {
@@ -412,6 +475,7 @@ export function launchAgent(
           }
 
           const msg = event.message;
+          partialAssistantText = "";
           instance.usage.turns++;
           const usage = msg.usage;
           if (usage) {
@@ -513,6 +577,12 @@ export function launchAgent(
           // Every streamed delta feeds the live decode estimate.
           const ev = event.assistantMessageEvent;
           if (ev && (ev.type === "text_delta" || ev.type === "thinking_delta" || ev.type === "toolcall_delta")) {
+            if (!gotFirstResponse) {
+              gotFirstResponse = true;
+              if (responseTimer) { clearTimeout(responseTimer); responseTimer = null; }
+            }
+            markProgress();
+            if (ev.type === "text_delta" && typeof ev.delta === "string") partialAssistantText += ev.delta;
             speed.noteDelta(id, typeof ev.delta === "string" ? ev.delta.length : 0);
           }
           // Incremental usage, when the provider reports it, beats estimating.
@@ -539,14 +609,27 @@ export function launchAgent(
       });
 
       proc.stderr?.on("data", (data: Buffer) => {
+        markProgress();
         instance.stderr += data.toString();
       });
 
       proc.on("close", (code) => {
-        if (responseTimer) { clearTimeout(responseTimer); responseTimer = null; }
+        clearAttemptWatchdogs();
 
         // Process remaining buffer
         if (buffer.trim()) processLine(buffer);
+        if (partialAssistantText.trim()) {
+          const partial = partialAssistantText.trim();
+          instance.output += partial + "\n";
+          const partialEntry: AgentLogEntry = {
+            ts: Date.now(),
+            level: "output",
+            text: `[partial before process exit]\n${partial}`,
+          };
+          instance.log.push(partialEntry);
+          notifyAgentLog(id, partialEntry);
+          partialAssistantText = "";
+        }
 
         const exitCode = code ?? 0;
         if (exitCode !== 0 && instance.status === "running") {
@@ -606,7 +689,7 @@ export function launchAgent(
       });
 
       proc.on("error", (err) => {
-        if (responseTimer) { clearTimeout(responseTimer); responseTimer = null; }
+        clearAttemptWatchdogs();
 
         instance.status = "error";
         instance.stderr += err.message;
@@ -642,7 +725,7 @@ export function launchAgent(
 
     // Handle abort — kills whichever process is currently running for this agent
     const killCurrentProc = () => {
-      if (responseTimer) { clearTimeout(responseTimer); responseTimer = null; }
+      clearAttemptWatchdogs();
       if (instance.status === "running") {
         instance.status = "killed";
         instance.stopReason = "killed";

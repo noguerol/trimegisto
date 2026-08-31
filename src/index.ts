@@ -21,6 +21,7 @@ import {
   getAgent,
   getAgentCounts,
   getActiveAgents,
+  getAgents,
   canSpawnPooled,
   getModelPool,
   selectAvailableModel,
@@ -513,7 +514,7 @@ export default function (pi: ExtensionAPI) {
   function buildToolDescription(): string {
     return [
       "Launch parallel Trimegisto sub-agents.",
-      "PROACTIVE POLICY: when Trimegisto is enabled, decompose and call this tool FIRST for any request with 2+ independent subtasks/files/areas. Skip only for a single indivisible/non-parallelizable/trivial task or explicit user opt-out. If unsure, spawn 2 active scouts and synthesize.",
+      "PROACTIVE POLICY: when Trimegisto is enabled, decompose and call this tool FIRST for any request with 2+ independent subtasks/files/areas. Skip only for a single indivisible/non-parallelizable/trivial task or explicit user opt-out. If unsure, spawn 2 active scouts and synthesize. After launching, NEVER sleep/poll/wait idly for agents; continue useful foreground work or call trimegisto_harvest for an instant snapshot.",
       "Tiers now:",
       tierStatusLine("active"),
       tierStatusLine("t1"),
@@ -531,7 +532,7 @@ export default function (pi: ExtensionAPI) {
     name: "trimegisto",
     label: "Trimegisto Multi-Agent",
     description: buildToolDescription(),
-    promptSnippet: "TRIMEGISTO ACTIVE: spawn parallel agents before solving any decomposable task. Skip only single indivisible/non-parallelizable tasks. Default tier active; use only ENABLED tiers.",
+    promptSnippet: "TRIMEGISTO ACTIVE: spawn parallel agents before decomposable work. After launch, never sleep/poll to wait; continue work or call trimegisto_harvest. Default tier active; use only ENABLED tiers.",
     parameters: Type.Object({
       tasks: Type.Array(TrimegistoTaskItem, {
         description: "Tasks. Max 8. Default tier active.",
@@ -630,6 +631,23 @@ export default function (pi: ExtensionAPI) {
 
       // Launch all agents in background — DO NOT BLOCK
       const launchedAgents: AgentInstance[] = [];
+      const sentHarvests = new Set<string>();
+      const harvestResult = (r: any): void => {
+        const harvestKey = r.agentId || `${r.tier}:${r.task}`;
+        if (sentHarvests.has(harvestKey)) return;
+        sentHarvests.add(harvestKey);
+        const ok = r.status === "done";
+        const output = (r.output || "").trim();
+        const stderr = (r.stderr || "").trim();
+        const preview = output
+          ? output.slice(0, 1800)
+          : (stderr ? `❌ ${stderr.slice(0, 800)}` : "_(no output)_");
+        safeSendMessage({
+          customType: "trimegisto-harvest",
+          content: `## ${ok ? "✅" : "⚠️"} Harvest ${r.agentId || "?"} [${formatTierLabel(r.tier || "?")}] — ${r.status}\n\n**Task:** ${(r.task || "").slice(0, 160)}\n\n${preview}${r.usage?.turns > 0 ? `\n\n*${r.usage.turns} turns, ↑${r.usage.input} ↓${r.usage.output}*` : ""}`,
+          display: true,
+        });
+      };
       const collectedResults: any[] = [];
       const taskDetails: any[] = [];
       let completedCount = 0;
@@ -674,6 +692,7 @@ export default function (pi: ExtensionAPI) {
         agent.resolve = (result) => {
           collectedResults.push(result);
           completedCount++;
+          harvestResult(result);
 
           // When all agents complete, send summary as a chat message
           if (completedCount >= params.tasks.length) {
@@ -724,7 +743,7 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `🚀 Launched ${params.tasks.length} Trimegisto agent(s):\n${taskList}\n\nResults will appear in chat as each agent completes.`,
+          text: `🚀 Launched ${params.tasks.length} Trimegisto agent(s):\n${taskList}\n\nDo not block or sleep waiting for them. Continue useful foreground work; harvested results will be injected as agents finish. For an instant non-blocking snapshot, call trimegisto_harvest.`,
         }],
         details: { tasks: taskDetails },
       };
@@ -838,6 +857,47 @@ export default function (pi: ExtensionAPI) {
   }
   registerMainTool();
 
+  pi.registerTool({
+    name: "trimegisto_harvest",
+    label: "Trimegisto Harvest",
+    description: "Instant, non-blocking snapshot of Trimegisto agents. Use this instead of sleep/polling when you need to integrate available results. Never waits for running agents.",
+    promptSnippet: "Use trimegisto_harvest for immediate available results; never run sleep/poll loops waiting for agents.",
+    parameters: Type.Object({
+      includeOutput: Type.Optional(Type.Boolean({ description: "Include output previews (default true)" })),
+      maxOutputChars: Type.Optional(Type.Number({ description: "Max chars per agent output preview (default 1200)" })),
+    }),
+    async execute(_toolCallId, params) {
+      const includeOutput = params.includeOutput !== false;
+      const maxOutputChars = Math.max(200, Math.min(8000, Math.floor(params.maxOutputChars || 1200)));
+      const agents = Array.from(getAgents().values()).sort((a, b) => a.startedAt - b.startedAt);
+      if (agents.length === 0) {
+        return { content: [{ type: "text", text: "No Trimegisto agents in this session." }], details: { agents: [] } };
+      }
+
+      const lines: string[] = ["## Trimegisto harvest (instant snapshot)", ""];
+      const details: any[] = [];
+      for (const a of agents) {
+        const elapsed = Math.round(((a.finishedAt || Date.now()) - a.startedAt) / 1000);
+        const statusIcon = a.status === "done" ? "✅" : a.status === "running" || a.status === "waiting" ? "⏳" : "⚠️";
+        lines.push(`### ${statusIcon} ${a.id} [${formatTierLabel(a.tier)}] — ${a.status} (${elapsed}s)`);
+        lines.push(`Task: ${a.task.slice(0, 180)}`);
+        if (includeOutput) {
+          const out = a.output.trim();
+          const err = a.stderr.trim();
+          if (out) lines.push("", "```", out.slice(0, maxOutputChars), "```");
+          else if (err) lines.push("", `Error/partial stderr: ${err.slice(0, Math.min(1000, maxOutputChars))}`);
+          else lines.push("", "_(no output yet — do not wait idly; continue other work)_");
+        }
+        if (a.usage.turns > 0) lines.push(`*${a.usage.turns} turns, ↑${a.usage.input} ↓${a.usage.output}*`);
+        lines.push("");
+        details.push({ agentId: a.id, tier: a.tier, task: a.task, status: a.status, output: a.output, stderr: a.stderr, usage: a.usage, elapsedSeconds: elapsed });
+      }
+      const active = agents.filter(a => a.status === "running" || a.status === "waiting").length;
+      lines.push(active > 0 ? `_${active} agent(s) still running; this harvest did not wait._` : "_All agents settled._");
+      return { content: [{ type: "text", text: lines.join("\n") }], details: { agents: details } };
+    },
+  });
+
   // ── Suppress custom message headers via custom renderers ──
   const suppressHeader = (msg: any) => {
     const mdTheme = getMarkdownTheme();
@@ -849,6 +909,7 @@ export default function (pi: ExtensionAPI) {
   };
   pi.registerMessageRenderer("trimegisto-log", suppressHeader);
   pi.registerMessageRenderer("trimegisto-results", suppressHeader);
+  pi.registerMessageRenderer("trimegisto-harvest", suppressHeader);
   pi.registerMessageRenderer("trimegisto-command", suppressHeader);
 
   // ── Register commands (lazy handlers) ───────────────────
@@ -1131,6 +1192,7 @@ export default function (pi: ExtensionAPI) {
           "Do NOT solve decomposable work entirely in the main agent before spawning. Use the main agent for orchestration, final integration, and genuinely single-threaded steps.",
           "Skip spawning only when the task is trivial, a single indivisible/non-parallelizable step, or the user explicitly asks not to delegate.",
           "If unsure, spawn at least two active/t0 scout workers with complementary angles and synthesize their findings.",
+          "After spawning, never run sleep/poll loops just to wait. Continue useful foreground work or call `trimegisto_harvest` for an instant available-results snapshot. Harvested completions are injected automatically.",
         ].join("\n")
       : "Trimegisto is enabled but auto-spawn is OFF: delegate only when explicitly requested or clearly useful.";
 

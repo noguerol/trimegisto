@@ -55,7 +55,7 @@ function writeRequest(tier: string, task: string, parentId: string, cwd: string)
  * Uses fs.promises + setTimeout polling instead of synchronous blocking.
  * This prevents freezing the sub-agent process during spawn-wait.
  */
-async function waitForResponse(requestId: string, timeoutMs: number = 300_000): Promise<any> {
+async function waitForResponse(requestId: string, timeoutMs: number = Number(process.env.TRIMEGISTO_SPAWN_WAIT_MS || 180_000)): Promise<any> {
   const responsesDir = path.join(INSTANCE_DIR, "responses");
   const respPath = path.join(responsesDir, `${requestId}.json`);
   const deadline = Date.now() + timeoutMs;
@@ -441,7 +441,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       onUpdate?.({
-        content: [{ type: "text", text: `⏳ Spawned ${tasks.length} sub-agent(s): ${tasks.map(t => t.tier + "('" + t.task.slice(0, 40) + "')").join(", ")}. Waiting for results...` }],
+        content: [{ type: "text", text: `⏳ Spawned ${tasks.length} sub-agent(s): ${tasks.map(t => t.tier + "('" + t.task.slice(0, 40) + "')").join(", ")}. Waiting with bounded timeout; do not spawn/poll indefinitely.` }],
         details: { tasks: taskDetailList, status: "waiting" },
       });
 
@@ -449,7 +449,7 @@ export default function (pi: ExtensionAPI) {
       const results: any[] = [];
       const errors: string[] = [];
       const startTime = Date.now();
-      const PER_REQUEST_TIMEOUT = 300_000; // 5 min per request
+      const PER_REQUEST_TIMEOUT = Number(process.env.TRIMEGISTO_SPAWN_WAIT_MS || 180_000); // bounded wait per request
 
       try {
         for (const requestId of requestIds) {
@@ -620,6 +620,10 @@ export default function (pi: ExtensionAPI) {
       }
     } catch { /* silent */ }
   }, 5000);
+  // Critical for `pi -p --mode json`: this helper timer must not keep the
+  // sub-agent process alive after the print-mode turn has finished. Otherwise
+  // the parent never receives `close`, so results are never harvested.
+  (pollInterval as any).unref?.();
 
   // Clean up on extension unload
   if (typeof pi.on === "function") {

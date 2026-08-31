@@ -1,6 +1,6 @@
 {
   "name": "trimegisto",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Pi multi-agent orchestration: tiered parallel sub-agents, @mentions, loop guard, file locks, context broker, dashboard.",
   "keywords": [
     "pi-package",

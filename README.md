@@ -75,7 +75,7 @@ pi update --extensions      # reconcile pinned git refs
 /tmg-config          # ...
 ```
 
-Results stream into the chat as each agent finishes, with per-agent logs, token/cost usage and a `✓ n/m done` summary.
+Results are harvested into the chat as each agent finishes, with per-agent logs, token/cost usage and a `✓ n/m done` summary. The main agent is explicitly instructed not to `sleep`/poll waiting for workers; it can call `trimegisto_harvest` for an instant non-blocking snapshot instead.
 
 ### Live throughput in the dashboard
 
@@ -111,8 +111,9 @@ When Trimegisto is enabled, a hidden orchestration directive is injected before 
 ```
 
 - `tier` defaults to `active`; max 8 tasks per call (per-tier capacity = `maxParallel`, higher with redundant model pools).
-- The tool **returns immediately**; agents run in the background and results appear in chat as they complete.
+- The tool **returns immediately**; agents run in the background and results are harvested into chat as they complete.
 - The tool description always lists which tiers are ENABLED right now — the LLM only spawns those.
+- `trimegisto_harvest` returns the current agent snapshot immediately. It never waits; use it instead of sleep/poll loops.
 
 ### Slash commands (user-facing)
 
@@ -236,11 +237,11 @@ Inspect with `/tmg loops`, tune with `/tmg loops sensitivity <0.5..1>` (higher =
 ```
 
 - **IPC** — sub-agents write spawn requests as JSON files; the main extension polls (500 ms), launches, and writes response files. All communication lives under a **per-instance directory** (`~/.pi/agent/trimegisto/instances/pid-<pid>-<ts>/`), so multiple pi processes running Trimegisto at the same time never interfere.
-- **Auto-spawn** — with `autoSpawn` on, the main agent receives a strong hidden policy to spawn first for decomposable work, and sub-agents can spawn more agents via `trimegisto_spawn` (batch mode preferred: `{tasks: [...]}` runs everything in parallel). Spawning is **non-blocking** (async polling, no frozen process) and depth/cooldown-limited by the supervisor.
+- **Auto-spawn** — with `autoSpawn` on, the main agent receives a strong hidden policy to spawn first for decomposable work, then continue without idle sleeps. Sub-agents can spawn more agents via `trimegisto_spawn` (batch mode preferred: `{tasks: [...]}` runs everything in parallel). Spawning is **non-blocking** (async polling, no frozen process) and depth/cooldown-limited by the supervisor.
 - **File locks** — advisory, 60 s stale timeout. Agents call `file_lock` before write/edit and `file_unlock` after; conflicts return the lock owner so agents can wait or move on. Locks are released automatically when an agent finishes, is killed or halted. Inspect with `/tmg locks`.
 - **Context broker** — when an agent modifies a file, other agents that previously read it (via `file_read_track`) get a compact system alert: "⚠️ Stale file: `x.ts` changed by `t3a` — re-read before editing."
 - **Proactive compaction** — Trimegisto watches the **main session's** context usage and triggers pi compaction proactively when it crosses the lowest enabled tier threshold (60 s cooldown), so long orchestration sessions stay under the limit.
-- **Failover** — with `redundantAgents` on, t1/t2 spawn on the least-loaded model of their pool; if a model/provider fails before doing real work (429/quota/overload, no first response in 2 min, spawn error), the same agent ID is retried on the next pool model.
+- **Watchdogs & failover** — every worker has bounded first-response, idle-progress and max-runtime watchdogs (defaults: 90 s / 120 s / 300 s), so a stuck sub-agent is killed and harvested instead of blocking orchestration forever. With `redundantAgents` on, provider failures/no first response can fail over to the next model in the pool.
 
 ### Data layout
 
