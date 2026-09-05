@@ -41,6 +41,8 @@
   "useActiveModel": true,
   "spawnOnlyOnActive": false,
   "redundantAgents": false,
+  "dedupeTasks": true,
+  "dedupeCrossAgent": false,
   "dashboardVisible": true,
   "loopSupervisor": {
     "enabled": true,
@@ -50,6 +52,7 @@
     "turnLimitGrace": 15,
     "tierCooldownMs": 60000,
     "similarityThreshold": 0.92,
-    "minRepeatableOutputChars": 80
+    "minRepeatableOutputChars": 80,
+    "dedupeCrossAgent": false
   }
 }

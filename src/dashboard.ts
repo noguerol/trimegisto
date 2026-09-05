@@ -11,6 +11,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import {
   getAgentCounts,
   getAgents,
+  getLoopSupervisor,
   type AgentCounts,
 } from "./agent-manager.ts";
 import { formatTierLabel } from "./config.ts";
@@ -29,6 +30,16 @@ type ThemeColor = "success" | "accent" | "warning" | "error" | "dim" | "muted";
 let tuiRef: any = null;
 export function requestDashboardRender(): void {
   try { tuiRef?.requestRender?.(); } catch { /* UI not available */ }
+}
+
+/** Count of cross-agent near-duplicate output pairs (Loop Supervisor). */
+function redundancyBadge(): string {
+  const ls = getLoopSupervisor();
+  const st = ls?.getState();
+  if (!st) return "";
+  let n = 0;
+  for (const t of ["active", "t1", "t2", "t3"] as const) n += st.tiers[t].crossDuplicates;
+  return n > 0 ? `♻${n}` : "";
 }
 
 /** Compute session-wide token/cost totals from the live agents map */
@@ -237,6 +248,8 @@ export function createDashboardWidget(ctx: ExtensionContext) {
           if (session.totalTurns > 0) {
             sessionParts.push(`🔄${session.totalTurns} turns`);
           }
+          const redun = redundancyBadge();
+          if (redun) sessionParts.push(theme.fg("warning", redun));
           lines.push(`  ${theme.fg("dim", sessionParts.join(" "))}`);
         }
 
@@ -299,6 +312,8 @@ export function createCompactWidget(ctx: ExtensionContext) {
           }
           const mainIdle = speedSuffix(speed.snapshot(MAIN_TARGET), fmtSpeed);
           if (mainIdle) line += ` ⌁ main${mainIdle}`;
+          const redun = redundancyBadge();
+          if (redun) line += theme.fg("warning", ` ${redun}`);
           lines.push(line);
           return lines.map(l => truncateToWidth(l, width));
         }
@@ -349,6 +364,8 @@ export function createCompactWidget(ctx: ExtensionContext) {
         if (mainLive) {
           line += theme.fg("dim", ` ⌁ main${mainLive}`);
         }
+        const redun = redundancyBadge();
+        if (redun) line += theme.fg("warning", ` ${redun}`);
 
         lines.push(line);
         return lines.map(l => truncateToWidth(l, width));

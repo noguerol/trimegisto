@@ -27,6 +27,8 @@ import { releaseAllAgentLocks, setInstanceDir as setLockInstanceDir } from "./fi
 import { broadcastFileChange, clearAgentContext, setInstanceDir as setContextInstanceDir } from "./context-broker.ts";
 import { type LoopSupervisor, type LoopAlert } from "./loop-supervisor.ts";
 import { speed } from "./speed.ts";
+import { isDuplicateTask, registerTask, forgetTask } from "./task-dedup.ts";
+import { buildSharedContextPreamble } from "./shared-context.ts";
 
 /** Path to the sub-agent extension that provides trimegisto_spawn tool */
 let subagentExtensionPath: string | null = null;
@@ -765,7 +767,12 @@ export function launchAgent(
       const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "trimegisto-"));
       promptDir = tmpDir;
       promptFilePath = path.join(tmpDir, `system-prompt-${id}.md`);
-      await fs.promises.writeFile(promptFilePath, config.systemPrompt, { encoding: "utf-8", mode: 0o600 });
+
+      // Shared-context preamble: files already read and facts already
+      // established by OTHER agents, so this agent avoids re-reading/re-deriving.
+      const sharedPreamble = instanceDir ? buildSharedContextPreamble(instanceDir, id) : "";
+      const fullPrompt = (sharedPreamble ? sharedPreamble + "\n\n" : "") + config.systemPrompt;
+      await fs.promises.writeFile(promptFilePath, fullPrompt, { encoding: "utf-8", mode: 0o600 });
 
       // Launch the first attempt on the primary model
       startAttempt(modelsToTry[0] || "");
@@ -940,6 +947,7 @@ export function processSpawnRequests(
   modelOverride?: string,
   spawnOnlyOnActive: boolean = false,
   redundantAgents: boolean = false,
+  dedupeTasks: boolean = true,
 ): number {
   const requests = scanSpawnRequests();
   let processed = 0;
@@ -995,6 +1003,30 @@ export function processSpawnRequests(
       continue;
     }
 
+    // ── Pre-launch dedup: skip near-duplicate tasks already spawned ──
+    if (dedupeTasks) {
+      const dedupe = isDuplicateTask(request.task);
+      if (dedupe.duplicate) {
+        writeSpawnResponse({
+          requestId: request.requestId,
+          result: {
+            agentId: request.requestId,
+            tier,
+            task: request.task,
+            status: "done",
+            output: `⏭ Skipped: near-duplicate of already-spawned work${dedupe.matchedTier ? ` [${dedupe.matchedTier}]` : ""}: "${(dedupe.matchedTask || "").slice(0, 120)}". Reuse that agent's result instead.`,
+            stderr: "",
+            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+            model: undefined,
+            stopReason: "deduplicated",
+            log: [],
+          },
+        });
+        processed++;
+        continue;
+      }
+    }
+
     try {
       // Model selection:
       // - "active" tier: the pi active model
@@ -1007,6 +1039,8 @@ export function processSpawnRequests(
         const pool = getModelPool(tc, true);
         tierModelOverride = selectAvailableModel(tier, pool, tc.maxParallel) ?? undefined;
       }
+      // Commit the task to the dedup registry now that it is really launching
+      if (dedupeTasks) registerTask(tier, request.task);
       const agent = launchAgent(
         tier,
         request.task,
@@ -1019,6 +1053,8 @@ export function processSpawnRequests(
 
       // Set resolve callback to write IPC response when agent completes
       agent.resolve = (result) => {
+        // Allow a legitimate retry if the accepted spawn failed outright
+        if (result.status === "error" || result.status === "killed") forgetTask(result.task);
         writeSpawnResponse({
           requestId: request.requestId,
           result,

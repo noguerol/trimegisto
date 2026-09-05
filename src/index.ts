@@ -34,6 +34,7 @@ import {
   sendToAgent,
   setLoopSupervisor,
 } from "./agent-manager.ts";
+import { dedupeTaskBatch, registerTask, forgetTask } from "./task-dedup.ts";
 import { saveConfig as persistConfig, loadConfig } from "./persistence.ts";
 import { cleanupOldNotifications } from "./context-broker.ts";
 import { LoopSupervisor, type LoopAlert } from "./loop-supervisor.ts";
@@ -167,17 +168,19 @@ export default function (pi: ExtensionAPI) {
 
   // Loop alert → chat notification
   loopSupervisor.setOnAlert((alert: LoopAlert) => {
-    const emoji = alert.strike >= 3 ? "🚨" : alert.strike >= 2 ? "⚠️" : "🔸";
+    const isDup = alert.type === "cross_agent_duplicate";
+    const emoji = isDup ? "♻️" : alert.strike >= 3 ? "🚨" : alert.strike >= 2 ? "⚠️" : "🔸";
+    const strikeSuffix = isDup ? "" : ` (strike ${alert.strike}/3)`;
     safeSendMessage({
       customType: "trimegisto-log",
-      content: `${emoji} **[Loop Supervisor]** ${alert.message} (strike ${alert.strike}/3)`,
+      content: `${emoji} **[Loop Supervisor]** ${alert.message}${strikeSuffix}`,
       display: true,
     });
     try {
       if (ctxRef?.hasUI) {
         ctxRef.ui.notify(
-          `Loop: ${alert.tier} strike ${alert.strike}/3 — ${alert.message.slice(0, 80)}`,
-          alert.strike >= 3 ? "error" : "warning",
+          `${isDup ? "Redundancy" : "Loop"}: ${alert.tier} — ${alert.message.slice(0, 80)}`,
+          isDup ? "warning" : alert.strike >= 3 ? "error" : "warning",
         );
       }
     } catch { /* ctx stale after session reload */ }
@@ -468,6 +471,7 @@ export default function (pi: ExtensionAPI) {
           spawnModelOverride("active"),
           config.spawnOnlyOnActive,
           config.redundantAgents,
+          config.dedupeTasks,
         );
       } catch { /* silently ignore polling errors */ }
     }
@@ -514,13 +518,13 @@ export default function (pi: ExtensionAPI) {
   function buildToolDescription(): string {
     return [
       "Launch parallel Trimegisto sub-agents.",
-      "PROACTIVE POLICY: when Trimegisto is enabled, decompose and call this tool FIRST for any request with 2+ independent subtasks/files/areas. Skip only for a single indivisible/non-parallelizable/trivial task or explicit user opt-out. If unsure, spawn 2 active scouts and synthesize. After launching, NEVER sleep/poll/wait idly for agents; continue useful foreground work or call trimegisto_harvest for an instant snapshot.",
+      "PROACTIVE POLICY: when Trimegisto is enabled, decompose and call this tool FIRST for any request with 2+ independent subtasks/files/areas. Skip only for a single indivisible/non-parallelizable/trivial task or explicit user opt-out. Assign DISJOINT, non-overlapping subtasks so no two agents redo the same work; only spawn redundant scouts (same task, different angle) when you explicitly need verification/consensus. After launching, NEVER sleep/poll/wait idly for agents; continue useful foreground work or call trimegisto_harvest for an instant snapshot.",
       "Tiers now:",
       tierStatusLine("active"),
       tierStatusLine("t1"),
       tierStatusLine("t2"),
       tierStatusLine("t3"),
-      "Default active/t0 = main pi model; prefer several active agents for same repo/task family.",
+      "Default active/t0 = main pi model; prefer several active agents for mass parallel work across DIFFERENT files/areas.",
       "Roles: active=t0 mass worker; t3=mechanical; t2=reasoning; t1=deep planning only.",
       "Only spawn ✓ ENABLED tiers; ✗ unavailable fails. IDs: t0a,t1a,t2b,t3c... Disabled tool returns error.",
     ].join("\n");
@@ -581,9 +585,34 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      // ── Pre-launch dedup: skip near-duplicate tasks ──────────
+      const dedupedTasks: any[] = [];
+      const skippedTasks: { task: string; tier: string; matchedTask: string; matchedTier?: string }[] = [];
+      if (config.dedupeTasks) {
+        const batch = dedupeTaskBatch(params.tasks as any);
+        dedupedTasks.push(...batch.accepted);
+        for (const s of batch.skipped) {
+          skippedTasks.push({ task: s.task, tier: s.tier, matchedTask: s.matchedTask, matchedTier: s.matchedTier });
+        }
+      } else {
+        dedupedTasks.push(...params.tasks);
+      }
+
+      if (dedupedTasks.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: `⏭ All ${params.tasks.length} task(s) are near-duplicates of already-spawned work:\n` +
+              skippedTasks.map(s => `  - "${s.task.slice(0, 80)}" ≈ "${s.matchedTask.slice(0, 80)}"${s.matchedTier ? ` [${s.matchedTier}]` : ""}`).join("\n") +
+              `\n\nNo new agents launched. The original agents' results are already being harvested.`,
+          }],
+          details: { tasks: [], skipped: skippedTasks },
+        };
+      }
+
       // Reject tiers that are disabled or have no model — the coordinator should
       // only spawn tiers listed as ENABLED in this tool's description.
-      const unavailable = params.tasks.filter((t: any) => !tierAvailable(t.tier));
+      const unavailable = dedupedTasks.filter((t: any) => !tierAvailable(t.tier));
       if (unavailable.length > 0) {
         const bad = [...new Set(unavailable.map((t: any) => t.tier))].join(", ");
         return {
@@ -598,7 +627,7 @@ export default function (pi: ExtensionAPI) {
 
       // Check tier limits
       const taskCounts: Record<string, number> = { active: 0, t1: 0, t2: 0, t3: 0 };
-      for (const t of params.tasks) {
+      for (const t of dedupedTasks) {
         taskCounts[t.tier] = (taskCounts[t.tier] || 0) + 1;
       }
 
@@ -616,7 +645,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Check existing running agents vs limits (pooled capacity when redundant agents are ON)
-      for (const t of params.tasks) {
+      for (const t of dedupedTasks) {
         if (!canSpawnPooled(t.tier, config[t.tier], config.redundantAgents)) {
           const poolSize = getModelPool(config[t.tier], config.redundantAgents).length;
           return {
@@ -652,7 +681,7 @@ export default function (pi: ExtensionAPI) {
       const taskDetails: any[] = [];
       let completedCount = 0;
 
-      for (const task of params.tasks) {
+      for (const task of dedupedTasks) {
         const tier = task.tier;
         if (!tierHasModel(tier)) {
           const errResult = {
@@ -679,6 +708,8 @@ export default function (pi: ExtensionAPI) {
           if (pick) taskModelOverride = pick;
         }
 
+        // Commit to the dedup registry now that the task is really launching
+        if (config.dedupeTasks) registerTask(tier, task.task);
         const agent = launchAgent(tier, task.task, config[tier], task.cwd || cwd, undefined, taskModelOverride, config.redundantAgents);
         launchedAgents.push(agent);
         taskDetails.push({
@@ -690,12 +721,14 @@ export default function (pi: ExtensionAPI) {
 
         // Set resolve callback to collect results and send summary when all done
         agent.resolve = (result) => {
+          // Allow a legitimate retry if the accepted spawn failed outright
+          if (result.status === "error" || result.status === "killed") forgetTask(result.task);
           collectedResults.push(result);
           completedCount++;
           harvestResult(result);
 
           // When all agents complete, send summary as a chat message
-          if (completedCount >= params.tasks.length) {
+          if (completedCount >= dedupedTasks.length) {
             const successCount = collectedResults.filter(r => r.status === "done").length;
             const failCount = collectedResults.filter(r => r.status === "error" || r.status === "killed").length;
 
@@ -743,7 +776,11 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `🚀 Launched ${params.tasks.length} Trimegisto agent(s):\n${taskList}\n\nDo not block or sleep waiting for them. Continue useful foreground work; harvested results will be injected as agents finish. For an instant non-blocking snapshot, call trimegisto_harvest.`,
+          text: `🚀 Launched ${dedupedTasks.length} Trimegisto agent(s):\n${taskList}` +
+            (skippedTasks.length > 0
+              ? `\n\n⏭ Skipped ${skippedTasks.length} near-duplicate task(s):\n` + skippedTasks.map(s => `  - "${s.task.slice(0, 60)}" ≈ "${s.matchedTask.slice(0, 60)}"`).join("\n")
+              : "") +
+            `\n\nDo not block or sleep waiting for them. Continue useful foreground work; harvested results will be injected as agents finish. For an instant non-blocking snapshot, call trimegisto_harvest.`,
         }],
         details: { tasks: taskDetails },
       };
@@ -875,6 +912,19 @@ export default function (pi: ExtensionAPI) {
       }
 
       const lines: string[] = ["## Trimegisto harvest (instant snapshot)", ""];
+
+      // Redundancy metric: near-duplicate outputs detected across agents
+      {
+        const ls = loopSupervisor.getState();
+        let totalDups = 0, totalWasted = 0;
+        for (const t of ["active", "t1", "t2", "t3"] as const) {
+          totalDups += ls.tiers[t].crossDuplicates;
+          totalWasted += ls.tiers[t].wastedTokens;
+        }
+        if (totalDups > 0) {
+          lines.push(`♻️ **Redundancy:** ${totalDups} near-duplicate output pair(s), ~${totalWasted} tokens overlapped.`, "");
+        }
+      }
       const details: any[] = [];
       for (const a of agents) {
         const elapsed = Math.round(((a.finishedAt || Date.now()) - a.startedAt) / 1000);
@@ -959,6 +1009,7 @@ export default function (pi: ExtensionAPI) {
         haltAll,
         saveConfig,
         registerMainTool,
+        syncLoopSupervisor: () => { loopSupervisor.updateConfig({ dedupeCrossAgent: config.dedupeCrossAgent }); },
       });
     },
   });
@@ -1039,6 +1090,8 @@ export default function (pi: ExtensionAPI) {
         useActiveModel: savedConfig.useActiveModel ?? config.useActiveModel,
         spawnOnlyOnActive: savedConfig.spawnOnlyOnActive ?? config.spawnOnlyOnActive,
         redundantAgents: savedConfig.redundantAgents ?? config.redundantAgents,
+        dedupeTasks: savedConfig.dedupeTasks ?? config.dedupeTasks,
+        dedupeCrossAgent: savedConfig.dedupeCrossAgent ?? config.dedupeCrossAgent,
         dashboardVisible: savedConfig.dashboardVisible ?? config.dashboardVisible,
         loopSupervisor: { ...config.loopSupervisor, ...(savedConfig.loopSupervisor || {}) },
       };
@@ -1047,6 +1100,8 @@ export default function (pi: ExtensionAPI) {
       if (savedConfig.loopSupervisor) {
         loopSupervisor.updateConfig(savedConfig.loopSupervisor);
       }
+      // Keep the supervisor's cross-agent dedup flag in sync with the top-level flag
+      loopSupervisor.updateConfig({ dedupeCrossAgent: config.dedupeCrossAgent });
     }
 
     // If config was loaded from session entry but not yet in the file, sync it
@@ -1210,8 +1265,10 @@ export default function (pi: ExtensionAPI) {
           "For every user request, first decide whether it has 2+ independent subtasks/files/areas/checks.",
           "If it is decomposable, your FIRST assistant action MUST be a `trimegisto` batch tool call that launches parallel agents; then do only coordination and synthesis while they run.",
           "Do NOT solve decomposable work entirely in the main agent before spawning. Use the main agent for orchestration, final integration, and genuinely single-threaded steps.",
+          "Assign DISJOINT, non-overlapping subtasks so no two agents redo the same work. Never give two agents the same file or the same question.",
+          "Only spawn redundant 'scout' agents (same task, different angle) when you explicitly need verification/consensus — not by default.",
           "Skip spawning only when the task is trivial, a single indivisible/non-parallelizable step, or the user explicitly asks not to delegate.",
-          "If unsure, spawn at least two active/t0 scout workers with complementary angles and synthesize their findings.",
+          "Assign DISJOINT, non-overlapping subtasks; never two agents on the same file/question. Only spawn redundant scouts when you need verification/consensus.",
           "After spawning, never run sleep/poll loops just to wait. Continue useful foreground work or call `trimegisto_harvest` for an instant available-results snapshot. Harvested completions are injected automatically.",
         ].join("\n")
       : "Trimegisto is enabled but auto-spawn is OFF: delegate only when explicitly requested or clearly useful.";
@@ -1323,6 +1380,8 @@ export default function (pi: ExtensionAPI) {
         useActiveModel: config.useActiveModel,
         spawnOnlyOnActive: config.spawnOnlyOnActive,
         redundantAgents: config.redundantAgents,
+        dedupeTasks: config.dedupeTasks,
+        dedupeCrossAgent: config.dedupeCrossAgent,
         dashboardVisible: config.dashboardVisible,
         loopSupervisor: config.loopSupervisor,
       });

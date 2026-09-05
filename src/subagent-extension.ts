@@ -25,6 +25,7 @@ import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import { publishNote } from "./shared-context.ts";
 
 /** Per-instance IPC directory, set by the main extension via env var */
 const INSTANCE_DIR = process.env.TRIMEGISTO_INSTANCE_DIR || path.join(
@@ -359,8 +360,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "trimegisto_spawn",
     label: "Trimegisto Spawn",
-    description: "Spawn Trimegisto sub-agents in parallel. Non-blocking. PROACTIVE POLICY: if your assigned task has 2+ independent subtasks/files/checks, call this first with batch {tasks:[...]} before doing serial work. Skip only trivial or indivisible work. Default active/t0 = main pi model. Roles: T3 mechanical, T2 reasoning, T1 planning only. Disabled Trimegisto returns error.",
-    promptSnippet: "For decomposable work, first call trimegisto_spawn({tasks:[{tier:'active',task:'...'}, ...]}). Skip only single indivisible tasks.",
+    description: "Spawn Trimegisto sub-agents in parallel. Non-blocking. PROACTIVE POLICY: if your assigned task has 2+ independent subtasks/files/checks, call this first with batch {tasks:[...]} before doing serial work. Assign DISJOINT, non-overlapping subtasks; never two agents on the same file/question. Skip only trivial or indivisible work. Default active/t0 = main pi model. Roles: T3 mechanical, T2 reasoning, T1 planning only. Disabled Trimegisto returns error.",
+    promptSnippet: "For decomposable work, first call trimegisto_spawn({tasks:[{tier:'active',task:'...'}, ...]}). Assign disjoint, non-overlapping subtasks. Skip only single indivisible tasks.",
     parameters: SpawnBatchParams,
 
     async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -600,6 +601,33 @@ export default function (pi: ExtensionAPI) {
           text: `✓ Tracking \`${path.basename(params.file_path)}\` for changes.`,
         }],
         details: { tracked: params.file_path, totalTracked: myReadFiles.size },
+      };
+    },
+  });
+
+  // ── Tool: trimegisto_note ───────────────────────────────
+
+  pi.registerTool({
+    name: "trimegisto_note",
+    label: "Publish Note (Trimegisto)",
+    description: "Publish a short fact/finding to the shared context so OTHER agents can reuse it instead of re-deriving it. Use for non-obvious discoveries: file locations, API shapes, gotchas, decisions.",
+    promptSnippet: "After a key finding: trimegisto_note(text)",
+    parameters: Type.Object({
+      text: Type.String({ description: "Fact or finding to share (max 2000 chars)" }),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const res = publishNote(INSTANCE_DIR, myAgentId, params.text);
+      if (res.ok) {
+        return {
+          content: [{ type: "text", text: `✓ Note published (${res.noteId}). Other agents will see it in their shared context.` }],
+          details: { noteId: res.noteId },
+        };
+      }
+      return {
+        content: [{ type: "text", text: `⚠️ Note not published: ${res.error}` }],
+        details: {},
+        isError: true,
       };
     },
   });

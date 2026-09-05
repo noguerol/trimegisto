@@ -21,8 +21,11 @@ Operational rule:
 - If your assigned task has 2+ independent subtasks/files/areas/checks, your FIRST action must be a trimegisto_spawn batch call so work runs in parallel.
 - Do not complete decomposable work serially before spawning; coordinate, integrate, and synthesize worker results.
 - Skip spawning only for trivial, single indivisible, or clearly non-parallelizable work.
-- If unsure, spawn 2 active/t0 scouts with complementary angles.
-- Prefer active/t0 workers for mass parallel work on the same repo/task family.
+- Assign DISJOINT, non-overlapping subtasks so no two agents redo the same work. Never give two agents the same file or the same question.
+- Only spawn redundant "scout" agents (same task, different angle) when you explicitly need verification/consensus — not by default.
+- Prefer active/t0 workers for mass parallel work across DIFFERENT files/areas.
+- Publish key findings with trimegisto_note so other agents can reuse them instead of re-deriving.
+- Track files you read with file_read_track so other agents are alerted when they change and can reuse your exploration.
 - Escalate only hard planning/architecture to T1; use T2/T3 only if configured.
 
 IDs: t0a/t0b active, t1a planner, t2a solver, t3a worker.`,
@@ -154,6 +157,13 @@ export function buildTierConfig(
 
   const tools = savedConfig?.tools || agentDef?.tools || defaults.tools;
 
+  // Internal Trimegisto tools are always available: they power auto-spawn,
+  // shared context (file_read_track / trimegisto_note) and file locking.
+  // Union them in so existing saved configs and agent files that predate a
+  // tool still get it, without clobbering user-configured extras.
+  const ESSENTIAL_TOOLS = ["trimegisto_spawn", "file_read_track", "trimegisto_note", "file_lock", "file_unlock"];
+  const resolvedTools = [...new Set([...(Array.isArray(tools) ? tools : []), ...ESSENTIAL_TOOLS])];
+
   const extraArgs = savedConfig?.extraArgs || defaults.extraArgs;
 
   // maxParallel and compactionThreshold: saved config > agent file > defaults
@@ -176,7 +186,7 @@ export function buildTierConfig(
     systemPrompt,
     maxParallel: typeof maxParallel === "number" ? maxParallel : defaults.maxParallel,
     compactionThreshold: typeof compactionThreshold === "number" ? compactionThreshold : defaults.compactionThreshold,
-    tools,
+    tools: resolvedTools,
     extraArgs,
     redundantModels,
   };
@@ -191,7 +201,7 @@ function getTierDefaults(tier: AgentTier): TierConfig {
         systemPrompt: DEFAULT_PROMPTS.active,
         maxParallel: 4,
         compactionThreshold: 85,
-        tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn"],
+        tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn", "file_read_track", "trimegisto_note"],
         extraArgs: [],
         redundantModels: [],
       };
@@ -202,7 +212,7 @@ function getTierDefaults(tier: AgentTier): TierConfig {
         systemPrompt: DEFAULT_PROMPTS.t1,
         maxParallel: 1,
         compactionThreshold: 65,
-        tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn"],
+        tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn", "file_read_track", "trimegisto_note"],
         extraArgs: [],
         redundantModels: [],
       };
@@ -213,7 +223,7 @@ function getTierDefaults(tier: AgentTier): TierConfig {
         systemPrompt: DEFAULT_PROMPTS.t2,
         maxParallel: 4,
         compactionThreshold: 75,
-        tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn"],
+        tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn", "file_read_track", "trimegisto_note"],
         extraArgs: [],
         redundantModels: [],
       };
@@ -224,7 +234,7 @@ function getTierDefaults(tier: AgentTier): TierConfig {
         systemPrompt: DEFAULT_PROMPTS.t3,
         maxParallel: 4,
         compactionThreshold: 85,
-        tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn"],
+        tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn", "file_read_track", "trimegisto_note"],
         extraArgs: [],
         redundantModels: [],
       };
@@ -242,6 +252,8 @@ export function getDefaultConfig(): TrimegistoConfig {
     useActiveModel: true,
     spawnOnlyOnActive: false,
     redundantAgents: false,
+    dedupeTasks: true,
+    dedupeCrossAgent: false,
     dashboardVisible: true,
     loopSupervisor: {
       enabled: true,

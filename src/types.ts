@@ -137,6 +137,13 @@ export interface LoopSupervisorConfig {
    * Default: 80
    */
   minRepeatableOutputChars?: number;
+  /**
+   * When true, ALSO detect near-identical outputs between DIFFERENT agents in
+   * the same tier (redundant parallel work). Emits a `cross_agent_duplicate`
+   * alert and accumulates a wasted-token metric, but never inflates loop
+   * strikes (overlap is not a loop). Default: false.
+   */
+  dedupeCrossAgent?: boolean;
 }
 
 export interface TrimegistoConfig {
@@ -166,6 +173,16 @@ export interface TrimegistoConfig {
    * model and fail over to the next one on provider errors/exhaustion/timeouts.
    */
   redundantAgents: boolean;
+  /**
+   * When ON (default), near-duplicate tasks are rejected before launch so the
+   * swarm never pays twice for effectively the same work.
+   */
+  dedupeTasks: boolean;
+  /**
+   * When ON, the Loop Supervisor also flags near-identical outputs from
+   * DIFFERENT agents (redundant parallel work) and reports wasted tokens.
+   */
+  dedupeCrossAgent: boolean;
   /** Whether the dashboard is visible */
   dashboardVisible: boolean;
   /** Loop supervisor settings */
