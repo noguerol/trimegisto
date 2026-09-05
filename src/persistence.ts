@@ -67,6 +67,8 @@ export function saveConfig(config: TrimegistoConfig): void {
       useActiveModel: config.useActiveModel,
       spawnOnlyOnActive: config.spawnOnlyOnActive,
       redundantAgents: config.redundantAgents,
+      dedupeTasks: config.dedupeTasks,
+      dedupeCrossAgent: config.dedupeCrossAgent,
       dashboardVisible: config.dashboardVisible,
       loopSupervisor: config.loopSupervisor,
       // Schema version for future migrations
@@ -100,6 +102,8 @@ export function loadConfig(): {
   useActiveModel?: boolean;
   spawnOnlyOnActive?: boolean;
   redundantAgents?: boolean;
+  dedupeTasks?: boolean;
+  dedupeCrossAgent?: boolean;
   dashboardVisible?: boolean;
   loopSupervisor?: Partial<{ enabled: boolean; maxRepeatedOutputs: number; maxSpawnDepth: number; maxAgentTurns: number; turnLimitGrace: number; tierCooldownMs: number }>;
 } | null {
@@ -123,6 +127,8 @@ export function loadConfig(): {
       useActiveModel: typeof data.useActiveModel === "boolean" ? data.useActiveModel : undefined,
       spawnOnlyOnActive: typeof data.spawnOnlyOnActive === "boolean" ? data.spawnOnlyOnActive : undefined,
       redundantAgents: typeof data.redundantAgents === "boolean" ? data.redundantAgents : undefined,
+      dedupeTasks: typeof data.dedupeTasks === "boolean" ? data.dedupeTasks : undefined,
+      dedupeCrossAgent: typeof data.dedupeCrossAgent === "boolean" ? data.dedupeCrossAgent : undefined,
       dashboardVisible: typeof data.dashboardVisible === "boolean" ? data.dashboardVisible : undefined,
       loopSupervisor: data.loopSupervisor && typeof data.loopSupervisor === "object" ? data.loopSupervisor : undefined,
     };

@@ -161,6 +161,8 @@ Global flags in the main menu:
 | `useActiveModel` | `true` | `active` tier agents use the pi active model (OFF → pi default model) |
 | `spawnOnlyOnActive` | `false` | Force **all** spawns onto the `active` tier (t0); t1/t2/t3 never spawn |
 | `redundantAgents` | `false` | t1/t2 spawn on the least-loaded model of their pool and fail over on provider errors/exhaustion/timeouts |
+| `dedupeTasks` | `true` | Reject near-duplicate tasks before launch (exact + word-set similarity, 5 min window) |
+| `dedupeCrossAgent` | `false` | Flag near-identical outputs from *different* agents and report wasted tokens |
 | `dashboard` | `compact` | UI mode: `compact` / `widget` / `off` |
 
 ### Config file
@@ -194,11 +196,12 @@ Deterministic loop detection in the main process (no prompt changes):
 |-----------|---------|---------|
 | **Output Similarity** | Same agent repeating near-identical output 3× consecutively (shingle Jaccard ≥ 0.92, whole output + progress tail) | 3 repeats, threshold 0.92, min 80 chars |
 | **Error Pattern** | Same agent repeating the same normalized error 3× consecutively | 3 repeats |
+| **Cross-agent duplicate** | Two *different* agents producing near-identical output (redundant parallel work) | opt-in via `dedupeCrossAgent`, sim ≥ 0.92 |
 | **Spawn Depth** | Circular auto-spawn chains | 5 levels |
 | **Turn Limit (soft)** | Agent exceeds `maxAgentTurns` → **warning only**, not killed | 50 turns |
 | **Turn Limit (hard)** | soft + `turnLimitGrace` → **kill** the agent | 65 turns |
 
-Repetition is tracked **per agent**, never per tier: different agents working on the same material (same contract, same codebase) can never trigger a false loop.
+Repetition is tracked **per agent**, never per tier: different agents working on the same material (same contract, same codebase) can never trigger a false loop. With `dedupeCrossAgent` ON, the supervisor *also* compares outputs across different agents in the same tier and flags near-identical results as redundant work (a `♻` alert + wasted-token metric), without inflating loop strikes.
 
 On detection, a **3-strike escalation** applies:
 
@@ -232,12 +235,15 @@ Inspect with `/tmg loops`, tune with `/tmg loops sensitivity <0.5..1>` (higher =
 │    --model <tier model> --tools <tier tools>           │
 │    --extension subagent-extension.ts                   │
 │    tools: trimegisto_spawn (batch, non-blocking),      │
-│           file_lock, file_unlock, file_read_track      │
+│           file_lock, file_unlock, file_read_track,     │
+│           trimegisto_note                              │
 └────────────────────────────────────────────────────────┘
 ```
 
 - **IPC** — sub-agents write spawn requests as JSON files; the main extension polls (500 ms), launches, and writes response files. All communication lives under a **per-instance directory** (`~/.pi/agent/trimegisto/instances/pid-<pid>-<ts>/`), so multiple pi processes running Trimegisto at the same time never interfere.
 - **Auto-spawn** — with `autoSpawn` on, the main agent receives a strong hidden policy to spawn first for decomposable work, then continue without idle sleeps. Sub-agents can spawn more agents via `trimegisto_spawn` (batch mode preferred: `{tasks: [...]}` runs everything in parallel). Spawning is **non-blocking** (async polling, no frozen process) and depth/cooldown-limited by the supervisor.
+- **Task deduplication** — before any launch, the task is fingerprinted and compared (exact + word-set similarity) against tasks spawned in the last 5 minutes. Near-duplicates are skipped with a `⏭` note so the swarm never pays twice for the same work. Disable with `dedupeTasks: false`.
+- **Shared context** — each new agent receives a compact preamble of files already read and facts already published (via `trimegisto_note`) by other agents, so it avoids redundant re-reading and re-derivation.
 - **File locks** — advisory, 60 s stale timeout. Agents call `file_lock` before write/edit and `file_unlock` after; conflicts return the lock owner so agents can wait or move on. Locks are released automatically when an agent finishes, is killed or halted. Inspect with `/tmg locks`.
 - **Context broker** — when an agent modifies a file, other agents that previously read it (via `file_read_track`) get a compact system alert: "⚠️ Stale file: `x.ts` changed by `t3a` — re-read before editing."
 - **Proactive compaction** — Trimegisto watches the **main session's** context usage and triggers pi compaction proactively when it crosses the lowest enabled tier threshold (60 s cooldown), so long orchestration sessions stay under the limit.

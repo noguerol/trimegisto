@@ -147,10 +147,16 @@ export async function handleTmgCommand(pi: ExtensionAPI, args: string | undefine
       }
       const state = supervisor.getState();
       const cfg = supervisor.getConfig();
-      const lines = [`◇ Loop Supervisor (sim ≥ ${cfg.similarityThreshold ?? 0.92})`];
+      const lines = [`◇ Loop Supervisor (sim ≥ ${cfg.similarityThreshold ?? 0.92}${cfg.dedupeCrossAgent ? ", cross-agent ON" : ""})`];
+      let totalDups = 0, totalWasted = 0;
       for (const tier of TIERS) {
         const ts = state.tiers[tier];
-        lines.push(`  ${tier}: ${ts.activeAgents} active, ${ts.recentHashes} outputs${ts.strikes ? ` ⚡ ${ts.strikes}/3` : ""}${(ts as any).turnWarned ? ` ⚠ ${String((ts as any).turnWarned)}` : ""}${ts.cooldownRemaining > 0 ? ` ⏳ ${(ts.cooldownRemaining / 1000).toFixed(0)}s` : ""}`);
+        totalDups += ts.crossDuplicates;
+        totalWasted += ts.wastedTokens;
+        lines.push(`  ${tier}: ${ts.activeAgents} active, ${ts.recentHashes} outputs${ts.strikes ? ` ⚡ ${ts.strikes}/3` : ""}${ts.turnWarned ? ` ⚠ ${ts.turnWarned}` : ""}${ts.crossDuplicates ? ` ♻ ${ts.crossDuplicates}` : ""}${ts.cooldownRemaining > 0 ? ` ⏳ ${(ts.cooldownRemaining / 1000).toFixed(0)}s` : ""}`);
+      }
+      if (totalDups > 0) {
+        lines.push("", `  ♻ Redundancy: ${totalDups} duplicate pair(s), ~${totalWasted} tokens overlapped`);
       }
       if (state.alerts.length) lines.push("", ...state.alerts.slice(-10).map(a => `  ${a.strike >= 3 ? "🚨" : a.strike >= 2 ? "⚠️" : "🔸"} ${a.type} — ${a.message.slice(0, 80)} (${Math.round((Date.now() - a.timestamp) / 1000)}s)`));
       ctx.ui.notify(lines.join("\n"), "info");

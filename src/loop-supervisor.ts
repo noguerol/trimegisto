@@ -16,6 +16,7 @@
  */
 
 import type { AgentResult, AgentTier, LoopSupervisorConfig } from "./types.ts";
+import { shingleHashes, jaccardSimilarity } from "./similarity.ts";
 
 // ── Types ──────────────────────────────────────────────────
 
@@ -23,12 +24,18 @@ import type { AgentResult, AgentTier, LoopSupervisorConfig } from "./types.ts";
 export type { LoopSupervisorConfig } from "./types.ts";
 
 export interface LoopAlert {
-  type: "output_repeat" | "spawn_depth" | "turn_limit" | "strike_three";
+  type: "output_repeat" | "spawn_depth" | "turn_limit" | "strike_three" | "cross_agent_duplicate";
   tier: AgentTier;
   agentId: string;
   message: string;
   strike: number;
   timestamp: number;
+  /** For cross_agent_duplicate: the other agent whose output was near-identical */
+  duplicateAgentId?: string;
+  /** For cross_agent_duplicate: approximate tokens spent producing redundant output */
+  wastedTokens?: number;
+  /** For cross_agent_duplicate: shingle Jaccard similarity (0..1) */
+  similarity?: number;
 }
 
 export interface ContextShock {
@@ -49,54 +56,8 @@ export const DEFAULT_LOOP_CONFIG: LoopSupervisorConfig = {
   tierCooldownMs: 60_000,
   similarityThreshold: 0.92,
   minRepeatableOutputChars: 80,
+  dedupeCrossAgent: false,
 };
-
-// ── Similarity hashing ─────────────────────────────────────
-
-/**
- * Fast non-cryptographic string hash (FNV-1a). Used for shingles.
- */
-function quickHash(s: string): number {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return h >>> 0;
-}
-
-/**
- * Word n-gram (shingle) hashes of normalized text.
- * Used to measure HOW SIMILAR two outputs are, instead of exact equality —
- * agents legitimately working on the same material (contracts, codebases)
- * share long common prefixes but still make progress, so exact hashing
- * produces false loop positives.
- */
-function shingleHashes(text: string, n = 8): number[] {
-  const words = text.toLowerCase().replace(/\s+/g, " ").split(" ");
-  if (words.length < n) {
-    return words.length ? [quickHash(words.join(" "))] : [];
-  }
-  const out: number[] = [];
-  for (let i = 0; i <= words.length - n; i++) {
-    out.push(quickHash(words.slice(i, i + n).join(" ")));
-  }
-  return out;
-}
-
-/** Jaccard similarity of two shingle sets (0 = disjoint, 1 = identical). */
-function similarity(a: number[], b: number[]): number {
-  if (a.length === 0 && b.length === 0) return 1;
-  if (a.length === 0 || b.length === 0) return 0;
-  const setA = new Set(a);
-  const setB = new Set(b);
-  let inter = 0;
-  for (const h of setA) {
-    if (setB.has(h)) inter++;
-  }
-  const union = setA.size + setB.size - inter;
-  return union === 0 ? 1 : inter / union;
-}
 
 /**
  * Normalize an error message for pattern matching.
@@ -143,6 +104,10 @@ interface TierState {
   /** How many consecutive results the last agent has produced without
    *  another agent interleaving. Repetition only counts when >= 3. */
   consecutiveSameAgent: number;
+  /** Number of cross-agent near-duplicate output pairs detected */
+  crossDuplicates: number;
+  /** Approximate tokens wasted on cross-agent duplicate work */
+  wastedTokens: number;
 }
 
 interface SpawnChainNode {
@@ -163,10 +128,10 @@ export class LoopSupervisor {
   constructor(config?: Partial<LoopSupervisorConfig>) {
     this.config = { ...DEFAULT_LOOP_CONFIG, ...config };
     this.tiers = {
-      active: { agents: new Map(), strikes: 0, cooldownUntil: 0, activeAgentIds: new Set(), turnWarnedAgents: new Set(), lastProcessedAgentId: null, consecutiveSameAgent: 0 },
-      t1: { agents: new Map(), strikes: 0, cooldownUntil: 0, activeAgentIds: new Set(), turnWarnedAgents: new Set(), lastProcessedAgentId: null, consecutiveSameAgent: 0 },
-      t2: { agents: new Map(), strikes: 0, cooldownUntil: 0, activeAgentIds: new Set(), turnWarnedAgents: new Set(), lastProcessedAgentId: null, consecutiveSameAgent: 0 },
-      t3: { agents: new Map(), strikes: 0, cooldownUntil: 0, activeAgentIds: new Set(), turnWarnedAgents: new Set(), lastProcessedAgentId: null, consecutiveSameAgent: 0 },
+      active: { agents: new Map(), strikes: 0, cooldownUntil: 0, activeAgentIds: new Set(), turnWarnedAgents: new Set(), lastProcessedAgentId: null, consecutiveSameAgent: 0, crossDuplicates: 0, wastedTokens: 0 },
+      t1: { agents: new Map(), strikes: 0, cooldownUntil: 0, activeAgentIds: new Set(), turnWarnedAgents: new Set(), lastProcessedAgentId: null, consecutiveSameAgent: 0, crossDuplicates: 0, wastedTokens: 0 },
+      t2: { agents: new Map(), strikes: 0, cooldownUntil: 0, activeAgentIds: new Set(), turnWarnedAgents: new Set(), lastProcessedAgentId: null, consecutiveSameAgent: 0, crossDuplicates: 0, wastedTokens: 0 },
+      t3: { agents: new Map(), strikes: 0, cooldownUntil: 0, activeAgentIds: new Set(), turnWarnedAgents: new Set(), lastProcessedAgentId: null, consecutiveSameAgent: 0, crossDuplicates: 0, wastedTokens: 0 },
     };
   }
 
@@ -383,14 +348,44 @@ export class LoopSupervisor {
         .replace(/\s+/g, " ")
         .toLowerCase();
       const tailSimilar = agentState.lastTail === null ||
-        similarity(shingleHashes(tail), shingleHashes(agentState.lastTail)) >= threshold;
+        jaccardSimilarity(shingleHashes(tail), shingleHashes(agentState.lastTail)) >= threshold;
       agentState.lastTail = tail;
 
       const recent = agentState.outputSignatures.slice(-this.config.maxRepeatedOutputs);
       outputRepeat = recent.length >= this.config.maxRepeatedOutputs &&
         state.consecutiveSameAgent >= this.config.maxRepeatedOutputs &&
         tailSimilar &&
-        recent.every(s => similarity(s, recent[0]) >= threshold);
+        recent.every(s => jaccardSimilarity(s, recent[0]) >= threshold);
+
+      // ── 1b. Cross-agent duplicate detection (opt-in, non-punitive) ──
+      // Two DIFFERENT agents producing near-identical output = redundant work,
+      // not a loop. Detected separately so it never inflates loop strikes: it
+      // only emits an alert and accumulates a wasted-token metric.
+      if (this.config.dedupeCrossAgent) {
+        for (const [otherId, other] of state.agents) {
+          if (otherId === result.agentId) continue;
+          const otherSig = other.outputSignatures[other.outputSignatures.length - 1];
+          if (!otherSig) continue;
+          const sim = jaccardSimilarity(sig, otherSig);
+          if (sim >= threshold) {
+            const wasted = (result.usage.input || 0) + (result.usage.output || 0);
+            state.crossDuplicates++;
+            state.wastedTokens += wasted;
+            this.emitAlert({
+              type: "cross_agent_duplicate",
+              tier: result.tier,
+              agentId: result.agentId,
+              duplicateAgentId: otherId,
+              similarity: Math.round(sim * 1000) / 1000,
+              wastedTokens: wasted,
+              message: `Redundant output: ${result.agentId} ≈ ${otherId} (${(sim * 100).toFixed(0)}% similar) — ~${wasted} tokens duplicated`,
+              strike: 0,
+              timestamp: now,
+            });
+            break;
+          }
+        }
+      }
     }
 
     // ── 2. Error pattern detection (per-agent, consecutive) ──
@@ -471,11 +466,13 @@ export class LoopSupervisor {
     state.turnWarnedAgents.clear();
     state.lastProcessedAgentId = null;
     state.consecutiveSameAgent = 0;
+    state.crossDuplicates = 0;
+    state.wastedTokens = 0;
   }
 
   /** Get current state snapshot (for /tmg loops command) */
   getState(): {
-    tiers: Record<AgentTier, { strikes: number; cooldownRemaining: number; activeAgents: number; recentHashes: number }>;
+    tiers: Record<AgentTier, { strikes: number; cooldownRemaining: number; activeAgents: number; recentHashes: number; turnWarned: number; crossDuplicates: number; wastedTokens: number }>;
     alerts: LoopAlert[];
   } {
     const snapshot = (tier: AgentTier) => {
@@ -486,6 +483,8 @@ export class LoopSupervisor {
         activeAgents: s.activeAgentIds.size,
         recentHashes: [...s.agents.values()].reduce((n, a) => n + a.outputSignatures.length, 0),
         turnWarned: s.turnWarnedAgents.size,
+        crossDuplicates: s.crossDuplicates,
+        wastedTokens: s.wastedTokens,
       };
     };
     return {

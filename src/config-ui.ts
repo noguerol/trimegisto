@@ -13,6 +13,7 @@ export interface ConfigUIRuntime {
   haltAll: () => number;
   saveConfig: () => void;
   registerMainTool: () => void;
+  syncLoopSupervisor?: () => void;
 }
 
 export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> {
@@ -75,6 +76,8 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
     "Active model for agents: " + (config.useActiveModel ? "ON" : "OFF"),
     "Spawn only on active (t0): " + (config.spawnOnlyOnActive ? "ON" : "OFF"),
     "Redundant agents: " + (config.redundantAgents ? "YES" : "NO"),
+    "Dedupe tasks: " + (config.dedupeTasks ? "ON" : "OFF"),
+    "Dedupe cross-agent output: " + (config.dedupeCrossAgent ? "ON" : "OFF"),
     "Dashboard: " + rt.dashboardMode,
     "Done",
   ]);
@@ -100,6 +103,8 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
   }
   if (tier.startsWith("Auto-spawn")) { config.autoSpawn = !config.autoSpawn; ctx.ui.notify(`Auto-spawn: ${config.autoSpawn ? "ON" : "OFF"}`, "info"); rt.saveConfig(); return; }
   if (tier.startsWith("Redundant agents")) { config.redundantAgents = !config.redundantAgents; ctx.ui.notify(`Redundant agents: ${config.redundantAgents ? "YES" : "NO"}`, "info"); rt.saveConfig(); rt.registerMainTool(); return; }
+  if (tier.startsWith("Dedupe tasks")) { config.dedupeTasks = !config.dedupeTasks; ctx.ui.notify(`Dedupe tasks: ${config.dedupeTasks ? "ON" : "OFF"}`, "info"); rt.saveConfig(); return; }
+  if (tier.startsWith("Dedupe cross-agent")) { config.dedupeCrossAgent = !config.dedupeCrossAgent; rt.syncLoopSupervisor?.(); ctx.ui.notify(`Dedupe cross-agent output: ${config.dedupeCrossAgent ? "ON" : "OFF"}`, "info"); rt.saveConfig(); return; }
   if (tier.startsWith("Dashboard")) {
     const modes: Array<"widget" | "compact" | "off"> = ["compact", "widget", "off"];
     const mode = modes[(modes.indexOf(rt.dashboardMode) + 1) % modes.length];
