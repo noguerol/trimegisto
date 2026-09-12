@@ -18,6 +18,7 @@ import {
   WATCHDOG_DEFAULTS,
   migrateSavedCompaction,
   effectiveCompactionThreshold,
+  sanitizeLoopSupervisorConfig,
 } from "./config.ts";
 import {
   launchAgent,
@@ -181,25 +182,26 @@ export default function (pi: ExtensionAPI) {
     return config.useActiveModel && activeModel ? activeModel : undefined;
   }
 
-  // ── Loop Supervisor ───────────────────────────────────
+  // ── Swarm guard ───────────────────────────────────────
   const loopSupervisor = new LoopSupervisor();
   setLoopSupervisor(loopSupervisor);
 
-  // Loop alert → chat notification
+  // Guard alert → chat notification (loop detection itself lives in antiloop)
   loopSupervisor.setOnAlert((alert: LoopAlert) => {
     const isDup = alert.type === "cross_agent_duplicate";
-    const emoji = isDup ? "♻️" : alert.strike >= 3 ? "🚨" : alert.strike >= 2 ? "⚠️" : "🔸";
-    const strikeSuffix = isDup ? "" : ` (strike ${alert.strike}/3)`;
+    const isTurn = alert.type === "turn_limit";
+    const emoji = isDup ? "♻️" : isTurn ? "⏳" : "🚧";
+    const label = isDup ? "Redundancy" : isTurn ? "Turn limit" : "Spawn depth";
     safeSendMessage({
       customType: "trimegisto-log",
-      content: `${emoji} **[Loop Supervisor]** ${alert.message}${strikeSuffix}`,
+      content: `${emoji} **[Trimegisto ${label}]** ${alert.message}`,
       display: true,
     });
     try {
       if (ctxRef?.hasUI) {
         ctxRef.ui.notify(
-          `${isDup ? "Redundancy" : "Loop"}: ${alert.tier} — ${alert.message.slice(0, 80)}`,
-          isDup ? "warning" : alert.strike >= 3 ? "error" : "warning",
+          `${label}: ${alert.tier} — ${alert.message.slice(0, 80)}`,
+          isDup || isTurn ? "warning" : "error",
         );
       }
     } catch { /* ctx stale after session reload */ }
@@ -1038,7 +1040,7 @@ export default function (pi: ExtensionAPI) {
     description: "Trimegisto control",
     getArgumentCompletions: (prefix: string) => {
       const first = prefix.trim().split(/\s+/)[0]?.toLowerCase() || "";
-      const subs = ["config", "enable", "disable", "launch", "tell", "kill", "halt", "list", "switch", "dashboard", "locks", "loops", "reset-loops"];
+      const subs = ["config", "enable", "disable", "launch", "tell", "kill", "halt", "list", "switch", "dashboard", "locks", "guard", "loops", "reset-guard", "reset-loops"];
       const items = subs.filter(s => s.startsWith(first)).map(s => ({ value: s, label: s }));
       return items.length > 0 ? items : null;
     },
@@ -1118,7 +1120,8 @@ export default function (pi: ExtensionAPI) {
           idleSeconds: clampWatchdogSeconds(savedConfig.watchdog?.idleSeconds ?? config.watchdog.idleSeconds, WATCHDOG_DEFAULTS.idleSeconds),
           maxRuntimeSeconds: clampWatchdogSeconds(savedConfig.watchdog?.maxRuntimeSeconds ?? config.watchdog.maxRuntimeSeconds, WATCHDOG_DEFAULTS.maxRuntimeSeconds),
         },
-        loopSupervisor: { ...config.loopSupervisor, ...(savedConfig.loopSupervisor || {}) },
+        // Sanitize: legacy configs still carry removed loop-detection keys.
+        loopSupervisor: sanitizeLoopSupervisorConfig(savedConfig.loopSupervisor as any, config.loopSupervisor),
       };
 
       // Apply watchdog timeouts (seconds → ms) to the agent manager
@@ -1138,9 +1141,9 @@ export default function (pi: ExtensionAPI) {
       // value equal to an old default is not reset on every load.
       if (Object.keys(migratedCompaction).length > 0) saveConfig();
 
-      // Apply loop supervisor config
+      // Apply swarm guard config
       if (savedConfig.loopSupervisor) {
-        loopSupervisor.updateConfig(savedConfig.loopSupervisor);
+        loopSupervisor.updateConfig(config.loopSupervisor);
       }
       // Keep the supervisor's cross-agent dedup flag in sync with the top-level flag
       loopSupervisor.updateConfig({ dedupeCrossAgent: config.dedupeCrossAgent });

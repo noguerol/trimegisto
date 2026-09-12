@@ -16,6 +16,7 @@ import {
   OLD_DEFAULT_COMPACTION,
   SCHEMA_VERSION,
   effectiveCompactionThreshold,
+  sanitizeLoopSupervisorConfig,
 } from "./src/config.ts";
 import { runConfigUI } from "./src/config-ui.ts";
 
@@ -274,6 +275,23 @@ console.log("Test 15 (redundant-models submenu stays open after Add attempt):");
   check("sequence main -> tier -> redundant -> redundant -> tier -> main",
     titles[0] === "Configure Trimegisto:" && titles[1]!.startsWith("Configure T1:") && titles[2]!.startsWith("Redundant models for") && titles[3]!.startsWith("Redundant models for") && titles[4]!.startsWith("Configure T1:") && titles[5] === "Configure Trimegisto:",
     titles);
+}
+
+console.log("Test 16 (sanitizeLoopSupervisorConfig drops legacy loop keys):");
+{
+  const defaults = { enabled: true, maxSpawnDepth: 5, maxAgentTurns: 50, turnLimitGrace: 15, dedupeCrossAgent: false };
+  const legacy = {
+    enabled: true, maxSpawnDepth: 7, maxAgentTurns: 20, turnLimitGrace: 11, dedupeCrossAgent: true,
+    maxRepeatedOutputs: 3, tierCooldownMs: 60000, similarityThreshold: 0.9, minRepeatableOutputChars: 60,
+  };
+  const out = sanitizeLoopSupervisorConfig(legacy, defaults);
+  check("only guard keys remain", JSON.stringify(Object.keys(out).sort()) === JSON.stringify(["dedupeCrossAgent", "enabled", "maxAgentTurns", "maxSpawnDepth", "turnLimitGrace"]), Object.keys(out));
+  check("valid values preserved", out.maxSpawnDepth === 7 && out.maxAgentTurns === 20 && out.turnLimitGrace === 11 && out.dedupeCrossAgent === true);
+  check("removed keys gone", !("maxRepeatedOutputs" in out) && !("tierCooldownMs" in out) && !("similarityThreshold" in out));
+  const bad = sanitizeLoopSupervisorConfig({ maxAgentTurns: "twenty" as any, maxSpawnDepth: NaN as any, dedupeCrossAgent: 1 as any }, defaults);
+  check("wrong types fall back to defaults", bad.maxAgentTurns === 50 && bad.maxSpawnDepth === 5 && bad.dedupeCrossAgent === false, bad);
+  const empty = sanitizeLoopSupervisorConfig(undefined, defaults);
+  check("undefined saved -> defaults", empty.maxAgentTurns === 50 && empty.enabled === true);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

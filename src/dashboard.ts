@@ -32,7 +32,7 @@ export function requestDashboardRender(): void {
   try { tuiRef?.requestRender?.(); } catch { /* UI not available */ }
 }
 
-/** Count of cross-agent near-duplicate output pairs (Loop Supervisor). */
+/** Count of cross-agent near-duplicate output pairs (swarm guard). */
 function redundancyBadge(): string {
   const ls = getLoopSupervisor();
   const st = ls?.getState();

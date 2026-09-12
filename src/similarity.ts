@@ -3,8 +3,8 @@
  *
  * Shared text-similarity helpers (word-shingle hashing + Jaccard).
  * Used by:
- *   - Loop Supervisor (intra-agent loop detection)
- *   - Loop Supervisor (cross-agent duplicate detection)
+ *   - task-dedup (pre-launch duplicate task rejection)
+ *   - swarm guard (cross-agent duplicate output detection)
  *   - Pre-launch task deduplication
  *
  * Kept in one module so every consumer measures similarity the same way.

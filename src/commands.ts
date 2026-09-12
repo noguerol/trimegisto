@@ -133,46 +133,40 @@ export async function handleTmgCommand(pi: ExtensionAPI, args: string | undefine
       return;
     }
 
+    case "guard":
     case "loops":
     case "loop": {
       const supervisor = getLoopSupervisor();
-      if (!supervisor) return ctx.ui.notify("◇ Loop Supervisor unavailable.", "warning");
-      if (parts[1] === "sensitivity") {
-        const val = parseFloat(parts[2]);
-        if (Number.isFinite(val) && val >= 0.5 && val <= 1) {
-          supervisor.updateConfig({ similarityThreshold: val });
-          ctx.ui.notify(`◇ Loop similarity: ${val}`, "info");
-        } else ctx.ui.notify("◇ Usage: /tmg loops sensitivity <0.5..1>", "warning");
-        return;
-      }
+      if (!supervisor) return ctx.ui.notify("◇ Swarm guard unavailable.", "warning");
       const state = supervisor.getState();
       const cfg = supervisor.getConfig();
-      const lines = [`◇ Loop Supervisor (sim ≥ ${cfg.similarityThreshold ?? 0.92}${cfg.dedupeCrossAgent ? ", cross-agent ON" : ""})`];
+      const lines = [`◇ Swarm guard (spawn depth ≤ ${cfg.maxSpawnDepth}, turns ≤ ${cfg.maxAgentTurns}+${cfg.turnLimitGrace ?? 15}${cfg.dedupeCrossAgent ? ", cross-agent dedup ON" : ""})`];
       let totalDups = 0, totalWasted = 0;
       for (const tier of TIERS) {
         const ts = state.tiers[tier];
         totalDups += ts.crossDuplicates;
         totalWasted += ts.wastedTokens;
-        lines.push(`  ${tier}: ${ts.activeAgents} active, ${ts.recentHashes} outputs${ts.strikes ? ` ⚡ ${ts.strikes}/3` : ""}${ts.turnWarned ? ` ⚠ ${ts.turnWarned}` : ""}${ts.crossDuplicates ? ` ♻ ${ts.crossDuplicates}` : ""}${ts.cooldownRemaining > 0 ? ` ⏳ ${(ts.cooldownRemaining / 1000).toFixed(0)}s` : ""}`);
+        lines.push(`  ${tier}: ${ts.activeAgents} active${ts.turnWarned ? ` ⏳ ${ts.turnWarned} near turn limit` : ""}${ts.crossDuplicates ? ` ♻ ${ts.crossDuplicates}` : ""}`);
       }
       if (totalDups > 0) {
         lines.push("", `  ♻ Redundancy: ${totalDups} duplicate pair(s), ~${totalWasted} tokens overlapped`);
       }
-      if (state.alerts.length) lines.push("", ...state.alerts.slice(-10).map(a => `  ${a.strike >= 3 ? "🚨" : a.strike >= 2 ? "⚠️" : "🔸"} ${a.type} — ${a.message.slice(0, 80)} (${Math.round((Date.now() - a.timestamp) / 1000)}s)`));
+      if (state.alerts.length) lines.push("", ...state.alerts.slice(-10).map(a => `  ${a.type === "cross_agent_duplicate" ? "♻" : a.type === "turn_limit" ? "⏳" : "🚧"} ${a.type} — ${a.message.slice(0, 80)} (${Math.round((Date.now() - a.timestamp) / 1000)}s)`));
       ctx.ui.notify(lines.join("\n"), "info");
       return;
     }
 
+    case "reset-guard":
     case "reset-loops": {
       const supervisor = getLoopSupervisor();
-      if (!supervisor) return ctx.ui.notify("◇ Loop Supervisor unavailable.", "warning");
+      if (!supervisor) return ctx.ui.notify("◇ Swarm guard unavailable.", "warning");
       const tier = parts[1]?.toLowerCase() as AgentTier | undefined;
       if (tier && (TIERS as readonly string[]).includes(tier)) {
         supervisor.resetTier(tier);
-        ctx.ui.notify(`◇ Loop reset: ${tier}.`, "info");
+        ctx.ui.notify(`◇ Guard reset: ${tier}.`, "info");
       } else {
         TIERS.forEach(t => supervisor.resetTier(t));
-        ctx.ui.notify("◇ Loop reset: all.", "info");
+        ctx.ui.notify("◇ Guard reset: all.", "info");
       }
       return;
     }
@@ -191,7 +185,7 @@ export async function handleTmgCommand(pi: ExtensionAPI, args: string | undefine
         "  /tmg launch <active|t1|t2|t3> <task>\n" +
         "  /tmg tell <agent-id> <msg>\n" +
         "  /tmg kill <id> | halt | list | switch <id>\n" +
-        "  /tmg dashboard | locks | loops | reset-loops [tier]\n" +
+        "  /tmg dashboard | locks | guard | reset-guard [tier]\n" +
         "  /tmg enable | disable\n" +
         "  @t2b <instruction>",
         "info",
