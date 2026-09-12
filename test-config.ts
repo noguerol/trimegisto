@@ -292,6 +292,8 @@ console.log("Test 16 (sanitizeLoopSupervisorConfig drops legacy loop keys):");
   check("wrong types fall back to defaults", bad.maxAgentTurns === 50 && bad.maxSpawnDepth === 5 && bad.dedupeCrossAgent === false, bad);
   const empty = sanitizeLoopSupervisorConfig(undefined, defaults);
   check("undefined saved -> defaults", empty.maxAgentTurns === 50 && empty.enabled === true);
+  const nullish = sanitizeLoopSupervisorConfig(null as any, defaults);
+  check("null saved -> defaults (no throw)", nullish.maxAgentTurns === 50 && nullish.maxSpawnDepth === 5);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
