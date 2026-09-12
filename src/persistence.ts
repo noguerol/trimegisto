@@ -109,7 +109,7 @@ export function loadConfig(): {
   dashboardVisible?: boolean;
   watchdog?: Partial<{ firstResponseSeconds: number; idleSeconds: number; maxRuntimeSeconds: number }>;
   _schemaVersion?: number;
-  loopSupervisor?: Partial<{ enabled: boolean; maxRepeatedOutputs: number; maxSpawnDepth: number; maxAgentTurns: number; turnLimitGrace: number; tierCooldownMs: number }>;
+  loopSupervisor?: Partial<{ enabled: boolean; maxSpawnDepth: number; maxAgentTurns: number; turnLimitGrace: number; dedupeCrossAgent: boolean }>;
 } | null {
   try {
     const configPath = getConfigPath();

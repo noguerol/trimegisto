@@ -141,32 +141,16 @@ export interface WatchdogConfig {
 
 export interface LoopSupervisorConfig {
   enabled: boolean;
-  maxRepeatedOutputs: number;
+  /** Max recursive auto-spawn depth (structural guard; antiloop cannot see it). */
   maxSpawnDepth: number;
   /** Soft turn limit — agent receives a warning here but is NOT killed. Default: 50 */
   maxAgentTurns: number;
   /** Extra turns granted after the soft limit before hard kill. Default: 15 (hard limit = soft + grace) */
   turnLimitGrace: number;
-  tierCooldownMs: number;
   /**
-   * Similarity threshold (0..1) for output repetition. Two outputs count as
-   * "the same" when their word-shingle Jaccard similarity is >= this.
-   * Higher values = fewer false positives when agents legitimately share
-   * common material (same contract, same codebase) while making real
-   * progress. Default: 0.92
-   */
-  similarityThreshold?: number;
-  /**
-   * Outputs shorter than this many chars are not checked for output-loop
-   * repetition (they're usually acks/status pings, not loop evidence).
-   * Default: 80
-   */
-  minRepeatableOutputChars?: number;
-  /**
-   * When true, ALSO detect near-identical outputs between DIFFERENT agents in
-   * the same tier (redundant parallel work). Emits a `cross_agent_duplicate`
-   * alert and accumulates a wasted-token metric, but never inflates loop
-   * strikes (overlap is not a loop). Default: false.
+   * When true, flag near-identical outputs from DIFFERENT agents (redundant
+   * parallel work) and report wasted tokens. This is overlap detection, not
+   * loop detection. Default: false.
    */
   dedupeCrossAgent?: boolean;
 }
@@ -204,7 +188,7 @@ export interface TrimegistoConfig {
    */
   dedupeTasks: boolean;
   /**
-   * When ON, the Loop Supervisor also flags near-identical outputs from
+   * When ON, the swarm guard also flags near-identical outputs from
    * DIFFERENT agents (redundant parallel work) and reports wasted tokens.
    */
   dedupeCrossAgent: boolean;

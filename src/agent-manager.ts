@@ -202,7 +202,7 @@ let pollInterval: ReturnType<typeof setInterval> | null = null;
 /** Extension context reference (set during init) */
 let extCtx: ExtensionContext | null = null;
 
-// ── Loop Supervisor ─────────────────────────────────────
+// ── Swarm guard ─────────────────────────────────────────
 let loopSupervisor: LoopSupervisor | null = null;
 
 export function setLoopSupervisor(supervisor: LoopSupervisor): void {
@@ -318,7 +318,7 @@ export function launchAgent(
   agents.set(id, instance);
   notifyStateChange();
 
-  // Register with loop supervisor
+  // Register with swarm guard
   if (loopSupervisor) {
     loopSupervisor.registerSpawn(id, tier, parentId);
   }
@@ -554,7 +554,7 @@ export function launchAgent(
           if (!instance.model && msg.model) instance.model = msg.model;
           if (msg.stopReason) instance.stopReason = msg.stopReason;
 
-          // ── Loop Supervisor: turn limit check ──────────
+          // ── Swarm guard: turn limit check ──────────────
           // checkTurnLimit returns true ONLY when the HARD limit is exceeded.
           // Soft limit violations generate a warning alert but don't kill.
           if (loopSupervisor && loopSupervisor.checkTurnLimit(id, tier, instance.usage.turns)) {
@@ -728,18 +728,9 @@ export function launchAgent(
 
         notifyStateChange();
 
-        // ── Loop Supervisor: process result ──────────────
+        // ── Swarm guard: record result for cross-agent redundancy detection ──
         if (loopSupervisor && instance.status !== "killed") {
-          const loopResult = loopSupervisor.processResult(buildResult());
-          if (loopResult.loopDetected) {
-            const loopEntry: AgentLogEntry = {
-              ts: Date.now(),
-              level: "error",
-              text: `⚠️ Loop detected (strike ${loopResult.strike}/3): ${instance.status === "error" ? "error pattern" : "output"} repeated`,
-            };
-            instance.log.push(loopEntry);
-            notifyAgentLog(id, loopEntry);
-          }
+          loopSupervisor.processResult(buildResult());
         }
 
         // Signal completion via resolve callback
@@ -966,7 +957,7 @@ export function getActiveAgents(): AgentInstance[] {
  * Check if a tier can spawn more agents.
  */
 export function canSpawn(tier: AgentTier, maxParallel: number, parentId?: string): boolean {
-  // Check loop supervisor spawn limits first
+  // Check swarm guard spawn limits first
   if (loopSupervisor) {
     const check = loopSupervisor.canSpawn(tier, parentId);
     if (!check.allowed) return false;
@@ -1239,18 +1230,6 @@ export function sendToAgent(
 Previous context: ${existing.task.slice(0, 200)}
 
 New instruction: ${instruction}`;
-
-  // ── Loop Supervisor: inject context shock if needed ────
-  if (loopSupervisor) {
-    const shock = loopSupervisor.getContextShockForRespawn(tier);
-    if (shock) {
-      task = `${shock.shockMessage}
-
----
-
-${task}`;
-    }
-  }
 
   const tierModelOverride = tier === "active" ? modelOverride : undefined;
   return launchAgent(tier, task, configs[tier], cwd, agentId, tierModelOverride, redundantAgents);

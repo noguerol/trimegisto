@@ -6,7 +6,7 @@
 
 # Trimegisto — Multi-Agent Orchestration for pi
 
-Trimegisto turns pi into a multi-agent runtime. It launches **parallel sub-agent processes** organized in four tiers, lets you (or the main LLM) delegate work to them, and keeps the whole swarm under control with a loop supervisor, advisory file locks, a context broker and a live dashboard — without ever replacing pi's native UI.
+Trimegisto turns pi into a multi-agent runtime. It launches **parallel sub-agent processes** organized in four tiers, lets you (or the main LLM) delegate work to them, and keeps the whole swarm under control with a swarm guard, advisory file locks, a context broker and a live dashboard — without ever replacing pi's native UI. (Reasoning-loop detection is delegated to the separate [`antiloop`](https://github.com/noguerol/antiloop) extension.)
 
 Every sub-agent is a real `pi` process (`pi -p --mode json`), so agents run in complete isolation with their own context window, tools and model.
 
@@ -131,14 +131,13 @@ When Trimegisto is enabled, a hidden orchestration directive is injected before 
 | `/tmg dashboard` | Cycle dashboard mode (compact → widget → off) |
 | `/tmg enable` / `/tmg disable` | Toggle Trimegisto globally |
 | `/tmg locks` | Show active file locks |
-| `/tmg loops` | Show Loop Supervisor state (strikes, cooldowns, alerts) |
-| `/tmg loops sensitivity <0.5..1>` | Tune similarity threshold at runtime |
-| `/tmg reset-loops [active\|t1\|t2\|t3]` | Reset loop strikes for a tier (or all) |
+| `/tmg guard` (alias `/tmg loops`) | Show guard state (spawn depth, turn warnings, redundancy) |
+| `/tmg reset-guard [active\|t1\|t2\|t3]` | Reset guard/redundancy counters for a tier (or all) |
 | `/tmg config` | Interactive configuration (models, limits, flags) |
 
 ### Steering
 
-Because each agent is a separate process, "steering" means **replacing**: Trimegisto kills the agent and relaunches a new one (same ID, same tier) with the previous task + your new instruction combined. If the tier is on cooldown after 3 loop strikes, the respawned agent also receives a "context shock" message forcing a different strategy.
+Because each agent is a separate process, "steering" means **replacing**: Trimegisto kills the agent and relaunches a new one (same ID, same tier) with the previous task + your new instruction combined. (Loop-stuck sub-agents are handled in-process by antiloop, which warns, force-breaks and finally aborts the run — no respawn needed.)
 
 ## Configuration
 
@@ -190,28 +189,22 @@ Your custom system prompt for this tier...
 
 Precedence: **saved config > agent file > built-in defaults** (per field: model, tools, systemPrompt, maxParallel, compactionThreshold, enabled).
 
-### Loop Supervisor
+### Loop detection (antiloop) & Swarm Guard
 
-Deterministic loop detection in the main process (no prompt changes):
+Reasoning/output loop detection lives in the separate **[antiloop](https://github.com/noguerol/antiloop)** extension. Antiloop is discovered by every sub-agent process (pi discovers `~/.pi/agent/extensions`; Trimegisto does not pass `--no-extensions`) and acts **mid-run** (warn → force break → abort). Trimegisto does not duplicate it — **keep antiloop installed for loop protection.**
+
+Trimegisto's main-process guard only covers what antiloop cannot see, because it is cross-process orchestration:
 
 | Mechanism | Detects | Default |
 |-----------|---------|---------|
-| **Output Similarity** | Same agent repeating near-identical output 3× consecutively (shingle Jaccard ≥ 0.92, whole output + progress tail) | 3 repeats, threshold 0.92, min 80 chars |
-| **Error Pattern** | Same agent repeating the same normalized error 3× consecutively | 3 repeats |
-| **Cross-agent duplicate** | Two *different* agents producing near-identical output (redundant parallel work) | opt-in via `dedupeCrossAgent`, sim ≥ 0.92 |
-| **Spawn Depth** | Circular auto-spawn chains | 5 levels |
+| **Spawn Depth** | Recursive auto-spawn chains | 5 levels |
 | **Turn Limit (soft)** | Agent exceeds `maxAgentTurns` → **warning only**, not killed | 50 turns |
 | **Turn Limit (hard)** | soft + `turnLimitGrace` → **kill** the agent | 65 turns |
+| **Cross-agent duplicate** | Two *different* agents producing near-identical output (redundant parallel work) | opt-in via `dedupeCrossAgent`, shingle Jaccard ≥ 0.92 |
 
-Repetition is tracked **per agent**, never per tier: different agents working on the same material (same contract, same codebase) can never trigger a false loop. With `dedupeCrossAgent` ON, the supervisor *also* compares outputs across different agents in the same tier and flags near-identical results as redundant work (a `♻` alert + wasted-token metric), without inflating loop strikes.
+Redundancy is tracked **per agent** and never flags same-agent repetition — repeated output from one agent is a reasoning loop, which antiloop owns. With `dedupeCrossAgent` ON, near-identical results across different agents in the same tier get a `♻` alert + wasted-token metric.
 
-On detection, a **3-strike escalation** applies:
-
-1. **Strike 1** — chat alert
-2. **Strike 2** — **context shock**: prune last turns + inject a "do a different approach" message on respawn
-3. **Strike 3** — **tier cooldown** for 60 s (no spawns from that tier)
-
-Inspect with `/tmg loops`, tune with `/tmg loops sensitivity <0.5..1>` (higher = fewer false positives), clear with `/tmg reset-loops`.
+Inspect with `/tmg guard` (alias `/tmg loops`), clear with `/tmg reset-guard`.
 
 ## How It Works
 
@@ -225,9 +218,9 @@ Inspect with `/tmg loops`, tune with `/tmg loops sensitivity <0.5..1>` (higher =
 │  │  ┌────────────────────────────────────────────┐  │  │
 │  │  │            Agent Manager                   │  │  │
 │  │  │  t0 x4  t1 x1  t2 x4  t3 x4  (per-model   │  │  │
-│  │  │  pools, failover, loop-supervised)        │  │  │
+│  │  │  pools, failover, guarded)               │  │  │
 │  │  └────────────────────────────────────────────┘  │  │
-│  │  Loop Supervisor · File Locks · Context Broker   │  │
+│  │  Swarm Guard · File Locks · Context Broker        │  │
 │  └──────────────────────────────────────────────────┘  │
 └───────────────▲────────────────────────────────────────┘
                 │ file-based IPC (requests/ + responses/)
@@ -243,7 +236,7 @@ Inspect with `/tmg loops`, tune with `/tmg loops sensitivity <0.5..1>` (higher =
 ```
 
 - **IPC** — sub-agents write spawn requests as JSON files; the main extension polls (500 ms), launches, and writes response files. All communication lives under a **per-instance directory** (`~/.pi/agent/trimegisto/instances/pid-<pid>-<ts>/`), so multiple pi processes running Trimegisto at the same time never interfere.
-- **Auto-spawn** — with `autoSpawn` on, the main agent receives a strong hidden policy to spawn first for decomposable work, then continue without idle sleeps. Sub-agents can spawn more agents via `trimegisto_spawn` (batch mode preferred: `{tasks: [...]}` runs everything in parallel). Spawning is **non-blocking** (async polling, no frozen process) and depth/cooldown-limited by the supervisor.
+- **Auto-spawn** — with `autoSpawn` on, the main agent receives a strong hidden policy to spawn first for decomposable work, then continue without idle sleeps. Sub-agents can spawn more agents via `trimegisto_spawn` (batch mode preferred: `{tasks: [...]}` runs everything in parallel). Spawning is **non-blocking** (async polling, no frozen process) and depth-limited by the guard.
 - **Task deduplication** — before any launch, the task is fingerprinted and compared (exact + word-set similarity) against tasks spawned in the last 5 minutes. Near-duplicates are skipped with a `⏭` note so the swarm never pays twice for the same work. Disable with `dedupeTasks: false`.
 - **Shared context** — each new agent receives a compact preamble of files already read and facts already published (via `trimegisto_note`) by other agents, so it avoids redundant re-reading and re-derivation.
 - **File locks** — advisory, 60 s stale timeout. Agents call `file_lock` before write/edit and `file_unlock` after; conflicts return the lock owner so agents can wait or move on. Locks are released automatically when an agent finishes, is killed or halted. Inspect with `/tmg locks`.
@@ -285,7 +278,7 @@ trimegisto/
 │   ├── index.ts                # startup shell: tool, lifecycle, lazy command/UI hooks
 │   ├── agent-manager.ts        # spawn/track/kill, model pools, failover
 │   ├── subagent-extension.ts   # injected into every sub-agent process
-│   ├── loop-supervisor.ts      # loop detection, strikes, cooldowns
+│   ├── loop-supervisor.ts      # swarm guard: spawn depth, turn limits, redundancy
 │   ├── file-lock.ts            # advisory file locking
 │   ├── context-broker.ts       # cross-agent file-change notifications
 │   ├── ipc.ts                  # file-based request/response IPC
@@ -297,7 +290,9 @@ trimegisto/
 │   └── types.ts
 ├── agents/
 │   ├── t1.md  t2.md  t3.md     # tier skills
-├── test-loop.ts                # loop-supervisor unit tests
+├── test-loop.ts                # swarm-guard unit tests
+├── test-config.ts              # config defaults, compaction migration, /tmg config menus
+├── test-watchdog.ts            # watchdog config tests
 └── test-speed.ts               # speed-tracker unit tests
 ```
 
@@ -307,8 +302,10 @@ trimegisto/
 git clone https://github.com/noguerol/trimegisto
 cd trimegisto
 pi install .                 # local-path install
-node --experimental-strip-types test-loop.ts    # loop-supervisor tests
-node --experimental-strip-types test-speed.ts   # speed-tracker tests
+node --experimental-strip-types test-loop.ts      # swarm-guard tests
+node --experimental-strip-types test-config.ts    # config/compaction/UI tests
+node --experimental-strip-types test-watchdog.ts  # watchdog config tests
+node --experimental-strip-types test-speed.ts     # speed-tracker tests
 ```
 
 ## License

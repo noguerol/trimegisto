@@ -1,8 +1,12 @@
-// Functional test for the per-agent loop detection fix.
+// Functional tests for the Trimegisto swarm guard.
+//
+// Loop detection itself now lives in the `antiloop` extension, so these tests
+// cover what remains here: spawn depth, turn limits and cross-agent duplicate
+// (redundancy) detection.
+//
 // Run: node --experimental-strip-types test-loop.ts
 import { LoopSupervisor, DEFAULT_LOOP_CONFIG } from "./src/loop-supervisor.ts";
 
-// --- Shared "common material": a contract excerpt that agents keep citing ---
 const CONTRACT = `Clause 12.1 - Prestation terms. The contractor shall provide the services described in Annex A
 for a total consideration of EUR 240,000 payable in four equal instalments. Any delay in payment
 shall accrue interest at the statutory rate. The parties agree that force majeure events including
@@ -13,13 +17,11 @@ Ancillary obligations include confidentiality, non-solicitation, and the duty to
 insurance coverage throughout the term. Disputes shall be resolved by arbitration in accordance
 with the rules of the Chamber of Commerce. `;
 
-const sig = (n: string) => `${CONTRACT}${CONTRACT.slice(0, 1800)}${n}`;
-
-function makeResult(agentId: string, tier: "t1" | "t2" | "t3", output: string, status: "done" | "error" = "done", stderr = "") {
+function makeResult(agentId: string, tier: "t1" | "t2" | "t3", output: string, status: "done" | "error" = "done", stderr = "", usage?: { input: number; output: number }) {
   return {
     agentId, tier, task: "analyze contract",
     status, output, stderr,
-    usage: { turns: 1, input: 0, output: 0, cost: 0 },
+    usage: { turns: 1, input: usage?.input ?? 0, output: usage?.output ?? 0, cost: 0 },
     log: [],
   } as any;
 }
@@ -30,125 +32,127 @@ function check(name: string, cond: boolean) {
   else { failed++; console.log(`  ✗ FAIL: ${name}`); }
 }
 
-// ── Test 1: 3 DIFFERENT t2 agents, shared contract material, different progress
-//    (this is the exact false positive from the user's log — must NOT strike)
+// ── Test 1: spawn depth limit ─────────────────────────────
 {
-  const s = new LoopSupervisor({ enabled: true });
-  let strikes = 0;
-  s.setOnAlert((a) => { if (a.strike > strikes) strikes = a.strike; });
-  const r1 = s.processResult(makeResult("t2a", "t2", sig("Deciding to exclude concrete prestation terms")));
-  const r2 = s.processResult(makeResult("t2b", "t2", sig("Assessing compliance pact compensation risks")));
-  const r3 = s.processResult(makeResult("t2c", "t2", sig("Designing optional ancillary obligations clause")));
-  console.log("Test 1 (3 agents, common material):");
-  check("no loop detected for any agent", !r1.loopDetected && !r2.loopDetected && !r3.loopDetected);
-  check("zero strikes accumulated", strikes === 0);
+  const s = new LoopSupervisor({ enabled: true, maxSpawnDepth: 2 });
+  const alerts: string[] = [];
+  s.setOnAlert(a => alerts.push(a.type));
+  console.log("Test 1 (spawn depth):");
+  check("root can spawn (no parent)", s.canSpawn("t2").allowed);
+  s.registerSpawn("t2a", "t2");                    // depth 1
+  s.registerSpawn("t2b", "t2", "t2a");             // depth 2
+  s.registerSpawn("t2c", "t2", "t2b");             // depth 3
+  check("depth 1 parent allowed", s.canSpawn("t2", "t2a").allowed);
+  check("depth 2 parent blocked", !s.canSpawn("t2", "t2b").allowed);
+  check("depth 3 parent blocked", !s.canSpawn("t2", "t2c").allowed);
+  check("spawn_depth alert emitted", alerts.includes("spawn_depth"));
+}
+
+// ── Test 2: turn limit soft warning then hard kill ────────
+{
+  const s = new LoopSupervisor({ enabled: true, maxAgentTurns: 5, turnLimitGrace: 3 });
+  const turnAlerts: Array<{ msg: string }> = [];
+  s.setOnAlert(a => { if (a.type === "turn_limit") turnAlerts.push(a); });
+  console.log("Test 2 (turn limit):");
+  s.registerSpawn("t2a", "t2");
+  check("at soft limit no kill", s.checkTurnLimit("t2a", "t2", 5) === false);
+  check("just over soft warns, no kill", s.checkTurnLimit("t2a", "t2", 6) === false);
+  check("soft warning emitted once", turnAlerts.length === 1, turnAlerts.length);
+  s.checkTurnLimit("t2a", "t2", 7);
+  check("still only one soft warning", turnAlerts.length === 1, turnAlerts.length);
+  check("hard limit kills (5+3+1)", s.checkTurnLimit("t2a", "t2", 9) === true);
+  check("hard kill emitted a second alert", turnAlerts.length === 2, turnAlerts.length);
+  check("turnWarned cleared after kill", s.getState().tiers.t2.turnWarned === 0);
+}
+
+// ── Test 3: cross-agent duplicate detection (redundancy) ──
+{
+  const s = new LoopSupervisor({ enabled: true, dedupeCrossAgent: true });
+  const dups: any[] = [];
+  s.setOnAlert(a => { if (a.type === "cross_agent_duplicate") dups.push(a); });
+  console.log("Test 3 (cross-agent redundancy):");
+  s.registerSpawn("t2a", "t2");
+  s.registerSpawn("t2b", "t2");
+  s.processResult(makeResult("t2a", "t2", CONTRACT + "agent A conclusion", "done", "", { input: 100, output: 50 }));
+  s.processResult(makeResult("t2b", "t2", CONTRACT + "agent A conclusion", "done", "", { input: 100, output: 50 }));
+  check("duplicate pair detected", dups.length === 1, dups.length);
+  check("reports the other agent", dups[0]?.duplicateAgentId === "t2a", dups[0]?.duplicateAgentId);
+  check("reports wasted tokens", dups[0]?.wastedTokens === 150, dups[0]?.wastedTokens);
+  check("counter incremented", s.getState().tiers.t2.crossDuplicates === 1);
+  // A genuinely different output must NOT be flagged
+  s.processResult(makeResult("t2c", "t2", CONTRACT.replace("240,000", "900,000") + " a completely different analysis with fresh numbers and a distinct plan of action for the quarter", "done"));
+  check("different output not flagged", s.getState().tiers.t2.crossDuplicates === 1, s.getState().tiers.t2.crossDuplicates);
+}
+
+// ── Test 4: dedupeCrossAgent OFF => no alerts ─────────────
+{
+  const s = new LoopSupervisor({ enabled: true, dedupeCrossAgent: false });
+  let dups = 0;
+  s.setOnAlert(a => { if (a.type === "cross_agent_duplicate") dups++; });
+  console.log("Test 4 (cross-agent OFF):");
+  s.processResult(makeResult("t2a", "t2", CONTRACT + "same"));
+  s.processResult(makeResult("t2b", "t2", CONTRACT + "same"));
+  check("no redundancy alert when disabled", dups === 0, dups);
+}
+
+// ── Test 5: repetition is NOT trimegisto's job anymore ────
+{
+  const s = new LoopSupervisor({ enabled: true, dedupeCrossAgent: true });
+  let alerts = 0;
+  s.setOnAlert(() => { alerts++; });
+  console.log("Test 5 (no loop detection here):");
+  for (let i = 0; i < 5; i++) s.processResult(makeResult("t2a", "t2", CONTRACT + "identical output every single time"));
+  check("same-agent repetition produces no alert", alerts === 0, alerts);
+  check("no strikes/cooldown state exists", !("strikes" in s.getState().tiers.t2));
+}
+
+// ── Test 6: failures and short outputs are ignored ────────
+{
+  const s = new LoopSupervisor({ enabled: true, dedupeCrossAgent: true });
+  let dups = 0;
+  s.setOnAlert(a => { if (a.type === "cross_agent_duplicate") dups++; });
+  console.log("Test 6 (failures / short outputs):");
+  s.processResult(makeResult("t2a", "t2", CONTRACT + "err", "error"));
+  s.processResult(makeResult("t2b", "t2", CONTRACT + "err", "error"));
+  check("errors never flagged as redundant", dups === 0, dups);
+  s.processResult(makeResult("t2c", "t2", "done"));
+  s.processResult(makeResult("t2d", "t2", "done"));
+  check("short outputs (acks) ignored", dups === 0, dups);
+}
+
+// ── Test 7: resetTier clears counters ─────────────────────
+{
+  const s = new LoopSupervisor({ enabled: true, dedupeCrossAgent: true });
+  s.processResult(makeResult("t2a", "t2", CONTRACT + "x"));
+  s.processResult(makeResult("t2b", "t2", CONTRACT + "x"));
+  console.log("Test 7 (reset):");
+  check("counter before reset", s.getState().tiers.t2.crossDuplicates === 1);
+  s.resetTier("t2");
   const st = s.getState().tiers.t2;
-  check("t2 not in cooldown", st.cooldownRemaining === 0 && st.strikes === 0);
+  check("counter cleared", st.crossDuplicates === 0 && st.wastedTokens === 0);
 }
 
-// ── Test 2: SAME agent repeating identical output 3x (real loop — must strike)
+// ── Test 8: disabled guard does nothing ───────────────────
 {
-  const s = new LoopSupervisor({ enabled: true });
-  let strikes = 0;
-  s.setOnAlert((a) => { if (a.strike > strikes) strikes = a.strike; });
-  const out = sig("The answer is the same every time. Final answer: exclude clause 12.1 entirely.");
-  s.processResult(makeResult("t2a", "t2", out));
-  s.processResult(makeResult("t2a", "t2", out));
-  const r3 = s.processResult(makeResult("t2a", "t2", out));
-  console.log("Test 2 (same agent, identical output x3):");
-  check("loop detected on 3rd result", r3.loopDetected);
-  check("strike count = 1", r3.strike === 1);
-  check("alert emitted", strikes === 1);
+  const s = new LoopSupervisor({ enabled: false, maxSpawnDepth: 1, maxAgentTurns: 1 });
+  let alerts = 0;
+  s.setOnAlert(() => { alerts++; });
+  console.log("Test 8 (disabled):");
+  s.registerSpawn("t2a", "t2");
+  s.registerSpawn("t2b", "t2", "t2a");
+  check("canSpawn always allowed", s.canSpawn("t2", "t2a").allowed);
+  check("turn limit never kills", s.checkTurnLimit("t2a", "t2", 999) === false);
+  check("no alerts", alerts === 0, alerts);
 }
 
-// ── Test 3: same agent, output ~85% common material but different conclusion
-//    (legitimate progress — must NOT strike)
+// ── Test 9: defaults still expose the guard knobs ─────────
 {
-  const s = new LoopSupervisor({ enabled: true });
-  const base = CONTRACT;
-  const o1 = base + " Step one: identify the parties and the payment schedule. Step two: verify force majeure scope.";
-  const o2 = base + " Step one: identify the parties and the payment schedule. Step two: analyze the arbitration clause.";
-  const o3 = base + " Step one: identify the parties and the payment schedule. Step two: draft the waiver provision.";
-  const r3 = s.processResult(makeResult("t2a", "t2", o1));
-  const r4 = s.processResult(makeResult("t2a", "t2", o2));
-  const r5 = s.processResult(makeResult("t2a", "t2", o3));
-  console.log("Test 3 (same agent, shared material, real progress):");
-  check("no loop detected", !r3.loopDetected && !r4.loopDetected && !r5.loopDetected);
-  check("no strikes", s.getState().tiers.t2.strikes === 0);
-}
-
-// ── Test 4: same agent, nearly-identical outputs with tiny variation
-//    (genuine loop behavior — should strike)
-{
-  const s = new LoopSupervisor({ enabled: true });
-  const o = sig("Final: everything is correct as written. No changes needed. Sign as-is.");
-  const o2 = o.slice(0, o.length - 3) + "…."; // ~99.9% identical
-  s.processResult(makeResult("t2a", "t2", o));
-  s.processResult(makeResult("t2a", "t2", o2));
-  const r3 = s.processResult(makeResult("t2a", "t2", o));
-  console.log("Test 4 (same agent, ~identical outputs x3):");
-  check("loop detected", r3.loopDetected);
-}
-
-// ── Test 5: interleaved agents must not accumulate strikes
-{
-  const s = new LoopSupervisor({ enabled: true });
-  const o = "repeated output content that is exactly the same string every time";
-  s.processResult(makeResult("t2a", "t2", o));
-  s.processResult(makeResult("t2b", "t2", "different output from a different agent working on its own thing"));
-  s.processResult(makeResult("t2a", "t2", o));
-  s.processResult(makeResult("t2b", "t2", "different again, some other legit work"));
-  const r5 = s.processResult(makeResult("t2a", "t2", o));
-  console.log("Test 5 (interleaved same-agent repeats):");
-  check("no loop despite 3 repeats non-consecutive", !r5.loopDetected);
-  check("no strikes", s.getState().tiers.t2.strikes === 0);
-}
-
-// ── Test 6: error pattern, same agent 3x consecutive (real)
-{
-  const s = new LoopSupervisor({ enabled: true });
-  s.processResult(makeResult("t2a", "t2", "", "error", "Error: cannot parse clause 14 at line 42"));
-  s.processResult(makeResult("t2a", "t2", "", "error", "Error: cannot parse clause 14 at line 42"));
-  const r3 = s.processResult(makeResult("t2a", "t2", "", "error", "Error: cannot parse clause 14 at line 42"));
-  console.log("Test 6 (same agent, same error x3):");
-  check("loop detected via error pattern", r3.loopDetected);
-}
-
-// ── Test 7: different agents, same error each (common infra error — must NOT strike)
-{
-  const s = new LoopSupervisor({ enabled: true });
-  s.processResult(makeResult("t2a", "t2", "", "error", "Error: model overloaded, retry later"));
-  s.processResult(makeResult("t2b", "t2", "", "error", "Error: model overloaded, retry later"));
-  const r3 = s.processResult(makeResult("t2c", "t2", "", "error", "Error: model overloaded, retry later"));
-  console.log("Test 7 (3 agents, same infra error):");
-  check("no loop detected", !r3.loopDetected);
-}
-
-// ── Test 8: full escalation — consecutive identical outputs → strikes 1..3 → cooldown
-// Sliding window: 3rd identical output = strike 1, each further one escalates.
-{
-  const s = new LoopSupervisor({ enabled: true });
-  const strikes: number[] = [];
-  s.setOnAlert((a) => strikes.push(a.strike));
-  const o = "I have examined this and the answer remains: reject the clause. Reject it again. Same reasoning.";
-  const r1 = s.processResult(makeResult("t2a", "t2", o));
-  const r2 = s.processResult(makeResult("t2a", "t2", o));
-  const r3 = s.processResult(makeResult("t2a", "t2", o));   // strike 1
-  const r4 = s.processResult(makeResult("t2a", "t2", o));   // strike 2
-  const r5 = s.processResult(makeResult("t2a", "t2", o));   // strike 3
-  console.log("Test 8 (full escalation to cooldown):");
-  check("strikes escalate 1,2,3", r3.strike === 1 && r4.strike === 2 && r5.strike === 3);
-  check("no strikes before 3rd output", r1.strike === 0 && r2.strike === 0);
-  check("tier in cooldown after strike 3", s.getState().tiers.t2.cooldownRemaining > 0);
-  check("canSpawn blocked during cooldown", !s.canSpawn("t2").allowed);
-  check("strike_three alert emitted", strikes.includes(3));
-}
-
-// ── Test 9: short outputs (acks/status) are never flagged ──
-{
-  const s = new LoopSupervisor({ enabled: true });
-  const r = s.processResult(makeResult("t2a", "t2", "done"));
-  check("short output not flagged", !r.loopDetected);
+  console.log("Test 9 (defaults):");
+  check("default maxSpawnDepth = 5", DEFAULT_LOOP_CONFIG.maxSpawnDepth === 5);
+  check("default maxAgentTurns = 50", DEFAULT_LOOP_CONFIG.maxAgentTurns === 50);
+  check("default turnLimitGrace = 15", DEFAULT_LOOP_CONFIG.turnLimitGrace === 15);
+  check("default dedupeCrossAgent = false", DEFAULT_LOOP_CONFIG.dedupeCrossAgent === false);
+  check("loop-detection knobs removed", !("maxRepeatedOutputs" in DEFAULT_LOOP_CONFIG) && !("similarityThreshold" in DEFAULT_LOOP_CONFIG) && !("tierCooldownMs" in DEFAULT_LOOP_CONFIG));
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

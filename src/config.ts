@@ -9,7 +9,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { TrimegistoConfig, TierConfig, AgentTier } from "./types.ts";
+import type { TrimegistoConfig, TierConfig, AgentTier, LoopSupervisorConfig } from "./types.ts";
 
 const CONFIG_ENTRY_TYPE = "trimegisto-config";
 
@@ -262,11 +262,10 @@ export function getDefaultConfig(): TrimegistoConfig {
     },
     loopSupervisor: {
       enabled: true,
-      maxRepeatedOutputs: 3,
       maxSpawnDepth: 5,
       maxAgentTurns: 50,
       turnLimitGrace: 15,
-      tierCooldownMs: 60_000,
+      dedupeCrossAgent: false,
     },
   };
 }
@@ -342,6 +341,29 @@ export function effectiveCompactionThreshold(
   ].filter(t => t > 0);
   if (thresholds.length === 0) return 0;
   return Math.min(...thresholds);
+}
+
+/**
+ * Sanitize a persisted loopSupervisor block.
+ *
+ * Loop detection moved to the `antiloop` extension, so legacy configs still
+ * carry removed keys (maxRepeatedOutputs, tierCooldownMs, similarityThreshold,
+ * minRepeatableOutputChars). Keep only the fields the guard still honors and
+ * fall back to the given defaults for missing/wrongly-typed values.
+ */
+export function sanitizeLoopSupervisorConfig(
+  saved: Partial<Record<string, unknown>> | undefined,
+  defaults: Partial<LoopSupervisorConfig>,
+): Partial<LoopSupervisorConfig> {
+  const num = (v: unknown, fb: number | undefined) => (typeof v === "number" && Number.isFinite(v) ? v : fb);
+  const bool = (v: unknown, fb: boolean | undefined) => (typeof v === "boolean" ? v : fb);
+  return {
+    enabled: bool(saved?.enabled, defaults.enabled),
+    maxSpawnDepth: num(saved?.maxSpawnDepth, defaults.maxSpawnDepth),
+    maxAgentTurns: num(saved?.maxAgentTurns, defaults.maxAgentTurns),
+    turnLimitGrace: num(saved?.turnLimitGrace, defaults.turnLimitGrace),
+    dedupeCrossAgent: bool(saved?.dedupeCrossAgent, defaults.dedupeCrossAgent),
+  };
 }
 
 /**

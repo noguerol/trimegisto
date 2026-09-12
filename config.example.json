@@ -52,13 +52,9 @@
   },
   "loopSupervisor": {
     "enabled": true,
-    "maxRepeatedOutputs": 3,
     "maxSpawnDepth": 5,
     "maxAgentTurns": 50,
     "turnLimitGrace": 15,
-    "tierCooldownMs": 60000,
-    "similarityThreshold": 0.92,
-    "minRepeatableOutputChars": 80,
     "dedupeCrossAgent": false
   }
 }
