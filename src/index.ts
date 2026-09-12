@@ -1225,7 +1225,8 @@ export default function (pi: ExtensionAPI) {
   const COMPACTION_COOLDOWN_MS = 60_000; // 1 min between checks
 
   function getEffectiveCompactionThreshold(): number {
-    // Lowest enabled worker-tier threshold; 0 means every tier is off, so
+    // Lowest enabled threshold across all tiers (active included, since the
+    // main session runs the active model). 0 means every tier is off, so
     // Trimegisto never forces compaction and pi's native setting decides.
     return effectiveCompactionThreshold(config);
   }
