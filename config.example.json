@@ -44,6 +44,12 @@
   "dedupeTasks": true,
   "dedupeCrossAgent": false,
   "dashboardVisible": true,
+  "watchdog": {
+    "_note": "All values in SECONDS. 0 disables that watchdog. maxRuntimeSeconds defaults to 0 (disabled): agents that keep making progress have no wall-clock cap.",
+    "firstResponseSeconds": 90,
+    "idleSeconds": 120,
+    "maxRuntimeSeconds": 0
+  },
   "loopSupervisor": {
     "enabled": true,
     "maxRepeatedOutputs": 3,

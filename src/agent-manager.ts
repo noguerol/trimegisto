@@ -73,12 +73,59 @@ const PROVIDER_EXHAUSTION_PATTERN = /429|rate.?limit|quota|insufficient|overload
 
 /**
  * Watchdogs keep background workers from blocking orchestration forever.
- * Defaults are intentionally bounded: agents are scouts/workers, not a second
- * unbounded main session. Env overrides are useful while testing locally.
+ * Defaults are intentionally bounded for the first-response and idle watchdogs;
+ * the wall-clock max-runtime watchdog is DISABLED by default (0) so agents that
+ * keep making progress may run for as long as they need. Values are configured
+ * via Trimegisto's config (seconds) and can still be seeded from env vars.
  */
 const FIRST_RESPONSE_TIMEOUT_MS = parseInt(process.env.TRIMEGISTO_FIRST_RESPONSE_TIMEOUT_MS || "90000", 10);
 const AGENT_IDLE_TIMEOUT_MS = parseInt(process.env.TRIMEGISTO_AGENT_IDLE_TIMEOUT_MS || "120000", 10);
-const AGENT_MAX_RUNTIME_MS = parseInt(process.env.TRIMEGISTO_AGENT_MAX_RUNTIME_MS || "300000", 10);
+const AGENT_MAX_RUNTIME_MS = parseInt(process.env.TRIMEGISTO_AGENT_MAX_RUNTIME_MS || "0", 10);
+
+export interface WatchdogTimeouts {
+  firstResponseMs: number;
+  idleMs: number;
+  /** 0 = disabled */
+  maxRuntimeMs: number;
+}
+
+/** Node's setTimeout limit (2^31-1 ms). */
+const MAX_TIMER_MS = 2_147_483_647;
+
+/**
+ * Clamp an arbitrary ms value to a valid setTimeout delay. Non-finite or
+ * negative values fall back; oversized values are capped so they never
+ * overflow and fire immediately. 0 means "disabled".
+ */
+function normalizeWatchdogMs(value: number, fallback: number): number {
+  if (!Number.isFinite(value) || value < 0) {
+    return Number.isFinite(fallback) && fallback > 0 ? Math.min(Math.floor(fallback), MAX_TIMER_MS) : 0;
+  }
+  return Math.min(Math.floor(value), MAX_TIMER_MS);
+}
+
+let watchdogTimeouts: WatchdogTimeouts = {
+  firstResponseMs: normalizeWatchdogMs(FIRST_RESPONSE_TIMEOUT_MS, 90_000),
+  idleMs: normalizeWatchdogMs(AGENT_IDLE_TIMEOUT_MS, 120_000),
+  maxRuntimeMs: normalizeWatchdogMs(AGENT_MAX_RUNTIME_MS, 0),
+};
+
+/**
+ * Update watchdog timeouts at runtime (ms). 0 disables the corresponding
+ * watchdog. Values are normalized/clamped so a bad override can never
+ * overflow setTimeout. Called by the extension after loading /tmg config.
+ */
+export function setWatchdogTimeouts(t: Partial<WatchdogTimeouts>): void {
+  const next = { ...watchdogTimeouts };
+  if (t.firstResponseMs !== undefined) next.firstResponseMs = normalizeWatchdogMs(t.firstResponseMs, watchdogTimeouts.firstResponseMs);
+  if (t.idleMs !== undefined) next.idleMs = normalizeWatchdogMs(t.idleMs, watchdogTimeouts.idleMs);
+  if (t.maxRuntimeMs !== undefined) next.maxRuntimeMs = normalizeWatchdogMs(t.maxRuntimeMs, watchdogTimeouts.maxRuntimeMs);
+  watchdogTimeouts = next;
+}
+
+export function getWatchdogTimeouts(): WatchdogTimeouts {
+  return { ...watchdogTimeouts };
+}
 
 /**
  * Build the ordered model pool for a tier: primary model first, then redundant models.
@@ -427,32 +474,41 @@ export function launchAgent(
       // instead of leaving the main session waiting forever.
       gotFirstResponse = false;
       lastProgressAt = Date.now();
-      responseTimer = setTimeout(() => {
-        if (!gotFirstResponse && instance.status === "running") {
-          terminateForWatchdog(
-            "first_response_timeout",
-            `⏱ No first response from ${model || "default model"} within ${Math.round(FIRST_RESPONSE_TIMEOUT_MS / 1000)}s`,
-          );
-        }
-      }, FIRST_RESPONSE_TIMEOUT_MS);
+      const { firstResponseMs, idleMs, maxRuntimeMs } = watchdogTimeouts;
+      if (firstResponseMs > 0) {
+        responseTimer = setTimeout(() => {
+          if (!gotFirstResponse && instance.status === "running") {
+            terminateForWatchdog(
+              "first_response_timeout",
+              `⏱ No first response from ${model || "default model"} within ${Math.round(firstResponseMs / 1000)}s`,
+            );
+          }
+        }, firstResponseMs);
+      }
 
-      idleTimer = setInterval(() => {
-        if (instance.status !== "running") return;
-        const idleMs = Date.now() - lastProgressAt;
-        if (idleMs >= AGENT_IDLE_TIMEOUT_MS) {
-          terminateForWatchdog(
-            "idle_timeout",
-            `⏱ No agent progress for ${Math.round(idleMs / 1000)}s (idle timeout ${Math.round(AGENT_IDLE_TIMEOUT_MS / 1000)}s)`,
-          );
-        }
-      }, Math.min(15_000, Math.max(1_000, Math.floor(AGENT_IDLE_TIMEOUT_MS / 3))));
+      if (idleMs > 0) {
+        idleTimer = setInterval(() => {
+          if (instance.status !== "running") return;
+          const idleMs2 = Date.now() - lastProgressAt;
+          if (idleMs2 >= idleMs) {
+            terminateForWatchdog(
+              "idle_timeout",
+              `⏱ No agent progress for ${Math.round(idleMs2 / 1000)}s (idle timeout ${Math.round(idleMs / 1000)}s)`,
+            );
+          }
+        }, Math.min(15_000, Math.max(1_000, Math.floor(idleMs / 3))));
+      }
 
-      runtimeTimer = setTimeout(() => {
-        terminateForWatchdog(
-          "max_runtime_timeout",
-          `⏱ Agent exceeded max runtime ${Math.round(AGENT_MAX_RUNTIME_MS / 1000)}s`,
-        );
-      }, AGENT_MAX_RUNTIME_MS);
+      // Max-runtime (wall-clock) watchdog: disabled when 0, so a working agent
+      // is never killed merely for taking a long time.
+      if (maxRuntimeMs > 0) {
+        runtimeTimer = setTimeout(() => {
+          terminateForWatchdog(
+            "max_runtime_timeout",
+            `⏱ Agent exceeded max runtime ${Math.round(maxRuntimeMs / 1000)}s`,
+          );
+        }, maxRuntimeMs);
+      }
 
       let buffer = "";
 

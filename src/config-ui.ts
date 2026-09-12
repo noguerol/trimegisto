@@ -1,5 +1,5 @@
 import { Container, getKeybindings, Spacer, Text } from "@earendil-works/pi-tui";
-import { formatTierLabel } from "./config.ts";
+import { formatTierLabel, clampWatchdogSeconds, MAX_WATCHDOG_SECONDS, WATCHDOG_DEFAULTS } from "./config.ts";
 import type { AgentTier, TrimegistoConfig } from "./types.ts";
 import { formatTmgStatus } from "./branding.ts";
 
@@ -14,10 +14,13 @@ export interface ConfigUIRuntime {
   saveConfig: () => void;
   registerMainTool: () => void;
   syncLoopSupervisor?: () => void;
+  syncWatchdog?: () => void;
 }
 
 export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> {
   const { config } = rt;
+  // Defensive: a corrupted/legacy config must never crash the UI.
+  if (!config.watchdog) config.watchdog = { ...WATCHDOG_DEFAULTS };
   let modelList: string[] | null = null;
 
   const pickModel = async (title: string): Promise<string | undefined> => {
@@ -78,6 +81,11 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
     "Redundant agents: " + (config.redundantAgents ? "YES" : "NO"),
     "Dedupe tasks: " + (config.dedupeTasks ? "ON" : "OFF"),
     "Dedupe cross-agent output: " + (config.dedupeCrossAgent ? "ON" : "OFF"),
+    "Watchdogs: " + (() => {
+      const wd = config.watchdog;
+      const fmt = (s: number) => (s > 0 ? `${s}s` : "off");
+      return `first ${fmt(wd.firstResponseSeconds)} | idle ${fmt(wd.idleSeconds)} | max ${fmt(wd.maxRuntimeSeconds)}`;
+    })(),
     "Dashboard: " + rt.dashboardMode,
     "Done",
   ]);
@@ -105,6 +113,37 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
   if (tier.startsWith("Redundant agents")) { config.redundantAgents = !config.redundantAgents; ctx.ui.notify(`Redundant agents: ${config.redundantAgents ? "YES" : "NO"}`, "info"); rt.saveConfig(); rt.registerMainTool(); return; }
   if (tier.startsWith("Dedupe tasks")) { config.dedupeTasks = !config.dedupeTasks; ctx.ui.notify(`Dedupe tasks: ${config.dedupeTasks ? "ON" : "OFF"}`, "info"); rt.saveConfig(); return; }
   if (tier.startsWith("Dedupe cross-agent")) { config.dedupeCrossAgent = !config.dedupeCrossAgent; rt.syncLoopSupervisor?.(); ctx.ui.notify(`Dedupe cross-agent output: ${config.dedupeCrossAgent ? "ON" : "OFF"}`, "info"); rt.saveConfig(); return; }
+  if (tier.startsWith("Watchdogs")) {
+    const wd = config.watchdog;
+    const fmt = (s: number) => (s > 0 ? `${s}s` : "off");
+    const editSeconds = async (label: string, current: number, apply: (n: number) => void): Promise<void> => {
+      const raw = await ctx.ui.input(`${label} — seconds (0 disables it)`, String(current));
+      if (raw === undefined) return;
+      const n = parseInt(raw.trim(), 10);
+      if (isNaN(n) || n < 0) { ctx.ui.notify("Enter a non-negative number of seconds", "error"); return; }
+      const clamped = clampWatchdogSeconds(n, 0);
+      apply(clamped);
+      rt.syncWatchdog?.();
+      if (clamped !== n) ctx.ui.notify(`Value capped at ${MAX_WATCHDOG_SECONDS}s (max)`, "warning");
+      ctx.ui.notify(`${label}: ${clamped > 0 ? `${clamped}s` : "off"}`, "info");
+      rt.saveConfig();
+    };
+    const wdChoice = await ctx.ui.select("Watchdogs (0 = off):", [
+      `First response: ${fmt(wd.firstResponseSeconds)}`,
+      `Idle timeout: ${fmt(wd.idleSeconds)}`,
+      `Max runtime (wall-clock): ${fmt(wd.maxRuntimeSeconds)}`,
+      "Back",
+    ]);
+    if (!wdChoice || wdChoice === "Back") return;
+    if (wdChoice.startsWith("First response")) {
+      await editSeconds("First response timeout", wd.firstResponseSeconds, n => { wd.firstResponseSeconds = n; });
+    } else if (wdChoice.startsWith("Idle timeout")) {
+      await editSeconds("Idle timeout", wd.idleSeconds, n => { wd.idleSeconds = n; });
+    } else if (wdChoice.startsWith("Max runtime")) {
+      await editSeconds("Max runtime", wd.maxRuntimeSeconds, n => { wd.maxRuntimeSeconds = n; });
+    }
+    return;
+  }
   if (tier.startsWith("Dashboard")) {
     const modes: Array<"widget" | "compact" | "off"> = ["compact", "widget", "off"];
     const mode = modes[(modes.indexOf(rt.dashboardMode) + 1) % modes.length];
