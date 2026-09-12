@@ -1,11 +1,11 @@
 {
-  "_note": "EXAMPLE ONLY — Trimegisto does not read this file. The real config is created automatically at ~/.pi/agent/trimegisto/config.json (or via /tmg config). Copy the structure below to that file if you want to pre-configure tiers. Model values are placeholders: use any 'provider/model' id from your pi model registry, or point at a local server (ollama, vLLM, LM Studio, llama.cpp, ...) as a custom provider.",
+  "_note": "EXAMPLE ONLY — Trimegisto does not read this file. The real config is created automatically at ~/.pi/agent/trimegisto/config.json (or via /tmg config). Copy the structure below to that file if you want to pre-configure tiers. Model values are placeholders: use any 'provider/model' id from your pi model registry, or point at a local server (ollama, vLLM, LM Studio, llama.cpp, ...) as a custom provider. compactionThreshold: 0 (default) = off, pi's native setting decides; 50-95 forces proactive compaction at that % of context.",
   "active": {
     "model": "",
     "tools": ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn"],
     "extraArgs": [],
     "maxParallel": 4,
-    "compactionThreshold": 85,
+    "compactionThreshold": 0,
     "enabled": true,
     "redundantModels": []
   },
@@ -14,7 +14,7 @@
     "tools": ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn"],
     "extraArgs": [],
     "maxParallel": 1,
-    "compactionThreshold": 65,
+    "compactionThreshold": 0,
     "enabled": true,
     "redundantModels": []
   },
@@ -23,7 +23,7 @@
     "tools": ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn"],
     "extraArgs": [],
     "maxParallel": 4,
-    "compactionThreshold": 75,
+    "compactionThreshold": 0,
     "enabled": true,
     "redundantModels": []
   },
@@ -32,7 +32,7 @@
     "tools": ["read", "bash", "grep", "find", "ls", "trimegisto_spawn"],
     "extraArgs": [],
     "maxParallel": 4,
-    "compactionThreshold": 85,
+    "compactionThreshold": 0,
     "enabled": true,
     "redundantModels": []
   },

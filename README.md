@@ -148,9 +148,11 @@ Menu → per-tier submenu:
 
 - **Model** — scrollable picker over your pi model registry (`provider/model`)
 - **Max Parallel** — 1–8 concurrent agents per tier (× pool size when redundant agents are on)
-- **Compaction Threshold** — 50–95% of context window for proactive compaction
+- **Compaction Threshold** — `off (pi default)` or 50–95% of context window for forced proactive compaction. Off (default) leaves compaction to pi's native setting.
 - **Redundant models** (t1/t2) — pool for load-balancing + automatic failover
 - **Enabled** — toggle the tier
+
+Changing any setting keeps you in the same menu, so you can flip several options in one session; `Back`/`Esc` goes up one level and `Done` closes.
 
 Global flags in the main menu:
 
@@ -246,7 +248,7 @@ Inspect with `/tmg loops`, tune with `/tmg loops sensitivity <0.5..1>` (higher =
 - **Shared context** — each new agent receives a compact preamble of files already read and facts already published (via `trimegisto_note`) by other agents, so it avoids redundant re-reading and re-derivation.
 - **File locks** — advisory, 60 s stale timeout. Agents call `file_lock` before write/edit and `file_unlock` after; conflicts return the lock owner so agents can wait or move on. Locks are released automatically when an agent finishes, is killed or halted. Inspect with `/tmg locks`.
 - **Context broker** — when an agent modifies a file, other agents that previously read it (via `file_read_track`) get a compact system alert: "⚠️ Stale file: `x.ts` changed by `t3a` — re-read before editing."
-- **Proactive compaction** — Trimegisto watches the **main session's** context usage and triggers pi compaction proactively when it crosses the lowest enabled tier threshold (60 s cooldown), so long orchestration sessions stay under the limit.
+- **Proactive compaction** — opt-in. Trimegisto can watch the **main session's** context usage and force pi compaction when it crosses the lowest enabled tier threshold (60 s cooldown). By default all thresholds are **0 (off)**, so pi's native compaction setting decides and we never force an early compaction; set a per-tier 50–95% via `/tmg config` to re-enable it. Pre-v3 configs that still hold the old built-in defaults (85/65/75/85) are migrated to off automatically.
 - **Watchdogs & failover** — every worker has bounded first-response and idle-progress watchdogs (defaults: 90 s / 120 s). The wall-clock **max-runtime watchdog is disabled by default** (`maxRuntimeSeconds: 0`), so an agent that keeps making progress may run for as long as it needs. All three are configurable in seconds via `/tmg config → Watchdogs` (0 = off) and persisted in `~/.pi/agent/trimegisto/config.json`. Precedence: saved config > `TRIMEGISTO_FIRST_RESPONSE_TIMEOUT_MS` / `TRIMEGISTO_AGENT_IDLE_TIMEOUT_MS` / `TRIMEGISTO_AGENT_MAX_RUNTIME_MS` env vars > built-in defaults. Values are clamped to a safe range so an oversized number can never overflow the timer. A stuck sub-agent is killed and harvested instead of blocking orchestration forever. With `redundantAgents` on, provider failures/no first response can fail over to the next model in the pool.
 
 ### Data layout
