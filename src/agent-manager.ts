@@ -561,7 +561,7 @@ export function launchAgent(
             const limitEntry: AgentLogEntry = {
               ts: Date.now(),
               level: "error",
-              text: `⛔ Hard turn limit exceeded (${instance.usage.turns} turns). Killing agent to prevent runaway loop.`,
+              text: `⛔ Hard turn limit exceeded (${instance.usage.turns} turns). Killing agent to prevent runaway resource use.`,
             };
             instance.log.push(limitEntry);
             notifyAgentLog(id, limitEntry);
@@ -728,8 +728,11 @@ export function launchAgent(
 
         notifyStateChange();
 
-        // ── Swarm guard: record result for cross-agent redundancy detection ──
-        if (loopSupervisor && instance.status !== "killed") {
+        // ── Swarm guard: always record the result so guard state (active
+        // ids, spawn chain, redundancy counters) is cleaned up even when the
+        // agent was killed by a turn limit / halt / replacement. Killed and
+        // failed results skip redundancy detection inside processResult().
+        if (loopSupervisor) {
           loopSupervisor.processResult(buildResult());
         }
 

@@ -155,5 +155,37 @@ function check(name: string, cond: boolean) {
   check("loop-detection knobs removed", !("maxRepeatedOutputs" in DEFAULT_LOOP_CONFIG) && !("similarityThreshold" in DEFAULT_LOOP_CONFIG) && !("tierCooldownMs" in DEFAULT_LOOP_CONFIG));
 }
 
+console.log("Test 10 (killed/failed results still clean up guard state):");
+{
+  const s = new LoopSupervisor({ enabled: true, maxSpawnDepth: 1, dedupeCrossAgent: true });
+  let dups = 0;
+  s.setOnAlert(a => { if (a.type === "cross_agent_duplicate") dups++; });
+  s.registerSpawn("t2a", "t2");
+  check("active before", s.getState().tiers.t2.activeAgents === 1);
+  check("spawn chain blocks at depth 1", !s.canSpawn("t2", "t2a").allowed);
+  s.processResult(makeResult("t2a", "t2", CONTRACT + "partial", "killed"));
+  check("killed agent removed from active", s.getState().tiers.t2.activeAgents === 0, s.getState().tiers.t2.activeAgents);
+  check("spawn chain cleaned", s.canSpawn("t2", "t2a").allowed);
+  check("killed result is not redundant work", dups === 0, dups);
+}
+
+console.log("Test 11 (boundary inputs are safe):");
+{
+  const s = new LoopSupervisor({ enabled: true, maxAgentTurns: 5, turnLimitGrace: 0, dedupeCrossAgent: true });
+  let threw = false;
+  try {
+    s.processResult({ agentId: "x", tier: "t2", status: "done" } as any);       // no output/usage
+    s.processResult({ agentId: "y", tier: "t2", status: "done", output: null, usage: null } as any);
+  } catch { threw = true; }
+  check("missing output/usage tolerated", !threw);
+  check("negative turns no kill", s.checkTurnLimit("a", "t2", -1) === false);
+  check("NaN turns no kill", s.checkTurnLimit("a", "t2", NaN) === false);
+  check("Infinity turns counted (kill)", s.checkTurnLimit("a", "t2", Infinity) === true);
+  check("unknown parent spawn allowed", s.canSpawn("t2", "nope").allowed);
+  const empty = new LoopSupervisor({ enabled: true, dedupeCrossAgent: true });
+  empty.processResult(makeResult("only", "t2", CONTRACT + "solo"));
+  check("no cross-agent alert with a single agent", empty.getState().tiers.t2.crossDuplicates === 0);
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

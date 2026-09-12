@@ -172,7 +172,10 @@ export class LoopSupervisor {
     const hardLimit = softLimit + (this.config.turnLimitGrace ?? 15);
     const state = this.tiers[tier];
 
-    if (turns <= softLimit) return false;
+    // Guard against NaN turn counts (which would slip past both comparisons
+    // below and be treated as a hard-limit kill). Infinity still counts as
+    // runaway and gets killed; -Infinity falls under the soft limit.
+    if (Number.isNaN(turns) || turns <= softLimit) return false;
 
     if (turns <= hardLimit) {
       if (!state.turnWarnedAgents.has(agentId)) {
