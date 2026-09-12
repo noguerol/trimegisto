@@ -70,6 +70,7 @@ export function saveConfig(config: TrimegistoConfig): void {
       dedupeTasks: config.dedupeTasks,
       dedupeCrossAgent: config.dedupeCrossAgent,
       dashboardVisible: config.dashboardVisible,
+      watchdog: config.watchdog,
       loopSupervisor: config.loopSupervisor,
       // Schema version for future migrations
       _schemaVersion: 2,
@@ -105,6 +106,7 @@ export function loadConfig(): {
   dedupeTasks?: boolean;
   dedupeCrossAgent?: boolean;
   dashboardVisible?: boolean;
+  watchdog?: Partial<{ firstResponseSeconds: number; idleSeconds: number; maxRuntimeSeconds: number }>;
   loopSupervisor?: Partial<{ enabled: boolean; maxRepeatedOutputs: number; maxSpawnDepth: number; maxAgentTurns: number; turnLimitGrace: number; tierCooldownMs: number }>;
 } | null {
   try {
@@ -130,6 +132,7 @@ export function loadConfig(): {
       dedupeTasks: typeof data.dedupeTasks === "boolean" ? data.dedupeTasks : undefined,
       dedupeCrossAgent: typeof data.dedupeCrossAgent === "boolean" ? data.dedupeCrossAgent : undefined,
       dashboardVisible: typeof data.dashboardVisible === "boolean" ? data.dashboardVisible : undefined,
+      watchdog: data.watchdog && typeof data.watchdog === "object" ? data.watchdog : undefined,
       loopSupervisor: data.loopSupervisor && typeof data.loopSupervisor === "object" ? data.loopSupervisor : undefined,
     };
   } catch (err) {

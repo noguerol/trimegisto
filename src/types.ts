@@ -114,6 +114,28 @@ export interface TierConfig {
   redundantModels?: string[];
 }
 
+/**
+ * Watchdog timeouts for spawned agents, in seconds.
+ * A value of 0 disables that watchdog.
+ */
+export interface WatchdogConfig {
+  /**
+   * Seconds to wait for the FIRST assistant response before killing the agent
+   * (provider hang / model never starts). 0 = disabled. Default: 90.
+   */
+  firstResponseSeconds: number;
+  /**
+   * Seconds without any agent progress (no stream events) before killing it.
+   * 0 = disabled. Default: 120.
+   */
+  idleSeconds: number;
+  /**
+   * Maximum wall-clock seconds per agent attempt. 0 = disabled (agent may run
+   * for as long as it keeps making progress). Default: 0 (disabled).
+   */
+  maxRuntimeSeconds: number;
+}
+
 export interface LoopSupervisorConfig {
   enabled: boolean;
   maxRepeatedOutputs: number;
@@ -185,6 +207,8 @@ export interface TrimegistoConfig {
   dedupeCrossAgent: boolean;
   /** Whether the dashboard is visible */
   dashboardVisible: boolean;
+  /** Watchdog timeouts (seconds; 0 disables that watchdog) */
+  watchdog: WatchdogConfig;
   /** Loop supervisor settings */
   loopSupervisor: Partial<LoopSupervisorConfig>;
 }

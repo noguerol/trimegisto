@@ -14,6 +14,8 @@ import {
   buildTierConfig,
   getDefaultConfig,
   formatTierLabel,
+  clampWatchdogSeconds,
+  WATCHDOG_DEFAULTS,
 } from "./config.ts";
 import {
   launchAgent,
@@ -33,6 +35,7 @@ import {
   processSpawnRequests,
   sendToAgent,
   setLoopSupervisor,
+  setWatchdogTimeouts,
 } from "./agent-manager.ts";
 import { dedupeTaskBatch, registerTask, forgetTask } from "./task-dedup.ts";
 import { saveConfig as persistConfig, loadConfig } from "./persistence.ts";
@@ -106,6 +109,20 @@ export default function (pi: ExtensionAPI) {
   let dashboardMode: "widget" | "compact" | "off" = "compact";
   let ctxRef: ExtensionContext | null = null;
   let disposed = false;
+
+  /**
+   * Push watchdog timeouts (stored in seconds) into the agent manager.
+   * 0 disables that watchdog; maxRuntime defaults to 0 (disabled), so agents
+   * that keep making progress are never killed on a wall-clock cap alone.
+   */
+  function applyWatchdogConfig(): void {
+    setWatchdogTimeouts({
+      firstResponseMs: clampWatchdogSeconds(config.watchdog?.firstResponseSeconds, WATCHDOG_DEFAULTS.firstResponseSeconds) * 1000,
+      idleMs: clampWatchdogSeconds(config.watchdog?.idleSeconds, WATCHDOG_DEFAULTS.idleSeconds) * 1000,
+      maxRuntimeMs: clampWatchdogSeconds(config.watchdog?.maxRuntimeSeconds, WATCHDOG_DEFAULTS.maxRuntimeSeconds) * 1000,
+    });
+  }
+  applyWatchdogConfig();
 
   /**
    * Timers and child-process callbacks can fire after /reload has replaced the
@@ -1010,6 +1027,7 @@ export default function (pi: ExtensionAPI) {
         saveConfig,
         registerMainTool,
         syncLoopSupervisor: () => { loopSupervisor.updateConfig({ dedupeCrossAgent: config.dedupeCrossAgent }); },
+        syncWatchdog: applyWatchdogConfig,
       });
     },
   });
@@ -1093,8 +1111,16 @@ export default function (pi: ExtensionAPI) {
         dedupeTasks: savedConfig.dedupeTasks ?? config.dedupeTasks,
         dedupeCrossAgent: savedConfig.dedupeCrossAgent ?? config.dedupeCrossAgent,
         dashboardVisible: savedConfig.dashboardVisible ?? config.dashboardVisible,
+        watchdog: {
+          firstResponseSeconds: clampWatchdogSeconds(savedConfig.watchdog?.firstResponseSeconds ?? config.watchdog.firstResponseSeconds, WATCHDOG_DEFAULTS.firstResponseSeconds),
+          idleSeconds: clampWatchdogSeconds(savedConfig.watchdog?.idleSeconds ?? config.watchdog.idleSeconds, WATCHDOG_DEFAULTS.idleSeconds),
+          maxRuntimeSeconds: clampWatchdogSeconds(savedConfig.watchdog?.maxRuntimeSeconds ?? config.watchdog.maxRuntimeSeconds, WATCHDOG_DEFAULTS.maxRuntimeSeconds),
+        },
         loopSupervisor: { ...config.loopSupervisor, ...(savedConfig.loopSupervisor || {}) },
       };
+
+      // Apply watchdog timeouts (seconds → ms) to the agent manager
+      applyWatchdogConfig();
 
       // Apply loop supervisor config
       if (savedConfig.loopSupervisor) {
@@ -1383,6 +1409,7 @@ export default function (pi: ExtensionAPI) {
         dedupeTasks: config.dedupeTasks,
         dedupeCrossAgent: config.dedupeCrossAgent,
         dashboardVisible: config.dashboardVisible,
+        watchdog: config.watchdog,
         loopSupervisor: config.loopSupervisor,
       });
     } catch {

@@ -255,6 +255,11 @@ export function getDefaultConfig(): TrimegistoConfig {
     dedupeTasks: true,
     dedupeCrossAgent: false,
     dashboardVisible: true,
+    watchdog: {
+      firstResponseSeconds: envWatchdogSeconds("TRIMEGISTO_FIRST_RESPONSE_TIMEOUT_MS", WATCHDOG_DEFAULTS.firstResponseSeconds),
+      idleSeconds: envWatchdogSeconds("TRIMEGISTO_AGENT_IDLE_TIMEOUT_MS", WATCHDOG_DEFAULTS.idleSeconds),
+      maxRuntimeSeconds: envWatchdogSeconds("TRIMEGISTO_AGENT_MAX_RUNTIME_MS", WATCHDOG_DEFAULTS.maxRuntimeSeconds),
+    },
     loopSupervisor: {
       enabled: true,
       maxRepeatedOutputs: 3,
@@ -267,6 +272,47 @@ export function getDefaultConfig(): TrimegistoConfig {
 }
 
 export const DEFAULT_PROMPTS_MAP = DEFAULT_PROMPTS;
+
+/**
+ * Node's setTimeout limit is 2^31-1 ms; any larger delay overflows and fires
+ * after ~1 ms. Clamp watchdog seconds below that so an oversized value can
+ * never kill an agent instantly.
+ */
+export const MAX_WATCHDOG_SECONDS = Math.floor(2_147_483_647 / 1000); // ~24.8 days
+
+/** Default watchdog timeouts in seconds (0 = disabled). */
+export const WATCHDOG_DEFAULTS = {
+  firstResponseSeconds: 90,
+  idleSeconds: 120,
+  maxRuntimeSeconds: 0,
+} as const;
+
+/**
+ * Coerce a watchdog value (seconds) to a safe integer in [0, MAX_WATCHDOG_SECONDS].
+ * Non-finite / negative / non-numeric values fall back to `fallback`; oversized
+ * values are clamped so setTimeout never overflows (which would fire immediately).
+ */
+export function clampWatchdogSeconds(value: unknown, fallback: number): number {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) {
+    const f = Math.floor(fallback);
+    return Number.isFinite(f) && f > 0 ? Math.min(f, MAX_WATCHDOG_SECONDS) : 0;
+  }
+  return Math.min(Math.floor(n), MAX_WATCHDOG_SECONDS);
+}
+
+/**
+ * Read a legacy ms env override and convert it to whole seconds.
+ * Keeps `TRIMEGISTO_*_MS` working now that watchdogs live in the config file:
+ * precedence is saved config > env var > built-in default.
+ */
+function envWatchdogSeconds(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const ms = parseInt(raw, 10);
+  if (!Number.isFinite(ms) || ms < 0) return fallback;
+  return clampWatchdogSeconds(Math.floor(ms / 1000), fallback);
+}
 
 export function formatTierLabel(tier: string): string {
   switch (tier) {
