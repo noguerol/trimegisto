@@ -325,14 +325,17 @@ export function migrateSavedCompaction(
 }
 
 /**
- * Lowest ACTIVE proactive-compaction threshold among the worker tiers.
- * Values <= 0 are disabled and ignored; returns 0 when every threshold is off
- * (meaning: let pi decide with its native setting).
+ * Lowest ACTIVE proactive-compaction threshold across all tiers.
+ * The monitor compacts the MAIN session (running the active model), so the
+ * active tier's threshold counts too — otherwise setting it in /tmg config
+ * would be a silent no-op. Values <= 0 are disabled and ignored; returns 0
+ * when every threshold is off (meaning: let pi decide with its native setting).
  */
 export function effectiveCompactionThreshold(
-  tiers: Pick<Record<AgentTier, { compactionThreshold: number }>, "t1" | "t2" | "t3">,
+  tiers: Pick<Record<AgentTier, { compactionThreshold: number }>, "active" | "t1" | "t2" | "t3">,
 ): number {
   const thresholds = [
+    tiers.active.compactionThreshold,
     tiers.t1.compactionThreshold,
     tiers.t2.compactionThreshold,
     tiers.t3.compactionThreshold,

@@ -216,12 +216,15 @@ console.log("Test 9 (load + migrate real persisted v2 config):");
 
 console.log("Test 10 (effectiveCompactionThreshold):");
 {
-  const t = (a: number, b: number, c: number) => effectiveCompactionThreshold({ t1: { compactionThreshold: a }, t2: { compactionThreshold: b }, t3: { compactionThreshold: c } });
-  check("all off -> 0", t(0, 0, 0) === 0, t(0, 0, 0));
-  check("only t1 -> that value", t(60, 0, 0) === 60, t(60, 0, 0));
-  check("lowest enabled wins", t(60, 50, 0) === 50, t(60, 50, 0));
-  check("negatives ignored", t(-5, 70, 0) === 70, t(-5, 70, 0));
-  check("100 is valid", t(0, 0, 100) === 100, t(0, 0, 100));
+  const t = (a: number, b: number, c: number, d: number) => effectiveCompactionThreshold({
+    active: { compactionThreshold: a }, t1: { compactionThreshold: b }, t2: { compactionThreshold: c }, t3: { compactionThreshold: d },
+  });
+  check("all off -> 0", t(0, 0, 0, 0) === 0, t(0, 0, 0, 0));
+  check("only t1 -> that value", t(0, 60, 0, 0) === 60, t(0, 60, 0, 0));
+  check("only active -> that value", t(50, 0, 0, 0) === 50, t(50, 0, 0, 0));
+  check("lowest enabled wins (incl. active)", t(45, 60, 50, 0) === 45, t(45, 60, 50, 0));
+  check("negatives ignored", t(0, -5, 70, 0) === 70, t(0, -5, 70, 0));
+  check("100 is valid", t(0, 0, 0, 100) === 100, t(0, 0, 0, 100));
   check("default config -> 0", effectiveCompactionThreshold(getDefaultConfig()) === 0);
 }
 
