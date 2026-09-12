@@ -16,6 +16,8 @@ import {
   formatTierLabel,
   clampWatchdogSeconds,
   WATCHDOG_DEFAULTS,
+  migrateSavedCompaction,
+  effectiveCompactionThreshold,
 } from "./config.ts";
 import {
   launchAgent,
@@ -1122,6 +1124,20 @@ export default function (pi: ExtensionAPI) {
       // Apply watchdog timeouts (seconds → ms) to the agent manager
       applyWatchdogConfig();
 
+      // Migrate pre-v3 compaction thresholds: old built-in defaults forced
+      // early compaction; reset them to 0 so pi's native setting decides.
+      const migratedCompaction = migrateSavedCompaction(
+        savedConfig as any,
+        (savedConfig as any)._schemaVersion,
+      );
+      for (const tier of ["active", "t1", "t2", "t3"] as const) {
+        const migrated = migratedCompaction[tier];
+        if (migrated !== undefined) config[tier].compactionThreshold = migrated;
+      }
+      // Persist the migration once (bumps _schemaVersion) so a later manual
+      // value equal to an old default is not reset on every load.
+      if (Object.keys(migratedCompaction).length > 0) saveConfig();
+
       // Apply loop supervisor config
       if (savedConfig.loopSupervisor) {
         loopSupervisor.updateConfig(savedConfig.loopSupervisor);
@@ -1209,13 +1225,9 @@ export default function (pi: ExtensionAPI) {
   const COMPACTION_COOLDOWN_MS = 60_000; // 1 min between checks
 
   function getEffectiveCompactionThreshold(): number {
-    // Use the lowest (most aggressive) threshold among enabled tiers
-    const thresholds = [
-      config.t1.compactionThreshold,
-      config.t2.compactionThreshold,
-      config.t3.compactionThreshold,
-    ];
-    return Math.min(...thresholds);
+    // Lowest enabled worker-tier threshold; 0 means every tier is off, so
+    // Trimegisto never forces compaction and pi's native setting decides.
+    return effectiveCompactionThreshold(config);
   }
 
   function maybeTriggerCompaction(ctx: ExtensionContext): void {
@@ -1234,6 +1246,9 @@ export default function (pi: ExtensionAPI) {
       const contextWindow = (ctx.model as any)?.contextWindow ?? 200_000;
       const usagePercent = (usage.tokens / contextWindow) * 100;
       const threshold = getEffectiveCompactionThreshold();
+
+      // 0 = disabled: let pi decide when to compact (native setting).
+      if (threshold <= 0) return;
 
       if (usagePercent >= threshold) {
         compactionInProgress = true;

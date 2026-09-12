@@ -11,6 +11,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { TrimegistoConfig } from "./types.ts";
+import { SCHEMA_VERSION } from "./config.ts";
 
 function getConfigPath(): string {
   const dir = path.join(getAgentDir(), "trimegisto");
@@ -73,7 +74,7 @@ export function saveConfig(config: TrimegistoConfig): void {
       watchdog: config.watchdog,
       loopSupervisor: config.loopSupervisor,
       // Schema version for future migrations
-      _schemaVersion: 2,
+      _schemaVersion: SCHEMA_VERSION,
       _savedAt: new Date().toISOString(),
     };
 
@@ -107,6 +108,7 @@ export function loadConfig(): {
   dedupeCrossAgent?: boolean;
   dashboardVisible?: boolean;
   watchdog?: Partial<{ firstResponseSeconds: number; idleSeconds: number; maxRuntimeSeconds: number }>;
+  _schemaVersion?: number;
   loopSupervisor?: Partial<{ enabled: boolean; maxRepeatedOutputs: number; maxSpawnDepth: number; maxAgentTurns: number; turnLimitGrace: number; tierCooldownMs: number }>;
 } | null {
   try {
@@ -133,6 +135,7 @@ export function loadConfig(): {
       dedupeCrossAgent: typeof data.dedupeCrossAgent === "boolean" ? data.dedupeCrossAgent : undefined,
       dashboardVisible: typeof data.dashboardVisible === "boolean" ? data.dashboardVisible : undefined,
       watchdog: data.watchdog && typeof data.watchdog === "object" ? data.watchdog : undefined,
+      _schemaVersion: typeof data._schemaVersion === "number" ? data._schemaVersion : undefined,
       loopSupervisor: data.loopSupervisor && typeof data.loopSupervisor === "object" ? data.loopSupervisor : undefined,
     };
   } catch (err) {

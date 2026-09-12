@@ -98,7 +98,10 @@ export interface TierConfig {
   systemPrompt: string;
   /** Max parallel instances */
   maxParallel: number;
-  /** Compaction threshold: % of context window at which to trigger proactive compaction (0-100). Lower = compact sooner. Default: 65 (t1), 75 (t2), 85 (t3) */
+  /**
+   * Proactive compaction threshold: % of the context window at which Trimegisto
+   * forces compaction. 0 = OFF (default): let pi decide with its native setting.
+   */
   compactionThreshold: number;
   /** Allowed tools */
   tools: string[];

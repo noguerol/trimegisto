@@ -200,7 +200,7 @@ function getTierDefaults(tier: AgentTier): TierConfig {
         model: "", // uses the pi ACTIVE model (useActiveModel)
         systemPrompt: DEFAULT_PROMPTS.active,
         maxParallel: 4,
-        compactionThreshold: 85,
+        compactionThreshold: 0,
         tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn", "file_read_track", "trimegisto_note"],
         extraArgs: [],
         redundantModels: [],
@@ -211,7 +211,7 @@ function getTierDefaults(tier: AgentTier): TierConfig {
         model: "", // User must configure
         systemPrompt: DEFAULT_PROMPTS.t1,
         maxParallel: 1,
-        compactionThreshold: 65,
+        compactionThreshold: 0,
         tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn", "file_read_track", "trimegisto_note"],
         extraArgs: [],
         redundantModels: [],
@@ -222,7 +222,7 @@ function getTierDefaults(tier: AgentTier): TierConfig {
         model: "",
         systemPrompt: DEFAULT_PROMPTS.t2,
         maxParallel: 4,
-        compactionThreshold: 75,
+        compactionThreshold: 0,
         tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn", "file_read_track", "trimegisto_note"],
         extraArgs: [],
         redundantModels: [],
@@ -233,7 +233,7 @@ function getTierDefaults(tier: AgentTier): TierConfig {
         model: "",
         systemPrompt: DEFAULT_PROMPTS.t3,
         maxParallel: 4,
-        compactionThreshold: 85,
+        compactionThreshold: 0,
         tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn", "file_read_track", "trimegisto_note"],
         extraArgs: [],
         redundantModels: [],
@@ -286,6 +286,60 @@ export const WATCHDOG_DEFAULTS = {
   idleSeconds: 120,
   maxRuntimeSeconds: 0,
 } as const;
+
+/** Current on-disk config schema version. Bumped when a migration is needed. */
+export const SCHEMA_VERSION = 3;
+
+/**
+ * Built-in compaction thresholds shipped before schema v3. Trimegisto used to
+ * force proactive compaction at these percentages; from v3 on, 0 means "off"
+ * (let pi decide with its native setting).
+ */
+export const OLD_DEFAULT_COMPACTION: Record<AgentTier, number> = {
+  active: 85,
+  t1: 65,
+  t2: 75,
+  t3: 85,
+};
+
+/**
+ * Migrate pre-v3 saved compaction thresholds.
+ *
+ * Any saved value that still equals one of the old built-in defaults is reset
+ * to 0 (off) so we stop forcing early compaction; values the user deliberately
+ * set to something else are preserved. Returns only the tiers that change.
+ */
+export function migrateSavedCompaction(
+  saved: Partial<Record<AgentTier, { compactionThreshold?: number }>> | undefined,
+  savedSchemaVersion: number | undefined,
+): Partial<Record<AgentTier, number>> {
+  const out: Partial<Record<AgentTier, number>> = {};
+  if ((savedSchemaVersion ?? 0) >= SCHEMA_VERSION) return out;
+  for (const tier of ["active", "t1", "t2", "t3"] as const) {
+    const value = saved?.[tier]?.compactionThreshold;
+    if (typeof value === "number" && value === OLD_DEFAULT_COMPACTION[tier]) {
+      out[tier] = 0;
+    }
+  }
+  return out;
+}
+
+/**
+ * Lowest ACTIVE proactive-compaction threshold among the worker tiers.
+ * Values <= 0 are disabled and ignored; returns 0 when every threshold is off
+ * (meaning: let pi decide with its native setting).
+ */
+export function effectiveCompactionThreshold(
+  tiers: Pick<Record<AgentTier, { compactionThreshold: number }>, "t1" | "t2" | "t3">,
+): number {
+  const thresholds = [
+    tiers.t1.compactionThreshold,
+    tiers.t2.compactionThreshold,
+    tiers.t3.compactionThreshold,
+  ].filter(t => t > 0);
+  if (thresholds.length === 0) return 0;
+  return Math.min(...thresholds);
+}
 
 /**
  * Coerce a watchdog value (seconds) to a safe integer in [0, MAX_WATCHDOG_SECONDS].
