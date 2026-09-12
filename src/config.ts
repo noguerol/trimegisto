@@ -311,7 +311,10 @@ function envWatchdogSeconds(name: string, fallback: number): number {
   if (raw === undefined) return fallback;
   const ms = parseInt(raw, 10);
   if (!Number.isFinite(ms) || ms < 0) return fallback;
-  return clampWatchdogSeconds(Math.floor(ms / 1000), fallback);
+  if (ms === 0) return 0; // explicit disable
+  // Sub-second values round up to 1s instead of silently disabling the watchdog
+  // (config is in seconds; 500ms previously became 0 = off).
+  return clampWatchdogSeconds(Math.max(1, Math.round(ms / 1000)), fallback);
 }
 
 export function formatTierLabel(tier: string): string {

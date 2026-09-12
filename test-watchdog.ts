@@ -59,6 +59,15 @@ console.log("Test 1b (legacy env vars still seed defaults):");
   check("env maxRuntime 600000ms -> 600s", wd.maxRuntimeSeconds === 600, wd.maxRuntimeSeconds);
   process.env.TRIMEGISTO_AGENT_MAX_RUNTIME_MS = "0";
   check("env maxRuntime 0 -> disabled", getDefaultConfig().watchdog.maxRuntimeSeconds === 0);
+  // Sub-second env values must NOT silently disable the watchdog.
+  process.env.TRIMEGISTO_AGENT_MAX_RUNTIME_MS = "500";
+  check("env 500ms -> 1s (not off)", getDefaultConfig().watchdog.maxRuntimeSeconds === 1, getDefaultConfig().watchdog.maxRuntimeSeconds);
+  process.env.TRIMEGISTO_AGENT_MAX_RUNTIME_MS = "999";
+  check("env 999ms -> 1s (not off)", getDefaultConfig().watchdog.maxRuntimeSeconds === 1, getDefaultConfig().watchdog.maxRuntimeSeconds);
+  process.env.TRIMEGISTO_AGENT_MAX_RUNTIME_MS = "1500";
+  check("env 1500ms -> 2s (rounded)", getDefaultConfig().watchdog.maxRuntimeSeconds === 2, getDefaultConfig().watchdog.maxRuntimeSeconds);
+  process.env.TRIMEGISTO_AGENT_MAX_RUNTIME_MS = "90000";
+  check("env 90000ms -> 90s", getDefaultConfig().watchdog.maxRuntimeSeconds === 90, getDefaultConfig().watchdog.maxRuntimeSeconds);
   if (savedEnv === undefined) delete process.env.TRIMEGISTO_AGENT_MAX_RUNTIME_MS; else process.env.TRIMEGISTO_AGENT_MAX_RUNTIME_MS = savedEnv;
 }
 
