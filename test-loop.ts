@@ -50,7 +50,7 @@ function check(name: string, cond: boolean) {
 
 // ── Test 2: turn limit soft warning then hard kill ────────
 {
-  const s = new LoopSupervisor({ enabled: true, maxAgentTurns: 5, turnLimitGrace: 3 });
+  const s = new LoopSupervisor({ enabled: true, turnLimitEnabled: true, maxAgentTurns: 5, turnLimitGrace: 3 });
   const turnAlerts: Array<{ msg: string }> = [];
   s.setOnAlert(a => { if (a.type === "turn_limit") turnAlerts.push(a); });
   console.log("Test 2 (turn limit):");
@@ -149,6 +149,7 @@ function check(name: string, cond: boolean) {
 {
   console.log("Test 9 (defaults):");
   check("default maxSpawnDepth = 5", DEFAULT_LOOP_CONFIG.maxSpawnDepth === 5);
+  check("default turnLimitEnabled = false (off)", DEFAULT_LOOP_CONFIG.turnLimitEnabled === false);
   check("default maxAgentTurns = 50", DEFAULT_LOOP_CONFIG.maxAgentTurns === 50);
   check("default turnLimitGrace = 15", DEFAULT_LOOP_CONFIG.turnLimitGrace === 15);
   check("default dedupeCrossAgent = false", DEFAULT_LOOP_CONFIG.dedupeCrossAgent === false);
@@ -171,7 +172,7 @@ console.log("Test 10 (killed/failed results still clean up guard state):");
 
 console.log("Test 11 (boundary inputs are safe):");
 {
-  const s = new LoopSupervisor({ enabled: true, maxAgentTurns: 5, turnLimitGrace: 0, dedupeCrossAgent: true });
+  const s = new LoopSupervisor({ enabled: true, turnLimitEnabled: true, maxAgentTurns: 5, turnLimitGrace: 0, dedupeCrossAgent: true });
   let threw = false;
   try {
     s.processResult({ agentId: "x", tier: "t2", status: "done" } as any);       // no output/usage
@@ -185,6 +186,36 @@ console.log("Test 11 (boundary inputs are safe):");
   const empty = new LoopSupervisor({ enabled: true, dedupeCrossAgent: true });
   empty.processResult(makeResult("only", "t2", CONTRACT + "solo"));
   check("no cross-agent alert with a single agent", empty.getState().tiers.t2.crossDuplicates === 0);
+}
+
+console.log("Test 12 (turn limit is opt-in and configurable):");
+{
+  // Default: OFF. Even a runaway turn count produces no alert and no kill.
+  const off = new LoopSupervisor({ enabled: true });
+  let offAlerts = 0;
+  off.setOnAlert(() => { offAlerts++; });
+  off.registerSpawn("t2a", "t2");
+  check("disabled by default: no kill at 999 turns", off.checkTurnLimit("t2a", "t2", 999) === false);
+  check("disabled by default: no alert", offAlerts === 0, offAlerts);
+
+  // Enabled: warning fires at the configured turn count, kill at +grace.
+  const on = new LoopSupervisor({ enabled: true, turnLimitEnabled: true, maxAgentTurns: 10, turnLimitGrace: 2 });
+  const kinds: string[] = [];
+  on.setOnAlert(a => kinds.push(a.type));
+  on.registerSpawn("t2a", "t2");
+  check("at 10 turns: no kill", on.checkTurnLimit("t2a", "t2", 10) === false);
+  check("at 11 turns: warn, no kill", on.checkTurnLimit("t2a", "t2", 11) === false);
+  check("warning emitted once", kinds.filter(k => k === "turn_limit").length === 1, kinds);
+  check("at 13 turns: hard kill (10+2+1)", on.checkTurnLimit("t2a", "t2", 13) === true);
+
+  // Runtime toggle: turning it off disarms an enabled guard immediately.
+  on.updateConfig({ turnLimitEnabled: false });
+  on.registerSpawn("t2b", "t2");
+  check("disabled at runtime: no kill", on.checkTurnLimit("t2b", "t2", 999) === false);
+  // and turning it back on works with the configured turns.
+  on.updateConfig({ turnLimitEnabled: true });
+  on.registerSpawn("t2c", "t2");
+  check("re-enabled at runtime: respects configured turns", on.checkTurnLimit("t2c", "t2", 12) === false && on.checkTurnLimit("t2c", "t2", 13) === true);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

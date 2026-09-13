@@ -143,6 +143,11 @@ export interface LoopSupervisorConfig {
   enabled: boolean;
   /** Max recursive auto-spawn depth (structural guard; antiloop cannot see it). */
   maxSpawnDepth: number;
+  /**
+   * Whether the turn limit is enforced at all. OFF by default: an agent is
+   * never warned or killed for its turn count unless this is enabled.
+   */
+  turnLimitEnabled: boolean;
   /** Soft turn limit — agent receives a warning here but is NOT killed. Default: 50 */
   maxAgentTurns: number;
   /** Extra turns granted after the soft limit before hard kill. Default: 15 (hard limit = soft + grace) */
@@ -153,6 +158,17 @@ export interface LoopSupervisorConfig {
    * loop detection. Default: false.
    */
   dedupeCrossAgent?: boolean;
+}
+
+export interface ModelHealthConfig {
+  /** Whether the model circuit breaker is active. */
+  enabled: boolean;
+  /** Consecutive model-level failures before the breaker opens. */
+  failureThreshold: number;
+  /** Base cooldown (seconds) applied when the breaker opens. */
+  cooldownSeconds: number;
+  /** Cap for the exponential backoff (seconds). */
+  maxCooldownSeconds: number;
 }
 
 export interface TrimegistoConfig {
@@ -198,6 +214,8 @@ export interface TrimegistoConfig {
   watchdog: WatchdogConfig;
   /** Loop supervisor settings */
   loopSupervisor: Partial<LoopSupervisorConfig>;
+  /** Model-level circuit breaker (pauses spawns on a failing model) */
+  modelHealth: ModelHealthConfig;
 }
 
 export interface SpawnRequest {

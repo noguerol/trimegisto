@@ -51,10 +51,19 @@
     "maxRuntimeSeconds": 0
   },
   "loopSupervisor": {
+    "_note": "Swarm guard. turnLimitEnabled defaults to false: the turn limit is OFF unless you turn it on. When enabled, an agent is warned at maxAgentTurns (50) and hard-killed at maxAgentTurns + turnLimitGrace (65).",
     "enabled": true,
     "maxSpawnDepth": 5,
+    "turnLimitEnabled": false,
     "maxAgentTurns": 50,
     "turnLimitGrace": 15,
     "dedupeCrossAgent": false
+  },
+  "modelHealth": {
+    "_note": "Circuit breaker for model-level failures (400 invalid_request_error, 5xx, quota, timeouts). After failureThreshold consecutive model-level failures, spawns on that model are refused for cooldownSeconds (doubling per re-trip up to maxCooldownSeconds) until it succeeds again, the model is changed in /tmg config, or /tmg reset-models clears it.",
+    "enabled": true,
+    "failureThreshold": 2,
+    "cooldownSeconds": 60,
+    "maxCooldownSeconds": 600
   }
 }

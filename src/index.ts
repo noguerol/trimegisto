@@ -39,11 +39,15 @@ import {
   sendToAgent,
   setLoopSupervisor,
   setWatchdogTimeouts,
+  setModelHealth,
+  getTierModelBlock,
+  formatModelBlockMessage,
 } from "./agent-manager.ts";
 import { dedupeTaskBatch, registerTask, forgetTask } from "./task-dedup.ts";
 import { saveConfig as persistConfig, loadConfig } from "./persistence.ts";
 import { cleanupOldNotifications } from "./context-broker.ts";
 import { LoopSupervisor, type LoopAlert } from "./loop-supervisor.ts";
+import { ModelHealth, sanitizeModelHealthConfig, MODEL_HEALTH_DEFAULTS } from "./model-health.ts";
 import { speed, MAIN_TARGET } from "./speed.ts";
 import { formatTmgStatus } from "./branding.ts";
 
@@ -140,6 +144,29 @@ export default function (pi: ExtensionAPI) {
       // Stale pi context after /reload/session replacement; ignore late log.
     }
   }
+
+  // ── Model health (circuit breaker) ─────────────────────
+  // Pauses spawns on a model that keeps failing at the provider level, so a
+  // broken model cannot trigger an uncontrolled spawn storm.
+  const modelHealth = new ModelHealth();
+  setModelHealth(modelHealth);
+
+  function applyModelHealthConfig(): void {
+    modelHealth.updateConfig(config.modelHealth ?? MODEL_HEALTH_DEFAULTS);
+  }
+  applyModelHealthConfig();
+
+  modelHealth.setOnTrip((entry, info) => {
+    const secs = Math.max(1, Math.ceil(info.remainingMs / 1000));
+    safeSendMessage({
+      customType: "trimegisto-log",
+      content: `🚫 **[Trimegisto model health]** ${entry.model} paused after ${entry.failures} model-level failure(s) — ${entry.lastReason || "provider error"}. Spawns on it are refused for ~${secs}s. Switch model via /tmg config or clear with /tmg reset-models.`,
+      display: true,
+    });
+    try {
+      if (ctxRef?.hasUI) ctxRef.ui.notify(`Model ${entry.model} paused (~${secs}s): spawns refused`, "error");
+    } catch { /* stale ctx after session reload */ }
+  });
 
   // Active pi model (used for spawning agents with the same model by default)
   let activeModel: string | null = null;
@@ -337,6 +364,21 @@ export default function (pi: ExtensionAPI) {
       };
     }
 
+    // Model-level circuit breaker: refuse to launch on a model in cooldown.
+    const modelBlock = getTierModelBlock(tier, tierConfig, config.redundantAgents, spawnModelOverride(tier));
+    if (modelBlock) {
+      return {
+        agentId: `error-${Date.now()}`,
+        tier,
+        task,
+        status: "error" as const,
+        output: "",
+        stderr: formatModelBlockMessage(modelBlock, formatTierLabel(tier)),
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+        log: [] as AgentLogEntry[],
+      };
+    }
+
     // Pick the least-loaded model from the tier pool when redundant agents are ON
     let modelOverride = spawnModelOverride(tier);
     if (config.redundantAgents && tier !== "active") {
@@ -527,7 +569,11 @@ export default function (pi: ExtensionAPI) {
       else if (config.spawnOnlyOnActive) why = " (spawn-only-on-active)";
       else why = ` (${(config as any)[tier]?.enabled === false ? "disabled" : "no model"})`;
     }
-    return `- ${label}: ${mark}${why} [${model}]`;
+    // Surface an open circuit breaker so the coordinator does not try a model
+    // that will be refused, and knows roughly when it comes back.
+    const block = avail ? getTierModelBlock(tier, (config as any)[tier], config.redundantAgents, spawnModelOverride(tier)) : null;
+    const paused = block ? ` ⛔ paused ${Math.max(1, Math.ceil(block.remainingMs / 1000))}s` : "";
+    return `- ${label}: ${mark}${why} [${model}]${paused}`;
   }
 
   function redundantSuffix(tier: string): string {
@@ -665,9 +711,35 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      // ── Model circuit breaker: refuse a batch that targets a paused model ──
+      // (e.g. provider returning 400s). Retrying here is exactly what caused
+      // the uncontrolled spawn storm, so the whole call is rejected with the
+      // cooldown info and the healthy alternatives.
+      const blockedTiers = new Map<AgentTier, string>();
+      for (const t of dedupedTasks) {
+        const tier = t.tier as AgentTier;
+        if (blockedTiers.has(tier)) continue;
+        const info = getTierModelBlock(tier, config[tier], config.redundantAgents, spawnModelOverride(tier));
+        if (info) blockedTiers.set(tier, formatModelBlockMessage(info, formatTierLabel(tier)));
+      }
+      if (blockedTiers.size > 0) {
+        const healthy = (["active", "t1", "t2", "t3"] as const)
+          .filter(x => tierAvailable(x) && !blockedTiers.has(x));
+        return {
+          content: [{
+            type: "text",
+            text: [...blockedTiers.values()].join("\n\n") +
+              `\n\nSpawn refused. Healthy tiers right now: ${healthy.length ? healthy.join(", ") : "none"}. ` +
+              `Do not retry the paused tier; continue with healthy work or fix the model via /tmg config.`,
+          }],
+          details: { blocked: [...blockedTiers.keys()], tasks: [] },
+          isError: true,
+        };
+      }
+
       // Check existing running agents vs limits (pooled capacity when redundant agents are ON)
       for (const t of dedupedTasks) {
-        if (!canSpawnPooled(t.tier, config[t.tier], config.redundantAgents)) {
+        if (!canSpawnPooled(t.tier, config[t.tier], config.redundantAgents, undefined, spawnModelOverride(t.tier))) {
           const poolSize = getModelPool(config[t.tier], config.redundantAgents).length;
           return {
             content: [{
@@ -946,6 +1018,16 @@ export default function (pi: ExtensionAPI) {
           lines.push(`♻️ **Redundancy:** ${totalDups} near-duplicate output pair(s), ~${totalWasted} tokens overlapped.`, "");
         }
       }
+
+      // Model-health: tell the coordinator which models are paused right now so
+      // it does not try to respawn onto a known-broken provider.
+      {
+        const paused = modelHealth.list().filter(e => e.blockedUntil > Date.now());
+        if (paused.length > 0) {
+          const parts = paused.map(e => `${e.model} (~${Math.max(1, Math.ceil((e.blockedUntil - Date.now()) / 1000))}s)`);
+          lines.push(`⛔ **Paused models:** ${parts.join(", ")}. Do not spawn on them; retry after the cooldown or switch via /tmg config.`, "");
+        }
+      }
       const details: any[] = [];
       for (const a of agents) {
         const elapsed = Math.round(((a.finishedAt || Date.now()) - a.startedAt) / 1000);
@@ -1030,8 +1112,19 @@ export default function (pi: ExtensionAPI) {
         haltAll,
         saveConfig,
         registerMainTool,
-        syncLoopSupervisor: () => { loopSupervisor.updateConfig({ dedupeCrossAgent: config.dedupeCrossAgent }); },
+        syncLoopSupervisor: () => {
+          // Push the whole guard config (turn limit included) and keep the
+          // top-level dedupeCrossAgent flag in sync with the guard's copy.
+          // IMPORTANT: mutate the existing object in place — the config UI holds
+          // a reference to it across submenu edits; reassigning would orphan
+          // later edits.
+          if (!config.loopSupervisor) config.loopSupervisor = {};
+          config.loopSupervisor.dedupeCrossAgent = config.dedupeCrossAgent;
+          loopSupervisor.updateConfig(config.loopSupervisor);
+        },
         syncWatchdog: applyWatchdogConfig,
+        syncModelHealth: applyModelHealthConfig,
+        clearModelHealth: (model?: string) => { modelHealth.clear(model); registerMainTool(); },
       });
     },
   });
@@ -1040,7 +1133,7 @@ export default function (pi: ExtensionAPI) {
     description: "Trimegisto control",
     getArgumentCompletions: (prefix: string) => {
       const first = prefix.trim().split(/\s+/)[0]?.toLowerCase() || "";
-      const subs = ["config", "enable", "disable", "launch", "tell", "kill", "halt", "list", "switch", "dashboard", "locks", "guard", "loops", "reset-guard", "reset-loops"];
+      const subs = ["config", "enable", "disable", "launch", "tell", "kill", "halt", "list", "switch", "dashboard", "locks", "guard", "loops", "reset-guard", "reset-loops", "models", "reset-models"];
       const items = subs.filter(s => s.startsWith(first)).map(s => ({ value: s, label: s }));
       return items.length > 0 ? items : null;
     },
@@ -1122,10 +1215,14 @@ export default function (pi: ExtensionAPI) {
         },
         // Sanitize: legacy configs still carry removed loop-detection keys.
         loopSupervisor: sanitizeLoopSupervisorConfig(savedConfig.loopSupervisor as any, config.loopSupervisor),
+        // Sanitize: clamp thresholds/cooldowns and fall back to defaults.
+        modelHealth: sanitizeModelHealthConfig(savedConfig.modelHealth as any, config.modelHealth ?? MODEL_HEALTH_DEFAULTS),
       };
 
       // Apply watchdog timeouts (seconds → ms) to the agent manager
       applyWatchdogConfig();
+      // Apply model-health circuit breaker settings.
+      applyModelHealthConfig();
 
       // Migrate pre-v3 compaction thresholds: old built-in defaults forced
       // early compaction; reset them to 0 so pi's native setting decides.
@@ -1430,6 +1527,7 @@ export default function (pi: ExtensionAPI) {
         dashboardVisible: config.dashboardVisible,
         watchdog: config.watchdog,
         loopSupervisor: config.loopSupervisor,
+        modelHealth: config.modelHealth,
       });
     } catch {
       // Stale pi context after /reload/session replacement; file persistence above is enough.

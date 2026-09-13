@@ -1,7 +1,7 @@
 /** Trimegisto slash-command handlers (lazy-loaded by the entrypoint). */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { getAgents, killAgent, haltAll as haltAllAgents, getAgent, getLoopSupervisor } from "./agent-manager.ts";
+import { getAgents, killAgent, haltAll as haltAllAgents, getAgent, getLoopSupervisor, getModelHealth } from "./agent-manager.ts";
 import { getActiveLocks } from "./file-lock.ts";
 import { formatTierLabel, parseAgentId } from "./config.ts";
 import type { AgentTier, TierConfig } from "./types.ts";
@@ -140,7 +140,8 @@ export async function handleTmgCommand(pi: ExtensionAPI, args: string | undefine
       if (!supervisor) return ctx.ui.notify("◇ Swarm guard unavailable.", "warning");
       const state = supervisor.getState();
       const cfg = supervisor.getConfig();
-      const lines = [`◇ Swarm guard (spawn depth ≤ ${cfg.maxSpawnDepth}, turns ≤ ${cfg.maxAgentTurns}+${cfg.turnLimitGrace ?? 15}${cfg.dedupeCrossAgent ? ", cross-agent dedup ON" : ""})`];
+      const turnLimit = cfg.turnLimitEnabled ? `turns ≤ ${cfg.maxAgentTurns}+${cfg.turnLimitGrace ?? 15}` : "turn limit OFF";
+      const lines = [`◇ Swarm guard (spawn depth ≤ ${cfg.maxSpawnDepth}, ${turnLimit}${cfg.dedupeCrossAgent ? ", cross-agent dedup ON" : ""})`];
       let totalDups = 0, totalWasted = 0;
       for (const tier of TIERS) {
         const ts = state.tiers[tier];
@@ -151,8 +152,46 @@ export async function handleTmgCommand(pi: ExtensionAPI, args: string | undefine
       if (totalDups > 0) {
         lines.push("", `  ♻ Redundancy: ${totalDups} duplicate pair(s), ~${totalWasted} tokens overlapped`);
       }
+      // Model-level circuit breaker state (paused models refuse spawns).
+      const mh = getModelHealth();
+      const blocked = (mh?.list() ?? []).filter(e => e.blockedUntil > Date.now());
+      if (blocked.length > 0) {
+        lines.push("", `  ⛔ Paused models (${blocked.length}):`);
+        for (const e of blocked) {
+          const secs = Math.max(1, Math.ceil((e.blockedUntil - Date.now()) / 1000));
+          lines.push(`    ${e.model} — ${e.failures} failure(s), retry in ~${secs}s`);
+        }
+      }
       if (state.alerts.length) lines.push("", ...state.alerts.slice(-10).map(a => `  ${a.type === "cross_agent_duplicate" ? "♻" : a.type === "turn_limit" ? "⏳" : "🚧"} ${a.type} — ${a.message.slice(0, 80)} (${Math.round((Date.now() - a.timestamp) / 1000)}s)`));
       ctx.ui.notify(lines.join("\n"), "info");
+      return;
+    }
+
+    case "models":
+    case "model-health": {
+      const mh = getModelHealth();
+      if (!mh) return ctx.ui.notify("Model health unavailable.", "warning");
+      const entries = mh.list();
+      if (entries.length === 0) return ctx.ui.notify("◇ Model health: no failures recorded.", "info");
+      const cfg = mh.getConfig();
+      const lines = [`◇ Model health (${cfg.enabled ? "ON" : "OFF"} | pause after ${cfg.failureThreshold} fail(s) | cooldown ${cfg.cooldownSeconds}s→${cfg.maxCooldownSeconds}s)`];
+      for (const e of entries) {
+        const state = e.blockedUntil > Date.now()
+          ? `⛔ paused ~${Math.max(1, Math.ceil((e.blockedUntil - Date.now()) / 1000))}s`
+          : e.failures > 0 ? `⚠ ${e.failures} recent fail(s)` : "✓ ok";
+        lines.push(`  ${e.model}: ${state} (total ${e.totalFailures} fail, ${e.successes} ok)`);
+      }
+      ctx.ui.notify(lines.join("\n"), "info");
+      return;
+    }
+
+    case "reset-models":
+    case "reset-model-health": {
+      const mh = getModelHealth();
+      if (!mh) return ctx.ui.notify("Model health unavailable.", "warning");
+      const model = parts[1];
+      const cleared = mh.clear(model);
+      ctx.ui.notify(model ? `◇ Model health cleared: ${model} (${cleared}).` : `◇ Model health cleared (${cleared} model(s)).`, "info");
       return;
     }
 
@@ -186,6 +225,7 @@ export async function handleTmgCommand(pi: ExtensionAPI, args: string | undefine
         "  /tmg tell <agent-id> <msg>\n" +
         "  /tmg kill <id> | halt | list | switch <id>\n" +
         "  /tmg dashboard | locks | guard | reset-guard [tier]\n" +
+        "  /tmg models | reset-models [model]\n" +
         "  /tmg enable | disable\n" +
         "  @t2b <instruction>",
         "info",

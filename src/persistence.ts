@@ -73,6 +73,7 @@ export function saveConfig(config: TrimegistoConfig): void {
       dashboardVisible: config.dashboardVisible,
       watchdog: config.watchdog,
       loopSupervisor: config.loopSupervisor,
+      modelHealth: config.modelHealth,
       // Schema version for future migrations
       _schemaVersion: SCHEMA_VERSION,
       _savedAt: new Date().toISOString(),
@@ -109,7 +110,8 @@ export function loadConfig(): {
   dashboardVisible?: boolean;
   watchdog?: Partial<{ firstResponseSeconds: number; idleSeconds: number; maxRuntimeSeconds: number }>;
   _schemaVersion?: number;
-  loopSupervisor?: Partial<{ enabled: boolean; maxSpawnDepth: number; maxAgentTurns: number; turnLimitGrace: number; dedupeCrossAgent: boolean }>;
+  loopSupervisor?: Partial<{ enabled: boolean; maxSpawnDepth: number; turnLimitEnabled: boolean; maxAgentTurns: number; turnLimitGrace: number; dedupeCrossAgent: boolean }>;
+  modelHealth?: Partial<{ enabled: boolean; failureThreshold: number; cooldownSeconds: number; maxCooldownSeconds: number }>;
 } | null {
   try {
     const configPath = getConfigPath();
@@ -137,6 +139,7 @@ export function loadConfig(): {
       watchdog: data.watchdog && typeof data.watchdog === "object" ? data.watchdog : undefined,
       _schemaVersion: typeof data._schemaVersion === "number" ? data._schemaVersion : undefined,
       loopSupervisor: data.loopSupervisor && typeof data.loopSupervisor === "object" ? data.loopSupervisor : undefined,
+      modelHealth: data.modelHealth && typeof data.modelHealth === "object" ? data.modelHealth : undefined,
     };
   } catch (err) {
     console.error("[trimegisto] Failed to load config:", err);

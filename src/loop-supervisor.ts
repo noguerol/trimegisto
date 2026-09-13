@@ -43,6 +43,7 @@ export interface LoopAlert {
 export const DEFAULT_LOOP_CONFIG: LoopSupervisorConfig = {
   enabled: true,
   maxSpawnDepth: 5,
+  turnLimitEnabled: false,
   maxAgentTurns: 50,
   turnLimitGrace: 15,
   dedupeCrossAgent: false,
@@ -160,13 +161,16 @@ export class LoopSupervisor {
   /**
    * Check agent turn count against limits.
    *
-   * Two-stage: turns > maxAgentTurns → warning alert, agent keeps running;
-   * turns > maxAgentTurns + turnLimitGrace → kill agent.
+   * Disabled by default: unless `turnLimitEnabled` is true, this never warns
+   * and never kills. When enabled it is two-stage: turns > maxAgentTurns →
+   * warning alert, agent keeps running; turns > maxAgentTurns + turnLimitGrace
+   * → kill agent.
    *
    * Returns true if the agent should be killed (hard limit exceeded).
    */
   checkTurnLimit(agentId: string, tier: AgentTier, turns: number): boolean {
     if (!this.config.enabled) return false;
+    if (!this.config.turnLimitEnabled) return false;
 
     const softLimit = this.config.maxAgentTurns;
     const hardLimit = softLimit + (this.config.turnLimitGrace ?? 15);

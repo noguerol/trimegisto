@@ -10,6 +10,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { TrimegistoConfig, TierConfig, AgentTier, LoopSupervisorConfig } from "./types.ts";
+import { MODEL_HEALTH_DEFAULTS } from "./model-health.ts";
 
 const CONFIG_ENTRY_TYPE = "trimegisto-config";
 
@@ -263,10 +264,12 @@ export function getDefaultConfig(): TrimegistoConfig {
     loopSupervisor: {
       enabled: true,
       maxSpawnDepth: 5,
+      turnLimitEnabled: false,
       maxAgentTurns: 50,
       turnLimitGrace: 15,
       dedupeCrossAgent: false,
     },
+    modelHealth: { ...MODEL_HEALTH_DEFAULTS },
   };
 }
 
@@ -357,11 +360,19 @@ export function sanitizeLoopSupervisorConfig(
 ): Partial<LoopSupervisorConfig> {
   const num = (v: unknown, fb: number | undefined) => (typeof v === "number" && Number.isFinite(v) ? v : fb);
   const bool = (v: unknown, fb: boolean | undefined) => (typeof v === "boolean" ? v : fb);
+  // Clamp the turn-limit knobs so a corrupt/hand-edited value cannot make the
+  // guard fire on every turn (0/negative) or overflow the comparison.
+  const clampInt = (v: unknown, fb: number, min: number, max: number) => {
+    const n = num(v, undefined);
+    if (n === undefined) return fb;
+    return Math.min(max, Math.max(min, Math.floor(n)));
+  };
   return {
     enabled: bool(saved?.enabled, defaults.enabled),
     maxSpawnDepth: num(saved?.maxSpawnDepth, defaults.maxSpawnDepth),
-    maxAgentTurns: num(saved?.maxAgentTurns, defaults.maxAgentTurns),
-    turnLimitGrace: num(saved?.turnLimitGrace, defaults.turnLimitGrace),
+    turnLimitEnabled: bool(saved?.turnLimitEnabled, defaults.turnLimitEnabled ?? false),
+    maxAgentTurns: clampInt(saved?.maxAgentTurns, defaults.maxAgentTurns ?? 50, 1, 100_000),
+    turnLimitGrace: clampInt(saved?.turnLimitGrace, defaults.turnLimitGrace ?? 15, 0, 100_000),
     dedupeCrossAgent: bool(saved?.dedupeCrossAgent, defaults.dedupeCrossAgent),
   };
 }
