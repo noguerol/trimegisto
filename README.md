@@ -131,8 +131,10 @@ When Trimegisto is enabled, a hidden orchestration directive is injected before 
 | `/tmg dashboard` | Cycle dashboard mode (compact → widget → off) |
 | `/tmg enable` / `/tmg disable` | Toggle Trimegisto globally |
 | `/tmg locks` | Show active file locks |
-| `/tmg guard` (alias `/tmg loops`) | Show guard state (spawn depth, turn warnings, redundancy) |
+| `/tmg guard` (alias `/tmg loops`) | Show guard state (spawn depth, turn warnings, redundancy, paused models) |
 | `/tmg reset-guard [active\|t1\|t2\|t3]` | Reset guard/redundancy counters for a tier (or all) |
+| `/tmg models` | Show model-health state (failures + paused models) |
+| `/tmg reset-models [model]` | Clear the circuit breaker for one model (or all) |
 | `/tmg config` | Interactive configuration (models, limits, flags) |
 
 ### Steering
@@ -164,7 +166,9 @@ Global flags in the main menu:
 | `redundantAgents` | `false` | t1/t2 spawn on the least-loaded model of their pool and fail over on provider errors/exhaustion/timeouts |
 | `dedupeTasks` | `true` | Reject near-duplicate tasks before launch (exact + word-set similarity, 5 min window) |
 | `dedupeCrossAgent` | `false` | Flag near-identical outputs from *different* agents and report wasted tokens |
+| `loopSupervisor.turnLimitEnabled` | `false` | Opt-in turn limit: warn at `maxAgentTurns` (50) then kill at `+turnLimitGrace` (65). Off = never killed on turn count |
 | `dashboard` | `compact` | UI mode: `compact` / `widget` / `off` |
+| `modelHealth` | on, 2 fails → 60 s→600 s | Circuit breaker that pauses spawns on a model failing at the provider level |
 
 ### Config file
 
@@ -198,13 +202,30 @@ Trimegisto's main-process guard only covers what antiloop cannot see, because it
 | Mechanism | Detects | Default |
 |-----------|---------|---------|
 | **Spawn Depth** | Recursive auto-spawn chains | 5 levels |
-| **Turn Limit (soft)** | Agent exceeds `maxAgentTurns` → **warning only**, not killed | 50 turns |
-| **Turn Limit (hard)** | soft + `turnLimitGrace` → **kill** the agent | 65 turns |
+| **Turn Limit (opt-in)** | Agent exceeds `maxAgentTurns` → **warning only**, then `+turnLimitGrace` → **kill**. Only enforced when `turnLimitEnabled` is ON | **OFF** (`turnLimitEnabled: false`); when enabled: warn at 50, kill at 65 |
 | **Cross-agent duplicate** | Two *different* agents producing near-identical output (redundant parallel work) | opt-in via `dedupeCrossAgent`, shingle Jaccard ≥ 0.92 |
 
 Redundancy is tracked **per agent** and never flags same-agent repetition — repeated output from one agent is a reasoning loop, which antiloop owns. With `dedupeCrossAgent` ON, near-identical results across different agents in the same tier get a `♻` alert + wasted-token metric.
 
+The turn limit is **off by default** so long-running agents are never killed on turn count alone. Enable it and set the counts in `/tmg config → Turn limit` (`Enabled`, `Warn at`, `Kill after`); the values are clamped (turns ≥ 1, grace ≥ 0) and persisted in `config.json`. Pre-existing configs that never set `turnLimitEnabled` behave as off.
+
 Inspect with `/tmg guard` (alias `/tmg loops`), clear with `/tmg reset-guard`.
+
+### Model health (circuit breaker)
+
+When a provider/model starts failing at the protocol level — HTTP `400 invalid_request_error`, 5xx, quota/rate limits, connection resets, or a provider hang — every spawn against it fails **fast**. Because a dead process frees its parallel slot immediately, the coordinator (or a sub-agent's `trimegisto_spawn`) can otherwise retry in a tight loop and launch an unbounded number of doomed agents: a **spawn storm**.
+
+Trimegisto classifies each finished attempt as a *model-level* failure only when the model never produced an answer (spawn/launch error, first-response/idle timeout, zero turns with no output, a provider error with no answer text, or `stopReason: error/aborted`). A task that fails after the model actually answered is **never** counted.
+
+After `modelHealth.failureThreshold` consecutive model-level failures (default **2**), the breaker opens and **refuses spawns on that model** for a cooldown:
+
+- Base cooldown **60 s**, doubling on each re-trip up to **600 s** (`cooldownSeconds` / `maxCooldownSeconds`).
+- While paused, the `trimegisto` tool, `trimegisto_spawn`, `/t0..t3`, `/tmg launch` and `@` all return a clear *“Model X is paused … retry in ~Ns”* message instead of launching.
+- The breaker is **half-open** after the cooldown: one attempt is allowed; a success clears everything, a failure re-opens with a longer cooldown.
+- Changing a tier's model in `/tmg config`, adding a redundant model, `/tmg reset-models [model]`, or a successful run clears the block immediately.
+- With `redundantAgents` on, a paused model is skipped and the pool keeps working on a healthy candidate; the tier only blocks when **every** candidate is paused.
+
+This is tuned in `/tmg config → Model health` (`enabled`, failures before pause, base/max cooldown) and persisted in `config.json`. Inspect with `/tmg models` or `/tmg guard`.
 
 ## How It Works
 
@@ -242,7 +263,7 @@ Inspect with `/tmg guard` (alias `/tmg loops`), clear with `/tmg reset-guard`.
 - **File locks** — advisory, 60 s stale timeout. Agents call `file_lock` before write/edit and `file_unlock` after; conflicts return the lock owner so agents can wait or move on. Locks are released automatically when an agent finishes, is killed or halted. Inspect with `/tmg locks`.
 - **Context broker** — when an agent modifies a file, other agents that previously read it (via `file_read_track`) get a compact system alert: "⚠️ Stale file: `x.ts` changed by `t3a` — re-read before editing."
 - **Proactive compaction** — opt-in. Trimegisto can watch the **main session's** context usage and force pi compaction when it crosses the lowest enabled tier threshold (60 s cooldown). By default all thresholds are **0 (off)**, so pi's native compaction setting decides and we never force an early compaction; set a per-tier 50–95% via `/tmg config` to re-enable it. Pre-v3 configs that still hold the old built-in defaults (85/65/75/85) are migrated to off automatically.
-- **Watchdogs & failover** — every worker has bounded first-response and idle-progress watchdogs (defaults: 90 s / 120 s). The wall-clock **max-runtime watchdog is disabled by default** (`maxRuntimeSeconds: 0`), so an agent that keeps making progress may run for as long as it needs. All three are configurable in seconds via `/tmg config → Watchdogs` (0 = off) and persisted in `~/.pi/agent/trimegisto/config.json`. Precedence: saved config > `TRIMEGISTO_FIRST_RESPONSE_TIMEOUT_MS` / `TRIMEGISTO_AGENT_IDLE_TIMEOUT_MS` / `TRIMEGISTO_AGENT_MAX_RUNTIME_MS` env vars > built-in defaults. Values are clamped to a safe range so an oversized number can never overflow the timer. A stuck sub-agent is killed and harvested instead of blocking orchestration forever. With `redundantAgents` on, provider failures/no first response can fail over to the next model in the pool.
+- **Watchdogs & failover** — every worker has bounded first-response and idle-progress watchdogs (defaults: 90 s / 120 s). The wall-clock **max-runtime watchdog is disabled by default** (`maxRuntimeSeconds: 0`), so an agent that keeps making progress may run for as long as it needs. All three are configurable in seconds via `/tmg config → Watchdogs` (0 = off) and persisted in `~/.pi/agent/trimegisto/config.json`. Precedence: saved config > `TRIMEGISTO_FIRST_RESPONSE_TIMEOUT_MS` / `TRIMEGISTO_AGENT_IDLE_TIMEOUT_MS` / `TRIMEGISTO_AGENT_MAX_RUNTIME_MS` env vars > built-in defaults. Values are clamped to a safe range so an oversized number can never overflow the timer. A stuck sub-agent is killed and harvested instead of blocking orchestration forever. With `redundantAgents` on, provider failures/no first response can fail over to the next model in the pool. Repeated **model-level** failures additionally trip the per-model circuit breaker (see *Model health* above) so a broken provider can't trigger a retry storm.
 
 ### Data layout
 
@@ -279,6 +300,7 @@ trimegisto/
 │   ├── agent-manager.ts        # spawn/track/kill, model pools, failover
 │   ├── subagent-extension.ts   # injected into every sub-agent process
 │   ├── loop-supervisor.ts      # swarm guard: spawn depth, turn limits, redundancy
+│   ├── model-health.ts         # per-model circuit breaker (pauses spawns on failing models)
 │   ├── file-lock.ts            # advisory file locking
 │   ├── context-broker.ts       # cross-agent file-change notifications
 │   ├── ipc.ts                  # file-based request/response IPC
@@ -293,6 +315,7 @@ trimegisto/
 ├── test-loop.ts                # swarm-guard unit tests
 ├── test-config.ts              # config defaults, compaction migration, /tmg config menus
 ├── test-watchdog.ts            # watchdog config tests
+├── test-model-health.ts        # model-health circuit-breaker tests
 └── test-speed.ts               # speed-tracker unit tests
 ```
 
@@ -305,6 +328,7 @@ pi install .                 # local-path install
 node --experimental-strip-types test-loop.ts      # swarm-guard tests
 node --experimental-strip-types test-config.ts    # config/compaction/UI tests
 node --experimental-strip-types test-watchdog.ts  # watchdog config tests
+node --experimental-strip-types test-model-health.ts # model-health circuit-breaker tests
 node --experimental-strip-types test-speed.ts     # speed-tracker tests
 ```
 

@@ -29,6 +29,26 @@ import { type LoopSupervisor, type LoopAlert } from "./loop-supervisor.ts";
 import { speed } from "./speed.ts";
 import { isDuplicateTask, registerTask, forgetTask } from "./task-dedup.ts";
 import { buildSharedContextPreamble } from "./shared-context.ts";
+import {
+  ModelHealth,
+  classifyModelFailure,
+  modelKey,
+  type ModelBlockInfo,
+} from "./model-health.ts";
+
+/**
+ * Model-level circuit breaker shared by every spawn path. Set by the extension
+ * during init so agent-manager can refuse spawns on a model that is failing.
+ */
+let modelHealth: ModelHealth | null = null;
+
+export function setModelHealth(mh: ModelHealth | null): void {
+  modelHealth = mh;
+}
+
+export function getModelHealth(): ModelHealth | null {
+  return modelHealth;
+}
 
 /** Path to the sub-agent extension that provides trimegisto_spawn tool */
 let subagentExtensionPath: string | null = null;
@@ -159,6 +179,8 @@ export function selectAvailableModel(tier: AgentTier, pool: string[], maxParalle
   let best: string | null = null;
   let bestCount = Infinity;
   for (const model of pool) {
+    // Skip models whose breaker is open (provider/model-level failures).
+    if (modelHealth && modelHealth.isBlocked(model)) continue;
     const running = countRunningOnModel(tier, model);
     if (running < maxParallel && running < bestCount) {
       best = model;
@@ -169,15 +191,73 @@ export function selectAvailableModel(tier: AgentTier, pool: string[], maxParalle
 }
 
 /**
+ * Model candidates a tier can spawn on: the redundant pool when there is one,
+ * otherwise the tier's single model (or the implicit pi default for the active
+ * tier when no override is present).
+ */
+export function tierModelCandidates(
+  tier: AgentTier,
+  tierConfig: TierConfig,
+  redundantAgents: boolean,
+  activeOverride?: string,
+): string[] {
+  if (tier === "active") return [modelKey(activeOverride)];
+  const pool = getModelPool(tierConfig, redundantAgents);
+  return pool.length > 0 ? pool : [modelKey(tierConfig.model)];
+}
+
+/**
+ * Circuit-breaker gate for a tier. Returns block info only when EVERY model
+ * candidate for the tier is in cooldown (i.e. the tier cannot spawn anywhere).
+ * When at least one candidate is healthy the tier may spawn, so this returns
+ * null even if some models are blocked.
+ */
+export function getTierModelBlock(
+  tier: AgentTier,
+  tierConfig: TierConfig,
+  redundantAgents: boolean,
+  activeOverride?: string,
+): ModelBlockInfo | null {
+  if (!modelHealth) return null;
+  const candidates = tierModelCandidates(tier, tierConfig, redundantAgents, activeOverride);
+  const blocks = candidates
+    .map(model => modelHealth!.getBlock(model))
+    .filter((b): b is ModelBlockInfo => !!b);
+  if (blocks.length === 0 || blocks.length < candidates.length) return null;
+  // All blocked: report the one that frees soonest so the caller can retry then.
+  return blocks.reduce((a, b) => (a.remainingMs <= b.remainingMs ? a : b));
+}
+
+/**
+ * User-facing message for a model in cooldown. Shared by the coordinator tool
+ * and the sub-agent IPC path so both explain why the spawn was refused.
+ */
+export function formatModelBlockMessage(block: ModelBlockInfo, tierLabel?: string): string {
+  const secs = Math.max(1, Math.ceil(block.remainingMs / 1000));
+  const when = new Date(block.retryAt).toLocaleTimeString();
+  const scope = tierLabel ? ` (${tierLabel})` : "";
+  return `⛔ Model ${block.model}${scope} is paused after ${block.failures} model-level failure(s): ${block.reason}. ` +
+    `Retry in ~${secs}s (after ${when}). Do NOT retry now — spawns are refused until the cooldown ends. ` +
+    `Switch to a healthy model via /tmg config, or clear it with /tmg reset-models.`;
+}
+
+/**
  * Pooled capacity check: the tier can spawn if ANY model in its pool has capacity.
  * Falls back to the classic per-tier count when redundancy is off or the pool has a single model.
  */
-export function canSpawnPooled(tier: AgentTier, tierConfig: TierConfig, redundantAgents: boolean, parentId?: string): boolean {
+export function canSpawnPooled(tier: AgentTier, tierConfig: TierConfig, redundantAgents: boolean, parentId?: string, activeOverride?: string): boolean {
   if (loopSupervisor) {
     const check = loopSupervisor.canSpawn(tier, parentId);
     if (!check.allowed) return false;
   }
   const pool = getModelPool(tierConfig, redundantAgents);
+  // Every candidate in cooldown (or no usable model) -> tier cannot spawn.
+  // activeOverride matters for the ACTIVE tier (its model lives in the pi
+  // session, not in tierConfig.model), so pass it through here too.
+  if (modelHealth) {
+    const candidates = tierModelCandidates(tier, tierConfig, redundantAgents, activeOverride);
+    if (candidates.length > 0 && candidates.every(m => modelHealth!.isBlocked(m))) return false;
+  }
   if (pool.length <= 1) {
     const running = Array.from(agents.values()).filter(
       a => a.tier === tier && (a.status === "running" || a.status === "waiting")
@@ -259,6 +339,32 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
   }
 
   return { command: "pi", args };
+}
+
+/**
+ * Feed a finished attempt into the model-health circuit breaker.
+ *
+ * Records a success for `done` and a MODEL-LEVEL failure for errors where the
+ * model never did real work (spawn/launch error, watchdog timeout, zero turns
+ * with no output, or an explicit provider error in stderr). Task failures after
+ * the model actually worked never trip the breaker. Killed agents are ignored.
+ */
+function recordModelOutcome(instance: AgentInstance, tierConfig: TierConfig, tier: AgentTier): void {
+  if (!modelHealth) return;
+  const key = instance.requestedModel || tierConfig.model || "";
+  if (instance.status !== "done" && instance.status !== "error") return;
+  const cls = classifyModelFailure({
+    status: instance.status,
+    turns: instance.usage.turns,
+    output: instance.output,
+    stderr: instance.stderr,
+    stopReason: instance.stopReason,
+  });
+  if (cls.modelLevel) {
+    modelHealth.recordFailure(key, cls.kind, cls.reason, tier);
+  } else if (instance.status === "done") {
+    modelHealth.recordSuccess(key);
+  }
 }
 
 /**
@@ -372,14 +478,24 @@ export function launchAgent(
     function tryFailover(reason: string): boolean {
       if (!redundantAgents) return false;
       if (instance.status !== "error") return false;
-      if (attemptIndex >= modelsToTry.length - 1) return false; // no more models to try
 
+      // Only fail over when the model did no real work (never produced output)
+      // or the provider shows exhaustion (quota/rate-limit/overload). If the
+      // model worked but the task itself failed, we don't waste retries.
       const noWork = instance.usage.turns === 0 || instance.output.trim().length === 0;
       const exhausted = PROVIDER_EXHAUSTION_PATTERN.test(instance.stderr);
       if (!noWork && !exhausted) return false;
 
+      // Advance to the next model, skipping any whose breaker is open.
+      let nextModel: string | undefined;
+      while (attemptIndex < modelsToTry.length - 1) {
+        attemptIndex++;
+        const candidate = modelsToTry[attemptIndex];
+        if (!modelHealth || !modelHealth.isBlocked(candidate)) { nextModel = candidate; break; }
+      }
+      if (nextModel === undefined) return false; // no more usable models to try
+
       clearAttemptWatchdogs();
-      const nextModel = modelsToTry[++attemptIndex];
       const failoverEntry: AgentLogEntry = {
         ts: Date.now(),
         level: "info",
@@ -435,6 +551,14 @@ export function launchAgent(
       notifyStateChange();
 
       let partialAssistantText = "";
+      // Only feed the model-health breaker once per attempt, even if both the
+      // 'error' and 'close' events fire for the same process.
+      let outcomeRecorded = false;
+      const noteModelOutcome = () => {
+        if (outcomeRecorded) return;
+        outcomeRecorded = true;
+        recordModelOutcome(instance, config, tier);
+      };
 
       const terminateForWatchdog = (stopReason: string, message: string) => {
         if (instance.status !== "running") return;
@@ -697,6 +821,10 @@ export function launchAgent(
           instance.status = "done";
         }
 
+        // ── Model health: record success/failure for this attempt BEFORE
+        // failover resets the instance back to "running". ──
+        noteModelOutcome();
+
         // ── Redundant failover: retry on the next model ──
         if (instance.status === "error" && tryFailover(`Model ${model || "default"} failed`)) {
           return;
@@ -756,6 +884,9 @@ export function launchAgent(
         };
         instance.log.push(errEntry);
         notifyAgentLog(id, errEntry);
+
+        // ── Model health: a process that never started is a model-level failure ──
+        noteModelOutcome();
 
         // ── Redundant failover: the process never started ──
         if (tryFailover(`Could not start ${model || "default model"}`)) {
@@ -839,6 +970,10 @@ export function launchAgent(
       };
       instance.log.push(errEntry);
       notifyAgentLog(id, errEntry);
+
+      // A launch error (temp files, spawn of the pi binary itself) is
+      // model-level: the model never got a chance to run.
+      recordModelOutcome(instance, config, tier);
 
       cleanupPromptFiles();
       notifyStateChange();
@@ -1029,7 +1164,29 @@ export function processSpawnRequests(
       continue;
     }
 
-    if (!canSpawnPooled(tier, tc, redundantAgents, request.parentId)) {
+    // ── Model-level circuit breaker: refuse spawns while the model is in
+    // cooldown, with a precise message so sub-agents back off instead of
+    // retrying the same failing provider. ──
+    const modelBlock = getTierModelBlock(tier, tc, redundantAgents, modelOverride);
+    if (modelBlock) {
+      writeSpawnResponse({
+        requestId: request.requestId,
+        result: {
+          agentId: request.requestId,
+          tier,
+          task: request.task,
+          status: "error",
+          output: "",
+          stderr: formatModelBlockMessage(modelBlock, formatTierLabel(tier)),
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+          log: [],
+        },
+      });
+      processed++;
+      continue;
+    }
+
+    if (!canSpawnPooled(tier, tc, redundantAgents, request.parentId, modelOverride)) {
       const running = Array.from(agents.values()).filter(
         a => a.tier === tier && (a.status === "running" || a.status === "waiting")
       ).length;
@@ -1204,6 +1361,21 @@ export function sendToAgent(
 
   // Spawn-only-on-active: respawn on the active tier (t0) instead of the original tier
   const tier = spawnOnlyOnActive ? "active" : existing.tier;
+
+  // Model-level circuit breaker: refuse the relaunch while the tier's model is
+  // in cooldown (the existing agent is left untouched). Surface the reason in
+  // the agent's log so the user sees it in chat instead of a generic error.
+  const relaunchBlock = getTierModelBlock(tier, configs[tier], redundantAgents, tier === "active" ? modelOverride : undefined);
+  if (relaunchBlock) {
+    const blockEntry: AgentLogEntry = {
+      ts: Date.now(),
+      level: "error",
+      text: formatModelBlockMessage(relaunchBlock),
+    };
+    existing.log.push(blockEntry);
+    notifyAgentLog(agentId, blockEntry);
+    return null;
+  }
 
   // Kill the existing agent process if still running
   if (existing.status === "running" || existing.status === "waiting") {

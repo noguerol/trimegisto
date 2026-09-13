@@ -34,6 +34,8 @@ console.log("Test 1 (compaction defaults are off):");
   check("t1 compactionThreshold = 0", c.t1.compactionThreshold === 0, c.t1.compactionThreshold);
   check("t2 compactionThreshold = 0", c.t2.compactionThreshold === 0, c.t2.compactionThreshold);
   check("t3 compactionThreshold = 0", c.t3.compactionThreshold === 0, c.t3.compactionThreshold);
+  check("turn limit is OFF by default", c.loopSupervisor.turnLimitEnabled === false, c.loopSupervisor.turnLimitEnabled);
+  check("turn limit keeps 50 turns / +15 grace when enabled", c.loopSupervisor.maxAgentTurns === 50 && c.loopSupervisor.turnLimitGrace === 15, c.loopSupervisor);
 }
 
 console.log("Test 2 (migrateSavedCompaction):");
@@ -279,19 +281,24 @@ console.log("Test 15 (redundant-models submenu stays open after Add attempt):");
 
 console.log("Test 16 (sanitizeLoopSupervisorConfig drops legacy loop keys):");
 {
-  const defaults = { enabled: true, maxSpawnDepth: 5, maxAgentTurns: 50, turnLimitGrace: 15, dedupeCrossAgent: false };
+  const defaults = { enabled: true, maxSpawnDepth: 5, turnLimitEnabled: false, maxAgentTurns: 50, turnLimitGrace: 15, dedupeCrossAgent: false };
   const legacy = {
-    enabled: true, maxSpawnDepth: 7, maxAgentTurns: 20, turnLimitGrace: 11, dedupeCrossAgent: true,
+    enabled: true, maxSpawnDepth: 7, turnLimitEnabled: true, maxAgentTurns: 20, turnLimitGrace: 11, dedupeCrossAgent: true,
     maxRepeatedOutputs: 3, tierCooldownMs: 60000, similarityThreshold: 0.9, minRepeatableOutputChars: 60,
   };
   const out = sanitizeLoopSupervisorConfig(legacy, defaults);
-  check("only guard keys remain", JSON.stringify(Object.keys(out).sort()) === JSON.stringify(["dedupeCrossAgent", "enabled", "maxAgentTurns", "maxSpawnDepth", "turnLimitGrace"]), Object.keys(out));
-  check("valid values preserved", out.maxSpawnDepth === 7 && out.maxAgentTurns === 20 && out.turnLimitGrace === 11 && out.dedupeCrossAgent === true);
+  check("only guard keys remain", JSON.stringify(Object.keys(out).sort()) === JSON.stringify(["dedupeCrossAgent", "enabled", "maxAgentTurns", "maxSpawnDepth", "turnLimitEnabled", "turnLimitGrace"]), Object.keys(out));
+  check("valid values preserved", out.maxSpawnDepth === 7 && out.maxAgentTurns === 20 && out.turnLimitGrace === 11 && out.turnLimitEnabled === true && out.dedupeCrossAgent === true);
   check("removed keys gone", !("maxRepeatedOutputs" in out) && !("tierCooldownMs" in out) && !("similarityThreshold" in out));
-  const bad = sanitizeLoopSupervisorConfig({ maxAgentTurns: "twenty" as any, maxSpawnDepth: NaN as any, dedupeCrossAgent: 1 as any }, defaults);
-  check("wrong types fall back to defaults", bad.maxAgentTurns === 50 && bad.maxSpawnDepth === 5 && bad.dedupeCrossAgent === false, bad);
+  const bad = sanitizeLoopSupervisorConfig({ maxAgentTurns: "twenty" as any, maxSpawnDepth: NaN as any, turnLimitEnabled: "yes" as any, dedupeCrossAgent: 1 as any }, defaults);
+  check("wrong types fall back to defaults", bad.maxAgentTurns === 50 && bad.maxSpawnDepth === 5 && bad.turnLimitEnabled === false && bad.dedupeCrossAgent === false, bad);
+  const clamped = sanitizeLoopSupervisorConfig({ maxAgentTurns: 0, turnLimitGrace: -4 } as any, defaults);
+  check("maxAgentTurns >= 1", clamped.maxAgentTurns === 1, clamped.maxAgentTurns);
+  check("turnLimitGrace >= 0", clamped.turnLimitGrace === 0, clamped.turnLimitGrace);
+  const huge = sanitizeLoopSupervisorConfig({ maxAgentTurns: 10 ** 12, turnLimitGrace: 10 ** 12 } as any, defaults);
+  check("turn-limit values capped", huge.maxAgentTurns === 100_000 && huge.turnLimitGrace === 100_000, huge);
   const empty = sanitizeLoopSupervisorConfig(undefined, defaults);
-  check("undefined saved -> defaults", empty.maxAgentTurns === 50 && empty.enabled === true);
+  check("undefined saved -> defaults", empty.maxAgentTurns === 50 && empty.enabled === true && empty.turnLimitEnabled === false);
   const nullish = sanitizeLoopSupervisorConfig(null as any, defaults);
   check("null saved -> defaults (no throw)", nullish.maxAgentTurns === 50 && nullish.maxSpawnDepth === 5);
 }

@@ -1,5 +1,6 @@
 import { Container, getKeybindings, Spacer, Text } from "@earendil-works/pi-tui";
 import { formatTierLabel, clampWatchdogSeconds, MAX_WATCHDOG_SECONDS, WATCHDOG_DEFAULTS } from "./config.ts";
+import { MODEL_HEALTH_DEFAULTS, sanitizeModelHealthConfig } from "./model-health.ts";
 import type { AgentTier, TrimegistoConfig } from "./types.ts";
 import { formatTmgStatus } from "./branding.ts";
 
@@ -15,12 +16,17 @@ export interface ConfigUIRuntime {
   registerMainTool: () => void;
   syncLoopSupervisor?: () => void;
   syncWatchdog?: () => void;
+  syncModelHealth?: () => void;
+  clearModelHealth?: (model?: string) => void;
 }
 
 export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> {
   const { config } = rt;
   // Defensive: a corrupted/legacy config must never crash the UI.
   if (!config.watchdog) config.watchdog = { ...WATCHDOG_DEFAULTS };
+  // Sanitize rather than merely defaulting: a partial modelHealth block (e.g.
+  // hand-edited config) must not leave undefined thresholds in the UI.
+  config.modelHealth = sanitizeModelHealthConfig(config.modelHealth as any, MODEL_HEALTH_DEFAULTS);
   let modelList: string[] | null = null;
 
   const pickModel = async (title: string): Promise<string | undefined> => {
@@ -86,10 +92,21 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
       "Redundant agents: " + (config.redundantAgents ? "YES" : "NO"),
       "Dedupe tasks: " + (config.dedupeTasks ? "ON" : "OFF"),
       "Dedupe cross-agent output: " + (config.dedupeCrossAgent ? "ON" : "OFF"),
+      "Turn limit: " + (() => {
+        const tl = config.loopSupervisor ?? {};
+        if (!tl.turnLimitEnabled) return "OFF";
+        const warn = tl.maxAgentTurns ?? 50;
+        return `ON | warn ${warn} | kill ${warn + (tl.turnLimitGrace ?? 15)}`;
+      })(),
       "Watchdogs: " + (() => {
         const wd = config.watchdog;
         const fmt = (s: number) => (s > 0 ? `${s}s` : "off");
         return `first ${fmt(wd.firstResponseSeconds)} | idle ${fmt(wd.idleSeconds)} | max ${fmt(wd.maxRuntimeSeconds)}`;
+      })(),
+      "Model health: " + (() => {
+        const mh = config.modelHealth;
+        if (!mh || !mh.enabled) return "OFF";
+        return `on | fails≥${mh.failureThreshold} | cool ${mh.cooldownSeconds}s→${mh.maxCooldownSeconds}s`;
       })(),
       "Dashboard: " + rt.dashboardMode,
       "Done",
@@ -118,6 +135,45 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
     if (choice.startsWith("Redundant agents")) { config.redundantAgents = !config.redundantAgents; ctx.ui.notify(`Redundant agents: ${config.redundantAgents ? "YES" : "NO"}`, "info"); rt.saveConfig(); rt.registerMainTool(); continue; }
     if (choice.startsWith("Dedupe tasks")) { config.dedupeTasks = !config.dedupeTasks; ctx.ui.notify(`Dedupe tasks: ${config.dedupeTasks ? "ON" : "OFF"}`, "info"); rt.saveConfig(); continue; }
     if (choice.startsWith("Dedupe cross-agent")) { config.dedupeCrossAgent = !config.dedupeCrossAgent; rt.syncLoopSupervisor?.(); ctx.ui.notify(`Dedupe cross-agent output: ${config.dedupeCrossAgent ? "ON" : "OFF"}`, "info"); rt.saveConfig(); continue; }
+
+    // Turn-limit submenu: stays open after each edit. Disabled by default;
+    // when on, `Warn at` triggers a warning and `Kill after` adds the grace.
+    if (choice.startsWith("Turn limit")) {
+      if (!config.loopSupervisor) config.loopSupervisor = {};
+      const tl = config.loopSupervisor;
+      const editTurns = async (label: string, current: number, min: number, apply: (n: number) => void): Promise<void> => {
+        const raw = await ctx.ui.input(`${label} — turns`, String(current));
+        if (raw === undefined) return;
+        const n = parseInt(raw.trim(), 10);
+        if (isNaN(n) || n < min) { ctx.ui.notify(`Enter a number of turns >= ${min}`, "error"); return; }
+        apply(Math.min(n, 100_000));
+        rt.syncLoopSupervisor?.();
+        ctx.ui.notify(`${label}: ${Math.min(n, 100_000)}`, "info");
+        rt.saveConfig();
+      };
+      while (true) {
+        const warn = tl.maxAgentTurns ?? 50;
+        const grace = tl.turnLimitGrace ?? 15;
+        const tlChoice = await ctx.ui.select("Turn limit (off by default):", [
+          `Enabled: ${tl.turnLimitEnabled ? "ON" : "OFF"}`,
+          `Warn at: ${warn} turns`,
+          `Kill after: +${grace} turns (hard kill at ${warn + grace})`,
+          "Back",
+        ]);
+        if (!tlChoice || tlChoice === "Back") break;
+        if (tlChoice.startsWith("Enabled")) {
+          tl.turnLimitEnabled = !tl.turnLimitEnabled;
+          rt.syncLoopSupervisor?.();
+          ctx.ui.notify(`Turn limit: ${tl.turnLimitEnabled ? "ON" : "OFF"}`, "info");
+          rt.saveConfig();
+        } else if (tlChoice.startsWith("Warn at")) {
+          await editTurns("Warn at", warn, 1, n => { tl.maxAgentTurns = n; });
+        } else if (tlChoice.startsWith("Kill after")) {
+          await editTurns("Kill grace", grace, 0, n => { tl.turnLimitGrace = n; });
+        }
+      }
+      continue;
+    }
     if (choice.startsWith("Dashboard")) {
       const modes: Array<"widget" | "compact" | "off"> = ["compact", "widget", "off"];
       const mode = modes[(modes.indexOf(rt.dashboardMode) + 1) % modes.length];
@@ -163,6 +219,52 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
       continue;
     }
 
+    // Model health submenu: stays open after each edit.
+    if (choice.startsWith("Model health")) {
+      const mhRef = (config.modelHealth ??= { ...MODEL_HEALTH_DEFAULTS });
+      const editSeconds = async (label: string, current: number, apply: (n: number) => void, max: number): Promise<void> => {
+        const raw = await ctx.ui.input(`${label} — seconds`, String(current));
+        if (raw === undefined) return;
+        const n = parseInt(raw.trim(), 10);
+        if (isNaN(n) || n < 1) { ctx.ui.notify("Enter a positive number of seconds", "error"); return; }
+        const clamped = Math.min(n, max);
+        apply(clamped);
+        rt.syncModelHealth?.();
+        if (clamped !== n) ctx.ui.notify(`Value capped at ${max}s (max)`, "warning");
+        ctx.ui.notify(`${label}: ${clamped}s`, "info");
+        rt.saveConfig();
+      };
+      while (true) {
+        const mhChoice = await ctx.ui.select("Model health (circuit breaker):", [
+          `Enabled: ${mhRef.enabled ? "ON" : "OFF"}`,
+          `Failures before pause: ${mhRef.failureThreshold}`,
+          `Base cooldown: ${mhRef.cooldownSeconds}s`,
+          `Max cooldown (backoff cap): ${mhRef.maxCooldownSeconds}s`,
+          "Reset paused models",
+          "Back",
+        ]);
+        if (!mhChoice || mhChoice === "Back") break;
+        if (mhChoice.startsWith("Enabled")) {
+          mhRef.enabled = !mhRef.enabled;
+          rt.syncModelHealth?.();
+          ctx.ui.notify(`Model health: ${mhRef.enabled ? "ON" : "OFF"}`, "info");
+          rt.saveConfig();
+        } else if (mhChoice.startsWith("Failures before pause")) {
+          const value = await ctx.ui.select("Consecutive model failures before pausing:", ["1", "2", "3", "4", "5"]);
+          const num = value ? parseInt(value, 10) : NaN;
+          if (!isNaN(num)) { mhRef.failureThreshold = num; rt.syncModelHealth?.(); ctx.ui.notify(`Pause after ${num} failure(s)`, "info"); rt.saveConfig(); }
+        } else if (mhChoice.startsWith("Base cooldown")) {
+          await editSeconds("Base cooldown", mhRef.cooldownSeconds, n => { mhRef.cooldownSeconds = n; }, mhRef.maxCooldownSeconds);
+        } else if (mhChoice.startsWith("Max cooldown")) {
+          await editSeconds("Max cooldown", mhRef.maxCooldownSeconds, n => { mhRef.maxCooldownSeconds = n; }, 86_400);
+        } else if (mhChoice.startsWith("Reset paused")) {
+          rt.clearModelHealth?.();
+          ctx.ui.notify("Paused models cleared", "info");
+        }
+      }
+      continue;
+    }
+
     // Tier submenu: stays open after each change; "Back"/Esc returns to main.
     const tierKey = (choice.startsWith("Active") ? "active" : choice.startsWith("T1") ? "t1" : choice.startsWith("T2") ? "t2" : "t3") as AgentTier;
     while (true) {
@@ -182,8 +284,16 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
         rt.saveConfig(); rt.registerMainTool(); continue;
       }
       if (subAction.startsWith("Model")) {
+        const previousModel = config[tierKey].model;
         const providerId = await pickModel(`Select ${formatTierLabel(tierKey)} model:`);
-        if (providerId) { config[tierKey].model = providerId; ctx.ui.notify(`${formatTierLabel(tierKey)} model: ${providerId}`, "info"); rt.saveConfig(); }
+        if (providerId) {
+          config[tierKey].model = providerId;
+          // Changing the model clears any cooldown left on the old one so the
+          // new model gets a clean slate (and the paused tier is unblocked).
+          if (previousModel && previousModel !== providerId) rt.clearModelHealth?.(previousModel);
+          ctx.ui.notify(`${formatTierLabel(tierKey)} model: ${providerId}`, "info");
+          rt.saveConfig();
+        }
         continue;
       }
       if (subAction.startsWith("Redundant models")) {
@@ -196,7 +306,7 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
             const providerId = await pickModel(`Add ${formatTierLabel(tierKey)} model:`);
             if (providerId) {
               if (providerId === config[tierKey].model || rm.includes(providerId)) ctx.ui.notify(`${providerId} already in pool`, "warning");
-              else { rm.push(providerId); ctx.ui.notify(`${formatTierLabel(tierKey)} redundant model added: ${providerId}`, "info"); rt.saveConfig(); rt.registerMainTool(); }
+              else { rm.push(providerId); rt.clearModelHealth?.(providerId); ctx.ui.notify(`${formatTierLabel(tierKey)} redundant model added: ${providerId}`, "info"); rt.saveConfig(); rt.registerMainTool(); }
             }
           } else if (rmChoice.startsWith("✕ Remove: ")) {
             const m = rmChoice.slice("✕ Remove: ".length);
