@@ -19,6 +19,7 @@ import {
   migrateSavedCompaction,
   effectiveCompactionThreshold,
   sanitizeLoopSupervisorConfig,
+  applyGuardConfig,
 } from "./config.ts";
 import {
   launchAgent,
@@ -1576,7 +1577,7 @@ export default function (pi: ExtensionAPI) {
           // later edits.
           if (!config.loopSupervisor) config.loopSupervisor = {};
           config.loopSupervisor.dedupeCrossAgent = config.dedupeCrossAgent;
-          loopSupervisor.updateConfig(config.loopSupervisor);
+          applyGuardConfig(loopSupervisor, config.loopSupervisor);
         },
         syncWatchdog: applyWatchdogConfig,
         syncModelHealth: applyModelHealthConfig,
@@ -2031,7 +2032,8 @@ export default function (pi: ExtensionAPI) {
     // symptom being "the UI says turn limit OFF while agents are still killed at
     // the hard limit". Pushing the whole object on every save makes that
     // divergence impossible through the config path.
-    if (config.loopSupervisor) loopSupervisor.updateConfig(config.loopSupervisor);
+    // Single choke point: see applyGuardConfig's contract note.
+    applyGuardConfig(loopSupervisor, config.loopSupervisor);
     // Save to dedicated config file (survives session changes)
     persistConfig(config);
     if (disposed) return;
