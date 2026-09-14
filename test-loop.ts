@@ -11,6 +11,9 @@ import { formatGuardTurnLimit } from "./src/commands.ts";
 import { foldDedupeFlagIntoGuard } from "./src/config.ts";
 import { setAgentStatus, agentIdleMs } from "./src/agent-manager.ts";
 import type { AgentInstance } from "./src/types.ts";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const CONTRACT = `Clause 12.1 - Prestation terms. The contractor shall provide the services described in Annex A
 for a total consideration of EUR 240,000 payable in four equal instalments. Any delay in payment
@@ -355,6 +358,31 @@ console.log("Guard push folds the top-level dedupe flag:");
 
   check("no guard block -> nothing to push", foldDedupeFlagIntoGuard({ dedupeCrossAgent: true }) === undefined);
   check("a non-object guard block is ignored", foldDedupeFlagIntoGuard({ loopSupervisor: "nope", dedupeCrossAgent: true } as any) === undefined);
+}
+
+// ── the guard-config choke point cannot be bypassed ──
+// src/index.ts cannot be imported by a unit test, so its wiring is protected
+// statically: exactly one place in src/ may push config into the guard. This is
+// what makes "add a save path that skips the fold" a CI failure instead of a
+// silent divergence of the kind this series kept fixing.
+console.log("Guard choke point (static invariant):");
+{
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const srcDir = path.join(here, "src");
+  const violations: string[] = [];
+  let chokeHits = 0;
+  for (const f of fs.readdirSync(srcDir)) {
+    if (!f.endsWith(".ts")) continue;
+    const src = fs.readFileSync(path.join(srcDir, f), "utf8");
+    src.split("\n").forEach((line, i) => {
+      if (!/\.updateConfig\s*\(/.test(line)) return;
+      if (/[Mm]odelHealth/.test(line)) return; // the circuit breaker has its own config path
+      if (f === "config.ts" && /supervisor\.updateConfig\(/.test(line)) { chokeHits++; return; }
+      violations.push(`${f}:${i + 1}: ${line.trim()}`);
+    });
+  }
+  check("no file bypasses applyGuardConfig to push guard config", violations.length === 0, violations);
+  check("the choke point exists exactly once in src/config.ts", chokeHits === 1, chokeHits);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
