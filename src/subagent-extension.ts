@@ -92,6 +92,7 @@ async function waitForResponse(requestId: string, timeoutMs: number = Number(pro
       task: "",
       status: "error",
       output: "",
+      finalOutput: "",
       stderr: `Spawn request timed out after ${timeoutMs}ms. The spawned agent may still be running — check /tmg list.`,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
     },

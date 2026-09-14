@@ -33,12 +33,18 @@ export interface AgentInstance {
   startedAt: number;
   /** Completion timestamp (if done/error/killed) */
   finishedAt?: number;
+  /** Accumulated time (ms) the agent spent in a terminal/stopped state. */
+  idleMs?: number;
+  /** When the agent last entered a terminal/stopped state (undefined while active). */
+  idleSince?: number;
   /** The child process (if running) */
   proc?: import("node:child_process").ChildProcess;
   /** Abort controller for this agent */
   controller: AbortController;
   /** Accumulated output so far */
   output: string;
+  /** Last assistant message text (the agent's own final answer), replaced on each assistant message */
+  finalOutput: string;
   /** Error output */
   stderr: string;
   /** Usage stats */
@@ -82,6 +88,7 @@ export interface AgentResult {
   task: string;
   status: AgentStatus;
   output: string;
+  finalOutput?: string;
   stderr: string;
   usage: UsageStats;
   model?: string;

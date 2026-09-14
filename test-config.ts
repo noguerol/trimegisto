@@ -17,8 +17,12 @@ import {
   SCHEMA_VERSION,
   effectiveCompactionThreshold,
   sanitizeLoopSupervisorConfig,
+  formatModelLabel,
 } from "./src/config.ts";
 import { runConfigUI } from "./src/config-ui.ts";
+import { createDashboardWidget } from "./src/dashboard.ts";
+import { getAgents } from "./src/agent-manager.ts";
+import type { AgentInstance } from "./src/types.ts";
 
 let passed = 0;
 let failed = 0;
@@ -301,6 +305,55 @@ console.log("Test 16 (sanitizeLoopSupervisorConfig drops legacy loop keys):");
   check("undefined saved -> defaults", empty.maxAgentTurns === 50 && empty.enabled === true && empty.turnLimitEnabled === false);
   const nullish = sanitizeLoopSupervisorConfig(null as any, defaults);
   check("null saved -> defaults (no throw)", nullish.maxAgentTurns === 50 && nullish.maxSpawnDepth === 5);
+}
+
+console.log("Test 17 (formatModelLabel for the dashboard):");
+{
+  check("deepseek slug -> Deepseek v4 Flash", formatModelLabel("deepseek/deepseek-v4-flash") === "Deepseek v4 Flash", formatModelLabel("deepseek/deepseek-v4-flash"));
+  check("kimi slug -> Kimi K3", formatModelLabel("moonshot/kimi-k3") === "Kimi K3", formatModelLabel("moonshot/kimi-k3"));
+  check("nested provider -> last segment", formatModelLabel("openrouter/anthropic/claude-opus-4") === "Claude Opus 4", formatModelLabel("openrouter/anthropic/claude-opus-4"));
+  check("decimal version kept", formatModelLabel("google/gemini-2.5-pro") === "Gemini 2.5 Pro", formatModelLabel("google/gemini-2.5-pro"));
+  check("generation marker uppercased (r1)", formatModelLabel("deepseek/deepseek-r1") === "Deepseek R1", formatModelLabel("deepseek/deepseek-r1"));
+  check("mixed/upper tokens preserved", formatModelLabel("bruma/bruma:8082//mnt/models/Qwen3.8-27B-ROCmFP4-FAST.gguf") === "Qwen3.8 27B ROCmFP4 FAST", formatModelLabel("bruma/bruma:8082//mnt/models/Qwen3.8-27B-ROCmFP4-FAST.gguf"));
+  check("(pi default) -> pi default", formatModelLabel("(pi default)") === "pi default");
+  check("empty/undefined -> empty", formatModelLabel("") === "" && formatModelLabel(undefined) === "" && formatModelLabel("   ") === "");
+  check("no crash on punctuation only", formatModelLabel("///") === "" && formatModelLabel("---") === "", formatModelLabel("---"));
+  check("single word titled", formatModelLabel("sonnet") === "Sonnet", formatModelLabel("sonnet"));
+}
+
+console.log("Test 18 (full dashboard shows the agent model):");
+{
+  const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+  const makeAgent = (over: Partial<AgentInstance>): AgentInstance => ({
+    id: "t2a", tier: "t2", task: "analyze the logs", status: "running", startedAt: Date.now(),
+    controller: new AbortController(), output: "", stderr: "", log: [],
+    usage: { input: 50, output: 100, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+    ...over,
+  } as AgentInstance);
+  const renderDashboard = (agent: AgentInstance): string => {
+    getAgents().set(agent.id, agent);
+    try {
+      const widget = createDashboardWidget({} as any)({} as any, theme as any);
+      return widget.render(160).join("\n");
+    } finally {
+      getAgents().delete(agent.id);
+    }
+  };
+
+  const withModel = renderDashboard(makeAgent({ model: "deepseek/deepseek-v4-flash", requestedModel: "deepseek/deepseek-v4-flash" }));
+  check("agent line shows the humanized model", withModel.includes("Deepseek v4 Flash"), withModel.split("\n").find(l => l.includes("t2a")));
+  const reqOnly = renderDashboard(makeAgent({ requestedModel: "moonshot/kimi-k3" }));
+  check("falls back to requestedModel before first response", reqOnly.includes("Kimi K3"), reqOnly.split("\n").find(l => l.includes("t2a")));
+  const noModel = renderDashboard(makeAgent({}));
+  check("no model renders without crashing and without label", noModel.includes("t2a") && !/undefined/.test(noModel), noModel.split("\n").find(l => l.includes("t2a")));
+  const longModel = renderDashboard(makeAgent({ model: "someprovider/this-is-a-very-long-model-name-that-should-be-capped-for-the-dashboard" }));
+  const longLine = longModel.split("\n").find(l => l.includes("t2a")) || "";
+  check("long model label is capped with an ellipsis", longLine.includes("…") && !longLine.includes("should-be-capped"), longLine);
+  const gguf = renderDashboard(makeAgent({ model: "bruma/bruma:8082//mnt/models/Qwen3.8-27B-ROCmFP4-FAST.gguf" }));
+  const ggufLine = gguf.split("\n").find(l => l.includes("t2a")) || "";
+  check("gguf weight path is humanized and compact", ggufLine.includes("Qwen3.8 27B ROCmFP4 FAST") && !ggufLine.includes(".gguf") && !ggufLine.includes("/mnt/"), ggufLine);
+  const doneAgent = renderDashboard(makeAgent({ status: "done", finishedAt: Date.now(), model: "moonshot/kimi-k3" }));
+  check("done agents also show the model", doneAgent.includes("Kimi K3"), doneAgent.split("\n").find(l => l.includes("t2a")));
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

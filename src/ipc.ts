@@ -112,6 +112,7 @@ export async function pollSpawnResponse(requestId: string, timeoutMs: number = 3
       task: "",
       status: "error",
       output: "",
+      finalOutput: "",
       stderr: `Spawn request timed out after ${timeoutMs}ms`,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
       log: [],

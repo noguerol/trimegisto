@@ -93,6 +93,16 @@ While agents run, the dashboard shows **continuous prefill and generation speeds
 
 The values are measured from the token stream itself (provider-agnostic), calibrated per model from real usage, and smoothed with an EMA so bursts don't flicker.
 
+The **full widget** (`/tmg dashboard` → `widget`) lists each agent with its **model** right after the agent id, so you can tell which model each worker is using (handy with redundant-model pools):
+
+```text
+  ◌ t2a Deepseek v4 Flash · T2 12s ↓38t/s 📤1.2k 📥3.4k — analyze the logs
+```
+
+Model ids are humanized — last path segment, separators to spaces, version prefixes kept lower-case (`deepseek/deepseek-v4-flash` → `Deepseek v4 Flash`, `moonshot/kimi-k3` → `Kimi K3`, `.../Qwen3.8-27B-ROCmFP4-FAST.gguf` → `Qwen3.8 27B ROCmFP4 FAST`). Long labels are capped with `…`. Before a worker's first response the label falls back to the requested model.
+
+**The clock is honest.** Each agent's timer shows total time since it started, but it **freezes the moment the agent finishes, errors or is killed** (it no longer counts up for a finished worker), and **resumes without jumping backwards if the agent comes back to life** (e.g. a failover retry). The number is wall-clock time — it does not try to measure how long the model actually spent processing, only how long the agent has been alive.
+
 ## Usage
 
 ### The `trimegisto` tool (LLM-facing)
@@ -101,19 +111,47 @@ When Trimegisto is enabled, a hidden orchestration directive is injected before 
 
 ```json
 {
+  "goal": "make the parser accept v2 manifests without breaking v1",
   "tasks": [
-    { "tier": "active", "task": "parse logs.csv and count rows" },
-    { "tier": "active", "task": "extract the 10 most common error codes" },
-    { "tier": "t2",     "task": "analyze the extracted codes and find root causes" }
+    { "tier": "active", "task": "map every place v1 manifests are parsed", "why": "locate the parser entry points", "writes": ["docs/parser-map.md"] },
+    { "tier": "active", "task": "port the v1 tests to v2 fixtures", "why": "agree on the expected behaviour", "writes": ["test/manifest.test.ts"] },
+    { "tier": "t2",     "task": "implement v2 parsing on top of that map", "why": "the change itself", "needs": [1], "writes": ["src/manifest.ts"] }
   ],
   "cwd": "/path/to/work"
 }
 ```
 
 - `tier` defaults to `active`; max 8 tasks per call (per-tier capacity = `maxParallel`, higher with redundant model pools).
-- The tool **returns immediately**; agents run in the background and results are harvested into chat as they complete.
+- **`goal`** is the overall objective. **`why`** is one line saying which part of it a task serves. A task that cannot name its need should not be spawned.
+- **`needs: [i]`** declares a real data dependency (1-based indices inside the same call). Declared dependencies run in **waves**: wave 2 starts only when wave 1 is terminal, and the upstream **verdict is injected into the dependent task**, so the edge actually carries data instead of being cosmetic. Tasks with no edge run in parallel — that is what to parallelise.
+- **`writes: [paths]`** lists files a task will write. Two tasks writing the same file are **serialised automatically** instead of racing (and instead of being silently rejected by the file lock at runtime).
+- **`lane`** overrides the automatic blast-radius classification: `open` (contained/reversible), `gated` (wide but reversible), `closed` (irreversible/high-consequence). A `closed` task makes the whole call **refuse to launch** — that lane does not open.
+- The tool **returns immediately**; agents run in the background and the batch **always ends with one reconciliation** (see [Guaranteed reconciliation](#guaranteed-reconciliation)).
 - The tool description always lists which tiers are ENABLED right now — the LLM only spawns those.
 - `trimegisto_harvest` returns the current agent snapshot immediately. It never waits; use it instead of sleep/poll loops.
+
+#### Plan gate (stop paying for work that should not run)
+
+Before anything is spawned, a **deterministic, model-free** gate (`src/plan-graph.ts`) turns the batch into a graph and rejects or repairs it:
+
+- **Duplicates merged.** Two tasks that would produce the same answer are one node, not two. Near-duplicate text inside the batch is clustered (shingle + Jaccard) and only the lowest index is launched; the rest are reported as merged. This is on top of the cross-call registry dedup (a task that duplicates something spawned in the last 5 minutes is skipped and never registered, so it can be retried later).
+- **Dependencies enforced.** `needs` is validated (out-of-range, self-references and cycles are dropped deterministically with a warning) and topologically sorted into waves. If a task *reads like* a pipeline step (`then`, `based on the findings`, `using the output`…) but declares no `needs`, the gate warns instead of guessing — an edge is only an edge when the next node actually reads the previous output.
+- **Same-file writers serialised.** No two launched nodes write the same file in the same wave.
+- **Code nodes flagged.** A task that is a pure transformation (parse, count, rename, format, diff…) is flagged: do it with bash instead of paying a model for a step that has exactly one correct answer.
+- **Relevance checked.** With a `goal` and a `why` per task, the gate computes a deterministic lexical overlap and warns when a task has no link to the stated objective. Without a `goal` it says so once and cannot check relevance at all.
+- **Closed lanes refused.** Irreversible, high-blast-radius work (deletions, `force-push`, deploy/publish, migrations, production data, credential rotation) is never launched automatically, whatever the confidence — the human decides.
+- **Feasible waves only.** A wave larger than the tier capacity is refused with an actionable message (split it with `needs`, or raise `maxParallel`); a wave that merely arrives when the tier is busy is **queued** and launched when a slot frees, not refused.
+- The gate's verdict is returned in the tool result (`### Waves`, `### Serialised`, `### Duplicates merged`, `### Code nodes`, `### Warnings`, `### Blockers` and the final `**Plan verdict:**` line), so the coordinator can see exactly why its plan was reshaped.
+
+#### Guaranteed reconciliation
+
+A spawn call is a **batch**, and a batch always produces exactly one final answer:
+
+- Each agent's **last assistant message** is captured separately as its verdict (not a head-truncated slice of its whole transcript), and the reconciler distils `final verdict > last meaningful output block > stderr`. Free-text fields are collapsed to one line before rendering, so an agent id, status or task containing newlines cannot forge a heading or a fake conclusion line.
+- The batch settles — and emits **one** `🪡 Trimegisto — final reconciliation` message — as soon as every agent is terminal (`done` / `error` / `killed`), or when the **hard batch deadline** expires (`TRIMEGISTO_BATCH_DEADLINE_MS`, default 30 min, minimum 1 min). Killed agents, watchdog kills and agents that never report still count as settled, so the conclusion is never lost.
+- The message lists per-agent verdicts, status counts, usage, **overlapping results** (near-duplicate verdicts collapsed with a similarity note), an explicit `INCOMPLETE:` list for anything that did not settle, and closes with the shared conclusion line. Agents that reported success but produced no usable verdict — empty output, or a raw provider error as their last message — are listed under **Unverified** with a `⚠️` icon instead of a silent `✅`, so the conclusion never over-claims. The reconciler is pure and deterministic (`src/reconcile.ts`); if it ever throws, a minimal fallback conclusion is still emitted.
+- Delivery uses `deliverAs: followUp` + `triggerTurn`, so the main model gets **exactly one** turn to write the unified final answer on top of the deterministic conclusion — without interrupting work in flight. The conclusion is rendered the moment it is sent, so it reaches you even when the main model's next request fails (e.g. a provider `400`).
+- Live agent progress and logs are **TUI-only entries**: they render in the transcript but are *not* sent to the main model. Only the reconciliation participates in the main conversation, which keeps the coordinator's context small and avoids the provider-400 storms an unbounded stream of injected messages used to cause. The `context` hook additionally drops empty Trimegisto messages and caps retained progress notes.
 
 ### Slash commands (user-facing)
 
@@ -193,6 +231,15 @@ Your custom system prompt for this tier...
 
 Precedence: **saved config > agent file > built-in defaults** (per field: model, tools, systemPrompt, maxParallel, compactionThreshold, enabled).
 
+### Provider diagnostics (opt-in)
+
+Twice now the coordinator has died with a provider `400 invalid_request_error` and the rejected payload was never seen, so the cause stayed a hypothesis. Capturing every request would be invasive, so this is a **post-mortem window** instead:
+
+- Nothing is written while the provider behaves. When it answers **≥ 400**, Trimegisto starts recording the next requests and responses for **10 minutes** and says so in the transcript.
+- Set `TRIMEGISTO_CAPTURE_PAYLOADS=1` to force capture on from the start (or `0`/`false`/`off` to disable the automatic window).
+- Records go to `<instance dir>/diagnostics/provider.jsonl` as JSONL. Secret-named keys (`api_key`, `authorization`, `token`, `secret`, …) are always `<redacted>`, and a long token that **mixes character classes** is redacted too — while prose, file paths and low-entropy filler are preserved, because blanking the payload would defeat the purpose.
+- Diagnostics can never break a request: recording is wrapped, the parent directory is created lazily and any filesystem error is swallowed.
+
 ### Loop detection (antiloop) & Swarm Guard
 
 Reasoning/output loop detection lives in the separate **[antiloop](https://github.com/noguerol/antiloop)** extension. Antiloop is discovered by every sub-agent process (pi discovers `~/.pi/agent/extensions`; Trimegisto does not pass `--no-extensions`) and acts **mid-run** (warn → force break → abort). Trimegisto does not duplicate it — **keep antiloop installed for loop protection.**
@@ -263,6 +310,9 @@ This is tuned in `/tmg config → Model health` (`enabled`, failures before paus
 - **File locks** — advisory, 60 s stale timeout. Agents call `file_lock` before write/edit and `file_unlock` after; conflicts return the lock owner so agents can wait or move on. Locks are released automatically when an agent finishes, is killed or halted. Inspect with `/tmg locks`.
 - **Context broker** — when an agent modifies a file, other agents that previously read it (via `file_read_track`) get a compact system alert: "⚠️ Stale file: `x.ts` changed by `t3a` — re-read before editing."
 - **Proactive compaction** — opt-in. Trimegisto can watch the **main session's** context usage and force pi compaction when it crosses the lowest enabled tier threshold (60 s cooldown). By default all thresholds are **0 (off)**, so pi's native compaction setting decides and we never force an early compaction; set a per-tier 50–95% via `/tmg config` to re-enable it. Pre-v3 configs that still hold the old built-in defaults (85/65/75/85) are migrated to off automatically.
+- **Plan graph (waves)** — a spawn call is a graph, not a pile. The gate (`src/plan-graph.ts`) merges in-batch duplicates, serialises same-file writers, flags mechanical work that needs no model, refuses irreversible lanes and sorts declared `needs` into topological waves. The scheduler launches one wave at a time, injects each upstream verdict into its dependents, defers a wave when the tier is momentarily full, and stops advancing if a human halts or kills the wave (dependents are reported as not launched instead of being spawned anyway).
+- **Guaranteed reconciliation** — a batch never ends in scattered fragments. On top of the per-agent harvests, every batch is tracked in a session-wide registry and produces exactly one deterministic final-reconciliation message when all agents are terminal or the batch deadline expires (killed/timed-out agents included). Verdicts come from each agent's own final message, near-duplicate verdicts are flagged, and failures are listed as `INCOMPLETE:` instead of being presented as answers. See [Guaranteed reconciliation](#guaranteed-reconciliation).
+- **Context hygiene** — sub-agent progress goes to TUI-only entries and never to the main model. Before every LLM call a pure pruner (`src/context-prune.ts`) keeps only the newest orchestration directive, caps retained progress notes (8), and drops empty custom messages, so the coordinator's requests stay small and well-formed (an unbounded pile of injected user-role messages is a common source of provider `400 invalid_request_error`). Non-custom messages are never touched, so tool_use ↔ tool_result pairing is safe.
 - **Watchdogs & failover** — every worker has bounded first-response and idle-progress watchdogs (defaults: 90 s / 120 s). The wall-clock **max-runtime watchdog is disabled by default** (`maxRuntimeSeconds: 0`), so an agent that keeps making progress may run for as long as it needs. All three are configurable in seconds via `/tmg config → Watchdogs` (0 = off) and persisted in `~/.pi/agent/trimegisto/config.json`. Precedence: saved config > `TRIMEGISTO_FIRST_RESPONSE_TIMEOUT_MS` / `TRIMEGISTO_AGENT_IDLE_TIMEOUT_MS` / `TRIMEGISTO_AGENT_MAX_RUNTIME_MS` env vars > built-in defaults. Values are clamped to a safe range so an oversized number can never overflow the timer. A stuck sub-agent is killed and harvested instead of blocking orchestration forever. With `redundantAgents` on, provider failures/no first response can fail over to the next model in the pool. Repeated **model-level** failures additionally trip the per-model circuit breaker (see *Model health* above) so a broken provider can't trigger a retry storm.
 
 ### Data layout
@@ -300,6 +350,11 @@ trimegisto/
 │   ├── agent-manager.ts        # spawn/track/kill, model pools, failover
 │   ├── subagent-extension.ts   # injected into every sub-agent process
 │   ├── loop-supervisor.ts      # swarm guard: spawn depth, turn limits, redundancy
+│   ├── plan-graph.ts           # pre-spawn plan gate: duplicates, deps→waves, lanes, code nodes
+│   ├── wave-scheduler.ts       # wave driver: one wave at a time, re-entrancy-safe, iterative
+│   ├── diagnostics.ts          # opt-in provider payload/response capture (post-mortem window)
+│   ├── reconcile.ts            # deterministic final reconciliation (guaranteed batch conclusion)
+│   ├── context-prune.ts        # pure LLM-context pruner (keeps coordinator requests small)
 │   ├── model-health.ts         # per-model circuit breaker (pauses spawns on failing models)
 │   ├── file-lock.ts            # advisory file locking
 │   ├── context-broker.ts       # cross-agent file-change notifications
@@ -316,7 +371,12 @@ trimegisto/
 ├── test-config.ts              # config defaults, compaction migration, /tmg config menus
 ├── test-watchdog.ts            # watchdog config tests
 ├── test-model-health.ts        # model-health circuit-breaker tests
-└── test-speed.ts               # speed-tracker unit tests
+├── test-speed.ts               # speed-tracker unit tests
+├── test-reconcile.ts           # reconciliation + batch-settle guarantee tests
+├── test-plan-graph.ts          # plan gate: duplicates, waves, lanes, code nodes
+├── test-wave-scheduler.ts      # wave driver: re-entrancy, deferral, stop, deadline
+├── test-diagnostics.ts         # payload capture: redaction, ring buffer, opt-in no-op
+└── test-context-prune.ts       # LLM-context pruner tests
 ```
 
 ## Development
@@ -330,6 +390,11 @@ node --experimental-strip-types test-config.ts    # config/compaction/UI tests
 node --experimental-strip-types test-watchdog.ts  # watchdog config tests
 node --experimental-strip-types test-model-health.ts # model-health circuit-breaker tests
 node --experimental-strip-types test-speed.ts     # speed-tracker tests
+node --experimental-strip-types test-reconcile.ts # reconciliation + settle guarantee tests
+node --experimental-strip-types test-plan-graph.ts # plan gate tests
+node --experimental-strip-types test-wave-scheduler.ts # wave driver tests
+node --experimental-strip-types test-diagnostics.ts # payload-capture tests
+node --experimental-strip-types test-context-prune.ts # context-pruner tests
 ```
 
 ## License

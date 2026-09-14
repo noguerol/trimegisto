@@ -15,11 +15,17 @@
  * about to launch (avoiding false "duplicate" on pre-flight failures):
  *   - isDuplicateTask(task)   check-only against the global registry
  *   - registerTask(tier, task)  commit a task to the registry at launch time
- *   - dedupeTaskBatch(tasks)  dedup a whole batch incl. within-batch overlaps
+ *   - forgetTask(task)        unregister a failed launch so a retry is allowed
+ *   - wordSet / wordSetSimilarity  shared with the plan gate's clustering
+ *
+ * Within-batch duplication used to live here (`dedupeTaskBatch`); it now belongs
+ * to the plan gate (`plan-graph.ts`), which merges duplicates, serialises
+ * same-file writers and orders dependencies in one deterministic pass.
  *
  * Consumers:
  *   - agent-manager.processSpawnRequests (auto-spawn from sub-agents)
  *   - index.ts registerMainTool.execute (main `trimegisto` tool)
+ *   - plan-graph.ts (duplicate clustering inside a batch)
  */
 
 import type { AgentTier } from "./types.ts";
@@ -70,7 +76,12 @@ function fingerprintOf(task: string): string {
   return (h >>> 0).toString(36);
 }
 
-function wordSet(task: string): Set<string> {
+/**
+ * Word-set of a task: normalized, stopword-stripped, order-insensitive.
+ * Exported so other pure modules (the plan gate) measure overlap the same way
+ * the launch-time dedup does — shingles collapse on short task descriptions.
+ */
+export function wordSet(task: string): Set<string> {
   const words = normalizeText(task)
     .split(" ")
     .filter(Boolean)
@@ -78,7 +89,7 @@ function wordSet(task: string): Set<string> {
   return new Set(words);
 }
 
-function wordSetSimilarity(a: Set<string>, b: Set<string>): number {
+export function wordSetSimilarity(a: Set<string>, b: Set<string>): number {
   if (a.size === 0 && b.size === 0) return 1;
   if (a.size === 0 || b.size === 0) return 0;
   let inter = 0;
@@ -125,54 +136,6 @@ export function registerTask(tier: AgentTier, task: string, now: number = Date.n
   if (!normalized) return;
   prune(now);
   registry.push({ fingerprint: fingerprintOf(task), words: wordSet(task), task, tier, ts: now });
-}
-
-/**
- * Dedup an entire batch, catching near-duplicates both against the global
- * registry AND within the batch itself. Does NOT register anything — callers
- * must `registerTask` each accepted task at launch time.
- */
-export function dedupeTaskBatch<T extends { tier: AgentTier; task: string }>(
-  tasks: T[],
-): {
-  accepted: T[];
-  skipped: Array<{ task: string; tier: AgentTier; matchedTask: string; matchedTier?: AgentTier; similarity?: number }>;
-} {
-  const accepted: T[] = [];
-  const skipped: Array<{ task: string; tier: AgentTier; matchedTask: string; matchedTier?: AgentTier; similarity?: number }> = [];
-  const local: TaskEntry[] = [];
-
-  for (const t of tasks) {
-    const normalized = normalizeText(t.task);
-    if (!normalized) { accepted.push(t); continue; }
-
-    const fingerprint = fingerprintOf(t.task);
-    const words = wordSet(t.task);
-
-    let dup: TaskDedupeResult = isDuplicateTask(t.task);
-    if (!dup.duplicate) {
-      for (const e of local) {
-        if (e.fingerprint === fingerprint) {
-          dup = { duplicate: true, matchedTask: e.task, matchedTier: e.tier, similarity: 1 };
-          break;
-        }
-        const sim = wordSetSimilarity(e.words, words);
-        if (sim >= TASK_DEDUPE_SIMILARITY) {
-          dup = { duplicate: true, matchedTask: e.task, matchedTier: e.tier, similarity: Math.round(sim * 1000) / 1000 };
-          break;
-        }
-      }
-    }
-
-    if (dup.duplicate) {
-      skipped.push({ task: t.task, tier: t.tier, matchedTask: dup.matchedTask || "", matchedTier: dup.matchedTier, similarity: dup.similarity });
-    } else {
-      accepted.push(t);
-      local.push({ fingerprint, words, task: t.task, tier: t.tier, ts: Date.now() });
-    }
-  }
-
-  return { accepted, skipped };
 }
 
 /**
