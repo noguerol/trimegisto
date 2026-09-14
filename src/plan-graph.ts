@@ -508,11 +508,16 @@ export function planBatch(tasks: PlanTaskInput[], options?: PlanOptions): PlanDe
 
   const rawList: unknown[] = Array.isArray(tasks) ? (tasks as unknown[]) : [];
 
+  // Hard ceiling that does NOT depend on the caller's maxTasks: the cycle and
+  // same-file reachability checks are recursive, so an enormous batch must be
+  // refused up front rather than traversed (a deep `needs` chain used to blow the
+  // stack when a caller raised maxTasks).
+  const HARD_MAX_TASKS = 500;
+  const taskCeiling = Math.min(maxTasks, HARD_MAX_TASKS);
+
   // Bail out BEFORE any graph work (dedup clustering and the cycle/serialisation
-  // DFS are super-linear): a huge batch must be refused, not analysed. Without
-  // this, a long `needs` chain can also blow the stack in the reachability DFS —
-  // "never throws on malformed input" has to include "impossibly large input".
-  if (rawList.length > maxTasks) {
+  // DFS are super-linear): a huge batch must be refused, not analysed.
+  if (rawList.length > taskCeiling) {
     const refusedNodes: PlanNode[] = rawList.map((raw, i) => ({
       index: i + 1,
       task: typeof (raw as any)?.task === "string" ? String((raw as any).task) : "",
@@ -523,7 +528,7 @@ export function planBatch(tasks: PlanTaskInput[], options?: PlanOptions): PlanDe
       warnings: [],
       codeNode: false,
     }));
-    const blocker = `${rawList.length} tasks proposed — exceeds maxTasks=${maxTasks}; split the batch or raise the limit`;
+    const blocker = `${rawList.length} tasks proposed — exceeds maxTasks=${maxTasks} (hard ceiling ${taskCeiling}); split the batch or raise the limit`;
     return {
       accept: false,
       repaired: false,
