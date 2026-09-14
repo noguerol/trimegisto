@@ -301,6 +301,9 @@ export function applyGuardConfig(
 ): boolean {
   if (!supervisor || typeof supervisor.updateConfig !== "function") return false;
   if (!guardConfig || typeof guardConfig !== "object" || Array.isArray(guardConfig)) return false;
+  // An empty object would apply nothing while reporting success, which is exactly
+  // the kind of silent no-op a caller would trust.
+  if (Object.keys(guardConfig as Record<string, unknown>).length === 0) return false;
   supervisor.updateConfig(guardConfig as any);
   return true;
 }

@@ -297,6 +297,16 @@ console.log("Turn-limit opt-in / config drift:");
   check("missing guard config is a safe no-op", applyGuardConfig(s, undefined) === false);
   check("non-object guard config is rejected", applyGuardConfig(s, "nope") === false && applyGuardConfig(s, [1]) === false);
   check("no supervisor is a safe no-op", applyGuardConfig(null, {}) === false);
+  check("an empty guard object is rejected (no fake success)", applyGuardConfig(s, {}) === false);
+
+  // Default-deny gate: these FAIL if the gate is a truthiness check (they used to
+  // kill with turnLimitEnabled = 1 / "yes").
+  const sloppyNum = new LoopSupervisor({ enabled: true, turnLimitEnabled: 1 as any, maxAgentTurns: 20, turnLimitGrace: 15 });
+  check("a truthy 1 does NOT enable the limit", sloppyNum.checkTurnLimit("z", "active", 999) === false);
+  const sloppyStr = new LoopSupervisor({ enabled: true, turnLimitEnabled: "yes" as any, maxAgentTurns: 20, turnLimitGrace: 15 });
+  check('a truthy "yes" does NOT enable the limit', sloppyStr.checkTurnLimit("z", "active", 999) === false);
+  const explicit = new LoopSupervisor({ enabled: true, turnLimitEnabled: true, maxAgentTurns: 20, turnLimitGrace: 15 });
+  check("an explicit true still does", explicit.checkTurnLimit("z", "active", 36) === true);
 
   // sanitizeLoopSupervisorConfig always returns the flag explicitly, so a config
   // loaded from disk can never be pushed with the field missing.

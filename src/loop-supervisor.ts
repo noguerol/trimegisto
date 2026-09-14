@@ -170,7 +170,11 @@ export class LoopSupervisor {
    */
   checkTurnLimit(agentId: string, tier: AgentTier, turns: number): boolean {
     if (!this.config.enabled) return false;
-    if (!this.config.turnLimitEnabled) return false;
+    // Default-deny: ONLY an explicit `true` enables it. A truthiness check let a
+    // truthy non-boolean (1, "yes") turn the guard on, which is the same class of
+    // bug as the reported "shown as OFF but still killing" — an accidental value
+    // silently arming a guard that kills agents.
+    if (this.config.turnLimitEnabled !== true) return false;
 
     const softLimit = this.config.maxAgentTurns;
     const hardLimit = softLimit + (this.config.turnLimitGrace ?? 15);
