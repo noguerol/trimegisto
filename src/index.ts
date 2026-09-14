@@ -7,6 +7,7 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { formatTierStatusLine, formatDirectiveContent, formatUnavailableTiersMessage } from "./tier-status.ts";
 import { fileURLToPath } from "node:url";
 
 import type { AgentTier, TrimegistoConfig, AgentLogEntry, AgentInstance } from "./types.ts";
@@ -983,23 +984,31 @@ export default function (pi: ExtensionAPI) {
   }
 
   function tierStatusLine(tier: AgentTier): string {
-    const label = formatTierLabel(tier);
+    // The actual string assembly lives in src/tier-status.ts so the shape of
+    // the message the model sees is unit-tested. This function is just the
+    // adapter: resolve the live values, then hand them to the pure helper.
     const avail = tierAvailable(tier);
-    const mark = avail ? "✓ ENABLED" : "✗ unavailable";
     const model = tier === "active"
       ? (activeModel || "no active model")
       : ((config as any)[tier]?.model || "no model") + redundantSuffix(tier);
-    let why = "";
+    let reason = "";
     if (!avail) {
-      if (tier === "active") why = config.active.enabled ? " (no active model)" : " (disabled)";
-      else if (config.spawnOnlyOnActive) why = " (spawn-only-on-active)";
-      else why = ` (${(config as any)[tier]?.enabled === false ? "disabled" : "no model"})`;
+      if (tier === "active") reason = config.active.enabled ? " (no active model)" : " (disabled)";
+      else if (config.spawnOnlyOnActive) reason = " (spawn-only-on-active)";
+      else reason = ` (${(config as any)[tier]?.enabled === false ? "disabled" : "no model"})`;
     }
     // Surface an open circuit breaker so the coordinator does not try a model
     // that will be refused, and knows roughly when it comes back.
     const block = avail ? getTierModelBlock(tier, (config as any)[tier], config.redundantAgents, spawnModelOverride(tier)) : null;
-    const paused = block ? ` ⛔ paused ${Math.max(1, Math.ceil(block.remainingMs / 1000))}s` : "";
-    return `- ${label}: ${mark}${why} [${model}]${paused}`;
+    const paused = block ? Math.max(1, Math.ceil(block.remainingMs / 1000)) : null;
+    const parallel = (config as any)[tier]?.maxParallel;
+    return formatTierStatusLine(formatTierLabel(tier), {
+      enabled: avail,
+      reason,
+      model,
+      pausedSeconds: paused,
+      maxParallel: Number.isFinite(parallel) && parallel > 0 ? parallel : null,
+    });
   }
 
   function redundantSuffix(tier: string): string {
@@ -1225,7 +1234,13 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
         return {
           content: [{
             type: "text",
-            text: `❌ Cannot spawn tier(s): ${bad} — not available right now (disabled or no model configured).\nAvailable tiers: ${["active","t1","t2","t3"].filter(tierAvailable).join(", ")}.\nConfigure with /tmg config.`,
+            // Same line format as the directive so a retry can read the cap
+            // straight off the rejection message. Assembled by a pure helper
+            // so the rejection shape is unit-tested.
+            text: formatUnavailableTiersMessage(
+              bad,
+              (["active", "t1", "t2", "t3"] as const).filter(tierAvailable).map(t => tierStatusLine(t)),
+            ),
           }],
           details: { unavailable: bad, available: ["active","t1","t2","t3"].filter(tierAvailable) },
           isError: true,
@@ -1954,10 +1969,11 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
           .join("\n")
       : "- none";
 
-    const availableTiers = (["active", "t1", "t2", "t3"] as const)
-      .filter(tierAvailable)
-      .map(t => t === "active" ? "active/t0" : t.toUpperCase())
-      .join(", ") || "none";
+    // Mirror the tool description's tier list so the per-turn prompt and the
+    // tool's system-prompt description never disagree. Listing ALL tiers —
+    // not just available ones — lets the coordinator see why a tier is
+    // unavailable (disabled vs no model) and the per-tier parallel cap.
+    const tierLines = (["active", "t1", "t2", "t3"] as const).map(t => tierStatusLine(t)).join("\n");
 
     const proactivePolicy = config.autoSpawn
       ? [
@@ -1974,7 +1990,12 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
     return {
       message: {
         customType: "trimegisto-context",
-        content: `${proactivePolicy}\n\nAvailable tiers: ${availableTiers}. Prefer active/t0 for mass parallel work; T3 mechanical, T2 reasoning, T1 only hard planning.\nActive agents (${activeAgents.length}):\n${agentList}\n\nManual controls: /tmg config, /tmg list, /t0, /t1, /t2, /t3, @t2b <instruction>.`,
+        content: formatDirectiveContent({
+        proactivePolicy,
+        tierLines: tierLines.split("\n"),
+        activeAgentCount: activeAgents.length,
+        activeAgentsFormatted: agentList,
+      }),
         display: false,
       },
     };
