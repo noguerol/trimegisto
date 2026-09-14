@@ -6,6 +6,7 @@
 //
 // Run: node --experimental-strip-types test-loop.ts
 import { LoopSupervisor, DEFAULT_LOOP_CONFIG } from "./src/loop-supervisor.ts";
+import { sanitizeLoopSupervisorConfig } from "./src/config.ts";
 import { setAgentStatus, agentIdleMs } from "./src/agent-manager.ts";
 import type { AgentInstance } from "./src/types.ts";
 
@@ -272,6 +273,28 @@ console.log("Test 12 (turn limit is opt-in and configurable):");
   const s = mk({});
   setAgentStatus(s, "running");
   check("same status is a no-op", s.idleSince === undefined && (s.idleMs || 0) === 0);
+}
+
+// ── turn-limit opt-in cannot be re-enabled by a stale partial push ──
+console.log("Turn-limit opt-in / config drift:");
+{
+  // Mechanism behind the reported symptom: a partial update that omits the flag
+  // PRESERVES the previous value, so a skipped "push the whole object" can leave
+  // the guard ON while the UI shows OFF. These pin the two invariants the fix
+  // relies on.
+  const s = new LoopSupervisor({ enabled: true, turnLimitEnabled: true, maxAgentTurns: 20, turnLimitGrace: 15 });
+  check("hard limit fires while ON", s.checkTurnLimit("a", "active", 36) === true || s.checkTurnLimit("b", "active", 36) === true);
+  s.updateConfig({ maxAgentTurns: 20 });
+  check("a partial update PRESERVES the flag (documented hazard)", s.getConfig().turnLimitEnabled === true);
+  s.updateConfig({ enabled: true, maxSpawnDepth: 5, turnLimitEnabled: false, maxAgentTurns: 20, turnLimitGrace: 15, dedupeCrossAgent: false });
+  check("pushing the whole object turns the limit off", s.getConfig().turnLimitEnabled === false);
+  check("and then it never warns or kills", s.checkTurnLimit("c", "active", 999) === false);
+
+  // sanitizeLoopSupervisorConfig always returns the flag explicitly, so a config
+  // loaded from disk can never be pushed with the field missing.
+  const d = { enabled: true, maxSpawnDepth: 5, turnLimitEnabled: false, maxAgentTurns: 50, turnLimitGrace: 15, dedupeCrossAgent: false };
+  const out: any = sanitizeLoopSupervisorConfig({ maxAgentTurns: 20 }, d);
+  check("sanitized config always carries turnLimitEnabled", typeof out.turnLimitEnabled === "boolean" && out.turnLimitEnabled === false, out.turnLimitEnabled);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
