@@ -96,7 +96,7 @@ Inside a batch, sub-agents can spawn their own workers (`trimegisto_spawn`, batc
 
 ## How it hangs together
 
-Sub-agents talk to the main extension through file-based IPC under a per-instance directory, so several pi processes running Trimegisto at once never interfere. Orphaned directories clean themselves up at startup. Beyond that, read the source or ask the agent — the behaviour is documented by ~700 regression checks that run with `node --experimental-strip-types test-*.ts`.
+Sub-agents talk to the main extension through file-based IPC under a per-instance directory, so several pi processes running Trimegisto at once never interfere. Orphaned directories clean themselves up at startup. Beyond that, read the source or ask the agent — the behaviour is documented by ~900 regression checks that run with `node --experimental-strip-types test-*.ts`.
 
 ## Development
 
