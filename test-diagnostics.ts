@@ -328,5 +328,19 @@ console.log("Embedded credentials (QA: a key pasted into prose was written in cl
   check("a long hyphenated non-credential token survives", redactSecrets({ p: pathy }).p === pathy);
 }
 
+console.log("Short prefixed secrets and credential-shaped object keys (QA leak probe):");
+{
+  const cases: Array<[string, string]> = [
+    ["short sk- secret", "sk-1234567890"],
+    ["short ghp_ secret", "ghp_abc12345"],
+    ["short Bearer token", "Bearer abcd"],
+  ];
+  const dump = JSON.stringify(redactSecrets(Object.fromEntries(cases.map(([n, v]) => [n, v]))));
+  for (const [n, v] of cases) check(`${n} redacted`, !dump.includes(v), dump.slice(0, 200));
+  const keyed = redactSecrets({ "sk-1234567890": "value" } as any);
+  check("a credential used as an OBJECT KEY is redacted", !JSON.stringify(keyed).includes("sk-1234567890"), keyed);
+  check("normal short values survive", redactSecrets({ v: "hello" }).v === "hello");
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

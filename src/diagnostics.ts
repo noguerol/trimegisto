@@ -122,14 +122,29 @@ function looksLikeEmbeddedCredential(token: string): boolean {
   return /[0-9]/.test(token) && /[A-Za-z]/.test(token);
 }
 
+/**
+ * Known credential prefixes. A match here is strong enough that no length floor
+ * is needed: a 13-character `sk-…` is still a key, and the QA leak probe found
+ * exactly that gap (short prefixed secrets passed the `>= 20` check untouched).
+ */
+const PREFIXED_SECRET_RE = /^(sk-|pk-|ghp_|gho_|github_pat_)[A-Za-z0-9._-]{8,}$|^Bearer\s\S+$/;
+
 /** Redact a bare string value that looks like a credential, never prose/paths. */
 function maybeRedactString(value: string): string {
+  if (PREFIXED_SECRET_RE.test(value)) return REDACTED;
   if (value.length >= 20 && looksLikeCredential(value)) return REDACTED;
   if (value.length < 20) return value;
   // A key embedded in prose/URL/header would otherwise land on disk verbatim.
   // Diagnostics exist to be read by a human after a failure, so this file is the
   // one place where over-redacting is the safe direction.
   return value.replace(EMBEDDED_TOKEN_RE, (token) => (looksLikeEmbeddedCredential(token) ? REDACTED : token));
+}
+
+/** A credential used as an OBJECT KEY is data too, not a field name. */
+function maybeRedactKey(key: string): string {
+  if (PREFIXED_SECRET_RE.test(key)) return REDACTED;
+  if (key.length >= 20 && looksLikeCredential(key)) return REDACTED;
+  return key;
 }
 
 function redactInner(value: unknown, depth: number, seen: WeakSet<object>): unknown {
@@ -158,11 +173,12 @@ function redactInner(value: unknown, depth: number, seen: WeakSet<object>): unkn
     seen.add(obj);
     const out: Record<string, unknown> = {};
     for (const key of Object.keys(obj)) {
+      const safeKey = maybeRedactKey(key);
       if (SECRET_KEY_RE.test(key)) {
-        out[key] = REDACTED;
+        out[safeKey] = REDACTED;
         continue;
       }
-      out[key] = redactInner((obj as Record<string, unknown>)[key], depth + 1, seen);
+      out[safeKey] = redactInner((obj as Record<string, unknown>)[key], depth + 1, seen);
     }
     seen.delete(obj);
     return out;
