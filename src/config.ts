@@ -418,6 +418,48 @@ export function formatTierLabel(tier: string): string {
 }
 
 /**
+ * Human-readable label for a model id, used by the dashboard agent list.
+ *
+ *   "deepseek/deepseek-v4-flash"   -> "Deepseek v4 Flash"
+ *   "moonshot/kimi-k3"            -> "Kimi K3"
+ *   "openrouter/anthropic/claude-opus-4" -> "Claude Opus 4"
+ *   "(pi default)" / "" / undefined -> "pi default" / ""
+ *
+ * Takes the last path segment (so provider and local weight paths drop away),
+ * strips common weight extensions and turns separators into spaces. Tokens are
+ * title-cased, except `v<digits>` version prefixes which stay lower-case and
+ * already-mixed/upper-case tokens which are preserved (`ROCmFP4`, `27B`).
+ */
+export function formatModelLabel(model?: string): string {
+  if (!model) return "";
+  let slug = model.trim();
+  if (!slug) return "";
+  if (slug === "(pi default)") return "pi default";
+
+  const slash = slug.lastIndexOf("/");
+  if (slash >= 0) slug = slug.slice(slash + 1);
+  slug = slug.replace(/\.(gguf|ggml|safetensors|bin|pt|onnx)$/i, "");
+  slug = slug.replace(/[-_:]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!slug) return "";
+
+  return slug.split(" ").map(humanizeModelToken).join(" ");
+}
+
+function humanizeModelToken(tok: string): string {
+  if (!tok) return tok;
+  // Version prefixes keep their conventional lower-case form (v4, v2.5).
+  if (/^v\d/i.test(tok)) return tok.toLowerCase();
+  // Preserve acronyms / mixed case coming from the id (ROCmFP4, 27B, GPT).
+  if (/[A-Z]/.test(tok)) return tok;
+  // Short generation markers: k3 -> K3, r1 -> R1, gpt4 -> GPT4.
+  if (/^[a-z]{1,4}\d+$/.test(tok)) return tok.toUpperCase();
+  // Numeric / date-like tokens stay untouched.
+  if (/^\d/.test(tok)) return tok;
+  const lower = tok.toLowerCase();
+  return lower.charAt(0).toUpperCase() + lower.slice(1);
+}
+
+/**
  * Parse an agent ID like "t2b" into { tier: "t2", letter: "b" }
  */
 export function parseAgentId(id: string): { tier: AgentTier; letter: string } | null {

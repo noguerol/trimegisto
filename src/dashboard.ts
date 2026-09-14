@@ -12,9 +12,10 @@ import {
   getAgentCounts,
   getAgents,
   getLoopSupervisor,
+  agentIdleMs,
   type AgentCounts,
 } from "./agent-manager.ts";
-import { formatTierLabel } from "./config.ts";
+import { formatTierLabel, formatModelLabel } from "./config.ts";
 import { speed, MAIN_TARGET, type SpeedSnapshot } from "./speed.ts";
 import { TMG_SHORT, formatTmgStatus } from "./branding.ts";
 
@@ -187,11 +188,23 @@ export function createDashboardWidget(ctx: ExtensionContext) {
         for (const agent of agentList.slice(0, 10)) {
           const dot = theme.fg(statusDot(agent.status), statusIcon(agent.status));
           const label = theme.fg("accent", `${agent.id}`);
-          const elapsed = formatElapsed(Date.now() - agent.startedAt);
+          // Small, dim model label right after the agent id. Falls back to the
+          // requested model until the first response reports the real one.
+          const modelName = formatModelLabel(agent.model || agent.requestedModel);
+          const modelStr = modelName
+            ? theme.fg("dim", ` ${modelName.length > 26 ? modelName.slice(0, 25) + "…" : modelName}`)
+            : "";
+          // Total wall time since the agent started, minus any time it spent in a
+          // terminal/stopped state — so the clock freezes when the agent is done,
+          // errored or killed, and resumes (without jumping) if it comes back.
+          const elapsedMs = (Date.now() - agent.startedAt) - agentIdleMs(agent);
+          const elapsed = formatElapsed(Math.max(0, elapsedMs));
           const timeStr = theme.fg("dim", ` ${elapsed}`);
           const taskPreview = agent.task.length > 50 ? agent.task.slice(0, 50) + "…" : agent.task;
+          // Separate the model from the tier label so the two don't blend.
+          const tierStr = modelName ? ` · ${formatTierLabel(agent.tier)}` : ` ${formatTierLabel(agent.tier)}`;
 
-          let detailLine = `  ${dot} ${label} ${formatTierLabel(agent.tier)}${timeStr}`;
+          let detailLine = `  ${dot} ${label}${modelStr}${tierStr}${timeStr}`;
 
           // Continuous throughput: prefill ↑ and decode ↓, measured live
           if (agent.status === "running" || agent.status === "waiting") {

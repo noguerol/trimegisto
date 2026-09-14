@@ -28,6 +28,7 @@ import { broadcastFileChange, clearAgentContext, setInstanceDir as setContextIns
 import { type LoopSupervisor, type LoopAlert } from "./loop-supervisor.ts";
 import { speed } from "./speed.ts";
 import { isDuplicateTask, registerTask, forgetTask } from "./task-dedup.ts";
+import { classifyLane } from "./plan-graph.ts";
 import { buildSharedContextPreamble } from "./shared-context.ts";
 import {
   ModelHealth,
@@ -87,6 +88,25 @@ function getSubagentExtensionPath(): string {
 
 /** Maps agent IDs to instances */
 const agents = new Map<string, AgentInstance>();
+
+/**
+ * Sticky halt flag. `haltAll()` only kills agents that are running/waiting, so a
+ * halt issued while nothing is running (a queued/deferred wave, or the gap
+ * between two waves) would otherwise kill zero and be silently ignored by any
+ * scheduler that asks "did an agent get killed?". A fresh explicit launch clears
+ * it, because that is the user starting work again.
+ */
+let halted = false;
+
+/** True while a global halt is in force (cleared by the next explicit launch). */
+export function isHalted(): boolean {
+  return halted;
+}
+
+/** Clear the halt flag (called by launchAgent). */
+export function clearHalted(): void {
+  halted = false;
+}
 
 /** Patterns in stderr that signal provider-side exhaustion (quota, rate limit, overload) */
 const PROVIDER_EXHAUSTION_PATTERN = /429|rate.?limit|quota|insufficient|overload|exhausted|capacity|503|payment|billing|usage limit|limit reached|402/i;
@@ -381,6 +401,8 @@ export function launchAgent(
   modelOverride?: string,
   redundantAgents: boolean = false,
 ): AgentInstance {
+  // An explicit launch means the user is starting work again.
+  halted = false;
   const id = nextId(tier);
   const controller = new AbortController();
 
@@ -392,6 +414,7 @@ export function launchAgent(
     startedAt: Date.now(),
     controller,
     output: "",
+    finalOutput: "",
     stderr: "",
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
     parentId,
@@ -459,6 +482,7 @@ export function launchAgent(
       task,
       status: instance.status,
       output: instance.output,
+      finalOutput: instance.finalOutput,
       stderr: instance.stderr,
       usage: instance.usage,
       model: instance.model,
@@ -504,11 +528,18 @@ export function launchAgent(
       instance.log.push(failoverEntry);
       notifyAgentLog(id, failoverEntry);
 
-      // Reset per-attempt state (keep accumulated log/usage for visibility)
-      instance.status = "running";
+      // Reset per-attempt state. Output/finalOutput MUST be cleared too: the
+      // failed attempt's last assistant message would otherwise be reported as
+      // the conclusion of the successful attempt (adversarial QA found this:
+      // a stale attempt-1 verdict survived into buildResult() on failover).
+      // The previous attempt's text stays in `instance.log` for visibility, and
+      // usage stays accumulated on purpose.
+      setAgentStatus(instance, "running");
       instance.stopReason = undefined;
       instance.finishedAt = undefined;
       instance.stderr = "";
+      instance.output = "";
+      instance.finalOutput = "";
       instance.proc = undefined;
       gotFirstResponse = false;
       lastProgressAt = Date.now();
@@ -572,6 +603,7 @@ export function launchAgent(
         if (partialAssistantText.trim()) {
           const partial = partialAssistantText.trim();
           instance.output += partial + "\n";
+          if (!instance.finalOutput) instance.finalOutput = partial;
           const partialEntry: AgentLogEntry = {
             ts: Date.now(),
             level: "output",
@@ -582,7 +614,7 @@ export function launchAgent(
           partialAssistantText = "";
         }
         instance.stderr += `\n${message}`;
-        instance.status = "error";
+        setAgentStatus(instance, "error");
         instance.stopReason = stopReason;
         clearAttemptWatchdogs();
         proc.kill("SIGTERM");
@@ -694,9 +726,11 @@ export function launchAgent(
           }
 
           // Extract text content and log it (verbatim, no truncation)
+          let messageText = "";
           for (const part of msg.content) {
             if (part.type === "text" && part.text) {
               instance.output += part.text + "\n";
+              messageText += part.text + "\n";
               const logEntry: AgentLogEntry = {
                 ts: Date.now(),
                 level: "output",
@@ -706,6 +740,7 @@ export function launchAgent(
               notifyAgentLog(id, logEntry);
             }
           }
+          if (messageText) instance.finalOutput = messageText;
 
           notifyStateChange();
         }
@@ -803,6 +838,7 @@ export function launchAgent(
         if (partialAssistantText.trim()) {
           const partial = partialAssistantText.trim();
           instance.output += partial + "\n";
+          if (!instance.finalOutput) instance.finalOutput = partial;
           const partialEntry: AgentLogEntry = {
             ts: Date.now(),
             level: "output",
@@ -815,10 +851,10 @@ export function launchAgent(
 
         const exitCode = code ?? 0;
         if (exitCode !== 0 && instance.status === "running") {
-          instance.status = "error";
+          setAgentStatus(instance, "error");
           if (!instance.stopReason) instance.stopReason = `exit:${exitCode}`;
         } else if (instance.status === "running") {
-          instance.status = "done";
+          setAgentStatus(instance, "done");
         }
 
         // ── Model health: record success/failure for this attempt BEFORE
@@ -871,7 +907,7 @@ export function launchAgent(
       proc.on("error", (err) => {
         clearAttemptWatchdogs();
 
-        instance.status = "error";
+        setAgentStatus(instance, "error");
         instance.stderr += err.message;
         instance.stopReason = "spawn_error";
         instance.finishedAt = Date.now();
@@ -910,7 +946,7 @@ export function launchAgent(
     const killCurrentProc = () => {
       clearAttemptWatchdogs();
       if (instance.status === "running") {
-        instance.status = "killed";
+        setAgentStatus(instance, "killed");
         instance.stopReason = "killed";
         instance.finishedAt = Date.now();
 
@@ -958,7 +994,7 @@ export function launchAgent(
       // Launch the first attempt on the primary model
       startAttempt(modelsToTry[0] || "");
     } catch (err: any) {
-      instance.status = "error";
+      setAgentStatus(instance, "error");
       instance.stderr = err?.message || String(err);
       instance.stopReason = "launch_error";
       instance.finishedAt = Date.now();
@@ -997,7 +1033,7 @@ export function killAgent(id: string): boolean {
     clearAgentContext(id);
 
     agent.controller.abort();
-    agent.status = "killed";
+    setAgentStatus(agent, "killed");
     agent.stopReason = "killed";
     agent.finishedAt = Date.now();
     if (agent.proc) {
@@ -1017,11 +1053,12 @@ export function killAgent(id: string): boolean {
  * Halt all agents (kill all running/waiting).
  */
 export function haltAll(): number {
+  halted = true;
   let killed = 0;
   for (const [id, agent] of agents) {
     if (agent.status === "running" || agent.status === "waiting") {
       agent.controller.abort();
-      agent.status = "killed";
+      setAgentStatus(agent, "killed");
       agent.stopReason = "halted";
       agent.finishedAt = Date.now();
       if (agent.proc) {
@@ -1145,6 +1182,30 @@ export function processSpawnRequests(
     const tier = request.tier;
     const tc = configs[tier];
 
+    // ── Closed-lane refusal (same policy as the main tool's plan gate) ──
+    // A sub-agent must not be able to launch irreversible work that the user
+    // never approved, however it phrased the request.
+    const lane = classifyLane(request.task);
+    if (lane.lane === "closed") {
+      writeSpawnResponse({
+        requestId: request.requestId,
+        result: {
+          agentId: request.requestId,
+          tier,
+          task: request.task,
+          status: "error",
+          output: "",
+          finalOutput: "",
+          stderr: `⛔ Refused: this task is in the closed lane (${lane.reason}). Irreversible or high-consequence work is never auto-spawned — ask the user to decide.`,
+          stopReason: "closed_lane",
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+          log: [],
+        },
+      });
+      processed++;
+      continue;
+    }
+
     // Tier disabled or missing a model -> fail fast with a clear message
     if (!tc || tc.enabled === false || (tier !== "active" && !tc.model)) {
       writeSpawnResponse({
@@ -1155,6 +1216,7 @@ export function processSpawnRequests(
           task: request.task,
           status: "error",
           output: "",
+          finalOutput: "",
           stderr: `Tier ${formatTierLabel(tier)} is not available (${tc?.enabled === false ? "disabled" : "no model configured"}). The coordinator should only spawn enabled tiers.`,
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
           log: [],
@@ -1177,6 +1239,7 @@ export function processSpawnRequests(
           task: request.task,
           status: "error",
           output: "",
+          finalOutput: "",
           stderr: formatModelBlockMessage(modelBlock, formatTierLabel(tier)),
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
           log: [],
@@ -1201,6 +1264,7 @@ export function processSpawnRequests(
           task: request.task,
           status: "error",
           output: "",
+          finalOutput: "",
           stderr: `Cannot spawn ${formatTierLabel(tier)}: max parallel limit reached (${running}/${capacity} agents active across ${poolSize} model(s)). Wait for running agents to complete, or increase the limit via /tmg config.`,
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
           log: [],
@@ -1222,6 +1286,7 @@ export function processSpawnRequests(
             task: request.task,
             status: "done",
             output: `⏭ Skipped: near-duplicate of already-spawned work${dedupe.matchedTier ? ` [${dedupe.matchedTier}]` : ""}: "${(dedupe.matchedTask || "").slice(0, 120)}". Reuse that agent's result instead.`,
+            finalOutput: "",
             stderr: "",
             usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
             model: undefined,
@@ -1278,6 +1343,7 @@ export function processSpawnRequests(
             task: agent.task,
             status: agent.status,
             output: agent.output,
+            finalOutput: agent.finalOutput,
             stderr: agent.stderr,
             usage: agent.usage,
             model: agent.model,
@@ -1295,6 +1361,7 @@ export function processSpawnRequests(
           task: request.task,
           status: "error",
           output: "",
+          finalOutput: "",
           stderr: err?.message || String(err),
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
           log: [],
@@ -1380,7 +1447,7 @@ export function sendToAgent(
   // Kill the existing agent process if still running
   if (existing.status === "running" || existing.status === "waiting") {
     existing.controller.abort();
-    existing.status = "killed";
+    setAgentStatus(existing, "killed");
     existing.stopReason = "replaced";
     existing.finishedAt = Date.now();
     if (existing.proc) {
@@ -1421,13 +1488,50 @@ function formatDuration(ms: number): string {
   return `${mins}m${secs}s`;
 }
 
+/** Terminal states: the agent is no longer progressing (clock frozen). */
+function isTerminalStatus(s: AgentStatus): boolean {
+  return s === "done" || s === "error" || s === "killed";
+}
+
+/**
+ * Transition an agent to a new status, keeping the dashboard clock honest:
+ * the clock freezes while the agent is in a terminal state (done/error/killed)
+ * and resumes — without jumping backwards — if it ever returns to an active
+ * state (running/waiting). Maintains idleMs / idleSince on the agent.
+ */
+export function setAgentStatus(agent: AgentInstance, next: AgentStatus): void {
+  if (agent.status === next) return;
+  const wasTerminal = isTerminalStatus(agent.status);
+  const nextTerminal = isTerminalStatus(next);
+  if (wasTerminal && !nextTerminal) {
+    // Resume: fold the frozen interval into idleMs so the clock continues from
+    // where it stopped (the stopped gap is not counted again).
+    if (agent.idleSince !== undefined) {
+      agent.idleMs = (agent.idleMs || 0) + (Date.now() - agent.idleSince);
+      agent.idleSince = undefined;
+    }
+  } else if (!wasTerminal && nextTerminal) {
+    // Stop: start accumulating frozen time.
+    agent.idleSince = Date.now();
+  }
+  agent.status = next;
+}
+
+/** Total time (ms) the agent has spent in a terminal/stopped state so far. */
+export function agentIdleMs(agent: AgentInstance): number {
+  let ms = agent.idleMs || 0;
+  if (agent.idleSince !== undefined) ms += Date.now() - agent.idleSince;
+  return ms;
+}
+
 /**
  * Format agent status for display.
  */
 export function formatAgentStatus(agent: AgentInstance): string {
   const label = formatTierLabel(agent.tier);
+  // Guard against clock skew (startedAt in the future) the same way the dashboard does.
   const duration = formatDuration(
-    (agent.finishedAt || Date.now()) - agent.startedAt
+    Math.max(0, (Date.now() - agent.startedAt) - agentIdleMs(agent))
   );
 
   let statusIcon: string;

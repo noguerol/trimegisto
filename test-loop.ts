@@ -6,6 +6,8 @@
 //
 // Run: node --experimental-strip-types test-loop.ts
 import { LoopSupervisor, DEFAULT_LOOP_CONFIG } from "./src/loop-supervisor.ts";
+import { setAgentStatus, agentIdleMs } from "./src/agent-manager.ts";
+import type { AgentInstance } from "./src/types.ts";
 
 const CONTRACT = `Clause 12.1 - Prestation terms. The contractor shall provide the services described in Annex A
 for a total consideration of EUR 240,000 payable in four equal instalments. Any delay in payment
@@ -216,6 +218,60 @@ console.log("Test 12 (turn limit is opt-in and configurable):");
   on.updateConfig({ turnLimitEnabled: true });
   on.registerSpawn("t2c", "t2");
   check("re-enabled at runtime: respects configured turns", on.checkTurnLimit("t2c", "t2", 12) === false && on.checkTurnLimit("t2c", "t2", 13) === true);
+}
+
+// ── Test: agent clock stops on stop, resumes on resume ─────
+{
+  const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+  const mk = (over: Partial<AgentInstance>): AgentInstance => ({
+    id: "t2a", tier: "t2", task: "t", status: "running", startedAt: Date.now(),
+    controller: new AbortController(), output: "", stderr: "", log: [],
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+    ...over,
+  } as AgentInstance);
+  const elapsed = (a: AgentInstance) => (Date.now() - a.startedAt) - agentIdleMs(a);
+
+  console.log("Test (agent clock stops on stop, resumes on resume):");
+  const a = mk({});
+  check("active agent has zero idle", agentIdleMs(a) === 0);
+
+  // Active for ~50ms, then finish: clock must freeze.
+  await sleep(50);
+  const activeMs = Date.now() - a.startedAt;
+  setAgentStatus(a, "done");
+  const e1 = elapsed(a);
+  await sleep(40);
+  const e2 = elapsed(a);
+  check("done agent clock is frozen", Math.abs(e2 - e1) < 15, { e1, e2 });
+  check("done agent elapsed ~= its active time", e1 >= activeMs - 20 && e1 <= activeMs + 20, { e1, activeMs });
+
+  // Resume: clock continues from where it stopped (no jump backwards) and ticks again.
+  setAgentStatus(a, "running");
+  check("resume clears the frozen interval", a.idleSince === undefined);
+  const e3 = elapsed(a);
+  check("resume does not jump the clock backwards", e3 >= e1 - 15, { e1, e3 });
+  await sleep(40);
+  const e4 = elapsed(a);
+  check("clock ticks again after resume", e4 > e3, { e3, e4 });
+
+  // A second stop/resume cycle adds more idle (total idle keeps growing).
+  const idleBefore = a.idleMs || 0;
+  setAgentStatus(a, "error");
+  await sleep(30);
+  setAgentStatus(a, "running");
+  check("second stop/resume adds idle", (a.idleMs || 0) > idleBefore, { idleBefore, idleMs: a.idleMs });
+
+  // Terminal -> terminal does not double-count or reset idle.
+  const t = mk({});
+  setAgentStatus(t, "done");
+  const ti = agentIdleMs(t);
+  setAgentStatus(t, "killed");
+  check("terminal->terminal keeps accumulating idle", agentIdleMs(t) >= ti && t.idleSince !== undefined);
+
+  // Same-status transition is a no-op.
+  const s = mk({});
+  setAgentStatus(s, "running");
+  check("same status is a no-op", s.idleSince === undefined && (s.idleMs || 0) === 0);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

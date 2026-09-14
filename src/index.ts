@@ -23,6 +23,7 @@ import {
 import {
   launchAgent,
   haltAll,
+  isHalted,
   getAgent,
   getAgentCounts,
   getActiveAgents,
@@ -43,9 +44,14 @@ import {
   getTierModelBlock,
   formatModelBlockMessage,
 } from "./agent-manager.ts";
-import { dedupeTaskBatch, registerTask, forgetTask } from "./task-dedup.ts";
+import { isDuplicateTask, registerTask, forgetTask } from "./task-dedup.ts";
 import { saveConfig as persistConfig, loadConfig } from "./persistence.ts";
 import { cleanupOldNotifications } from "./context-broker.ts";
+import { reconcileBatch, decideBatchSettle, distillConclusion } from "./reconcile.ts";
+import { planBatch, type PlanNode, type PlanTaskInput } from "./plan-graph.ts";
+import { advanceWaves } from "./wave-scheduler.ts";
+import { ProviderDiagnostics, diagnosticsEnabledFromEnv } from "./diagnostics.ts";
+import { pruneContextMessages, MAX_PROGRESS_MESSAGES } from "./context-prune.ts";
 import { LoopSupervisor, type LoopAlert } from "./loop-supervisor.ts";
 import { ModelHealth, sanitizeModelHealthConfig, MODEL_HEALTH_DEFAULTS } from "./model-health.ts";
 import { speed, MAIN_TARGET } from "./speed.ts";
@@ -103,10 +109,24 @@ const TierEnum = StringEnum(["active", "t1", "t2", "t3"] as const, {
   description: "Tier. Default active. Use only enabled tiers.",
 });
 
+const LaneEnum = StringEnum(["open", "gated", "closed"] as const, {
+  description: "Blast-radius lane. 'closed' = irreversible/high-consequence (deploy, migrate, drop, force-push, credentials) and is REFUSED: ask the user to decide instead. 'gated' = wide but reversible (shared utils, schema, public API, config). 'open' = contained/reversible (default).",
+});
+
 const TrimegistoTaskItem = Type.Object({
   tier: Type.Optional(TierEnum),
-  task: Type.String({ description: "Agent task" }),
+  task: Type.String({ description: "Agent task (one bounded unit of work, one input in, one output out)." }),
   cwd: Type.Optional(Type.String({ description: "Agent cwd" })),
+  needs: Type.Optional(Type.Array(Type.Number(), {
+    description: "1-based indices of OTHER tasks in THIS same call whose output this task consumes. Declare an edge only if this task genuinely reads their result; two tasks with no edge run in parallel. Example: needs: [1,2].",
+  })),
+  why: Type.Optional(Type.String({
+    description: "One line: which part of the overall goal this task serves. Required in practice — a task that cannot name its need should not be spawned.",
+  })),
+  writes: Type.Optional(Type.Array(Type.String(), {
+    description: "Files this task will write. Two tasks writing the same file are serialised automatically instead of racing.",
+  })),
+  lane: Type.Optional(LaneEnum),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -136,14 +156,406 @@ export default function (pi: ExtensionAPI) {
    * extension context. pi correctly rejects calls through that stale API; never
    * let those late callbacks crash the host process.
    */
-  function safeSendMessage(message: any): void {
+  function safeSendMessage(message: any, options?: any): void {
     if (disposed) return;
     try {
-      pi.sendMessage(message);
+      pi.sendMessage(message, options);
     } catch {
       // Stale pi context after /reload/session replacement; ignore late log.
     }
   }
+
+  /**
+   * TUI-only extension entry. Unlike pi.sendMessage(), custom entries do NOT
+   * participate in LLM context, so live agent progress can stream into the
+   * transcript without flooding the main model's conversation (which is what
+   * makes the coordinator's requests fail with provider 400s). The single
+   * reconciliation message is the only Trimegisto output that reaches the model.
+   */
+  function safeAppendEntry(customType: string, data: unknown): void {
+    if (disposed) return;
+    try {
+      pi.appendEntry(customType, data);
+    } catch {
+      // Stale pi context after /reload/session replacement; ignore late entry.
+    }
+  }
+
+  // ── Guaranteed reconciliation: session-wide batch registry ───────────────
+  // Every trimegisto batch registers here. A batch settles EXACTLY ONCE and
+  // always emits one deterministic conclusion, however the agents end:
+  // resolved, killed, watchdog-terminated, or past the hard deadline. This is
+  // what makes Trimegisto always reconcile instead of leaving fragments around.
+  interface PendingBatch {
+    id: string;
+    startedAt: number;
+    deadlineAt: number;
+    agentIds: string[];
+    skipped: { task: string; tier: string; matchedTask: string; matchedTier?: string }[];
+    results: Map<string, any>;
+    settled: boolean;
+    // ── plan-graph state (dependency-aware waves) ──
+    /** Overall objective the batch must advance (from the coordinator). */
+    goal?: string;
+    cwd: string;
+    /** Launched waves, each a list of plan nodes that run in parallel. */
+    waves: PlanNode[][];
+    /** Index of the wave currently in flight; -1 before the first one. */
+    currentWave: number;
+    /** Agent ids belonging to the CURRENT wave (terminality is per wave). */
+    waveAgentIds: string[];
+    /** plan index (1-based) -> normalised task spec {tier, task, cwd}. */
+    taskByIndex: Map<number, any>;
+    /** plan index -> agent id actually launched for it. */
+    nodeAgent: Map<number, string>;
+    /** plan indexes that were launched at least once. */
+    launched: Set<number>;
+    taskDetails: any[];
+    /** Deterministic plan-gate summary, echoed to the coordinator. */
+    planSummary: string;
+  }
+  const pendingBatches: PendingBatch[] = [];
+  let batchSeq = 0;
+  /** Max chars of an upstream verdict carried across a dependency edge. */
+  const UPSTREAM_VERDICT_CHARS = 700;
+  const BATCH_DEADLINE_MS = (() => {
+    const raw = Number(process.env.TRIMEGISTO_BATCH_DEADLINE_MS);
+    return Number.isFinite(raw) && raw > 0 ? Math.max(60_000, raw) : 30 * 60_000;
+  })();
+
+  /** Normalize an AgentResult or an AgentInstance into the reconciler shape. */
+  function toRecon(a: any): any {
+    return {
+      agentId: a.agentId ?? a.id ?? "?",
+      tier: a.tier ?? "?",
+      task: a.task ?? "",
+      status: a.status ?? "killed",
+      output: a.output ?? "",
+      finalOutput: a.finalOutput ?? "",
+      stderr: a.stderr ?? "",
+      stopReason: a.stopReason,
+      usage: a.usage,
+    };
+  }
+
+  /**
+   * Settle a batch: build the deterministic reconciliation from whatever is
+   * known (captured results, live agent state, or an explicit "never reported"
+   * placeholder) and deliver it as ONE message. Must be idempotent.
+   */
+  function settleBatch(batch: PendingBatch, reason: string): void {
+    if (batch.settled) return;
+    batch.settled = true;
+
+    const results = batch.agentIds.map((id) => {
+      const captured = batch.results.get(id);
+      if (captured) return toRecon(captured);
+      const live = getAgent(id);
+      if (live) return toRecon(live);
+      return {
+        agentId: id,
+        tier: "?",
+        task: "",
+        status: "killed",
+        output: "",
+        finalOutput: "",
+        stderr: `agent ${id} never reported a result`,
+        stopReason: "no_result",
+        usage: { turns: 0, input: 0, output: 0, cost: 0 },
+      };
+    });
+
+    // Nodes the scheduler never got to launch (deadline, halt, capacity) must
+    // appear in the conclusion as incomplete instead of vanishing silently.
+    for (const wave of batch.waves) {
+      for (const node of wave) {
+        if (batch.launched.has(node.index)) continue;
+        const spec = batch.taskByIndex.get(node.index);
+        results.push({
+          agentId: `#${node.index}`,
+          tier: spec?.tier ?? "?",
+          task: spec?.task ?? node.task,
+          status: "error",
+          output: "",
+          finalOutput: "",
+          stderr: "not launched (the batch stopped before this wave)",
+          stopReason: "not_launched",
+          usage: { turns: 0, input: 0, output: 0, cost: 0 },
+        });
+      }
+    }
+
+    let markdown: string;
+    let headline: string;
+    try {
+      const out = reconcileBatch(results, {
+        batchId: batch.id.replace(/^batch-/, ""),
+        startedAt: batch.startedAt,
+        now: Date.now(),
+        skipped: batch.skipped,
+      });
+      markdown = out.markdown;
+      headline = out.headline;
+    } catch (err: any) {
+      // The reconciliation itself must never be why the user gets no answer.
+      const done = results.filter((r: any) => r.status === "done").length;
+      headline = `${done}/${results.length} done (fallback reconciliation)`;
+      const lines: string[] = [
+        "## 🪡 Trimegisto — final reconciliation (fallback)",
+        "",
+        `Batch \`${batch.id}\` settled (${reason}) but the reconciler failed: ${err?.message || String(err)}`,
+        "",
+      ];
+      for (const r of results) {
+        lines.push(`- **${r.agentId}** [${r.tier}] — ${r.status}: ${(r.task || "").slice(0, 120)}`);
+      }
+      lines.push("", `**Trimegisto conclusion:** ${done}/${results.length} agents completed.`);
+      markdown = lines.join("\n");
+    }
+
+    const idx = pendingBatches.indexOf(batch);
+    if (idx >= 0) pendingBatches.splice(idx, 1);
+
+    // The message is rendered the instant it is sent, so the user always gets
+    // the conclusion even if the main model's next request fails. followUp +
+    // triggerTurn asks for exactly ONE reconciling turn without interrupting
+    // work that is still in flight.
+    safeSendMessage(
+      {
+        customType: "trimegisto-results",
+        content: markdown,
+        display: true,
+        details: { batchId: batch.id, reason },
+      },
+      { deliverAs: "followUp", triggerTurn: true },
+    );
+    try { ctxRef?.ui?.notify(`Trimegisto: ${headline}`, "info"); } catch { /* no UI */ }
+  }
+
+  // ── Dependency-aware wave scheduler ───────────────────────────────────────
+  // The plan gate decides WHICH nodes exist and their order; this decides WHEN
+  // each one runs. A wave is launched only when the previous wave is terminal,
+  // so a declared edge really carries data (the upstream verdict is prepended
+  // to the dependent task) instead of being cosmetic.
+  function tierCapacity(tier: AgentTier): number {
+    return config[tier].maxParallel * Math.max(1, getModelPool(config[tier], config.redundantAgents).length);
+  }
+
+  function zeroUsage() {
+    return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
+  }
+
+  /** Verdicts crossing a dependency edge, bounded so a wave cannot explode. */
+  function buildUpstreamBlock(node: PlanNode, batch: PendingBatch): string {
+    if (!node.needs || node.needs.length === 0) return "";
+    const parts: string[] = [];
+    for (const dep of node.needs) {
+      const agentId = batch.nodeAgent.get(dep);
+      if (!agentId) continue;
+      // `agent-manager`'s close handler calls notifyStateChange() (which drives
+      // this scheduler) BEFORE instance.resolve(), so the captured result may not
+      // be in `batch.results` yet when the next wave launches. Fall back to the
+      // live agent, which is already terminal and holds its finalOutput — without
+      // this the edge would inject "(no result reported)" in the common path.
+      const source = batch.results.get(agentId) ?? getAgent(agentId);
+      const verdict = source ? distillConclusion(toRecon(source), UPSTREAM_VERDICT_CHARS) : "(no result reported)";
+      parts.push(`- upstream #${dep} ${agentId} [${source?.status ?? "unknown"}]: ${verdict}`);
+    }
+    if (parts.length === 0) return "";
+    return `Upstream results from this Trimegisto batch (you depend on them — build on them, do not re-derive):\n${parts.join("\n")}\n\n`;
+  }
+
+  /** Every agent of the CURRENT wave reached a terminal state. */
+  function waveFinished(batch: PendingBatch): boolean {
+    if (batch.waveAgentIds.length === 0) return true;
+    const statuses: Record<string, string | undefined> = {};
+    for (const id of batch.waveAgentIds) statuses[id] = getAgent(id)?.status;
+    // Single source of truth for "terminal": the tested pure decision helper.
+    return decideBatchSettle(
+      batch.waveAgentIds,
+      statuses,
+      new Set(batch.results.keys()),
+      Date.now(),
+      Number.POSITIVE_INFINITY,
+    ).settle;
+  }
+
+  /**
+   * Launch one wave. Returns false (without launching anything) when the tier
+   * capacity is not available yet, so the caller can retry on the next sweep
+   * instead of half-launching or failing the batch.
+   */
+  function launchWave(batch: PendingBatch, wave: PlanNode[]): boolean {
+    if (!wave || wave.length === 0) return true;
+
+    // Pre-check capacity for the WHOLE wave: never half-launch a wave.
+    const projected: Record<string, number> = { active: 0, t1: 0, t2: 0, t3: 0 };
+    for (const node of wave) {
+      const tier = (batch.taskByIndex.get(node.index)?.tier as AgentTier) || "active";
+      if (tierHasModel(tier)) projected[tier] = (projected[tier] || 0) + 1;
+    }
+    const counts = getAgentCounts();
+    for (const tier of ["active", "t1", "t2", "t3"] as const) {
+      const n = projected[tier] || 0;
+      if (n === 0) continue;
+      // Keep the swarm guard's spawn-depth check in the loop (it used to live in
+      // the pre-flight capacity check that the wave scheduler replaced).
+      if (!canSpawnPooled(tier, config[tier], config.redundantAgents, undefined, spawnModelOverride(tier))) return false;
+      const inFlight = counts[tier].running + counts[tier].waiting;
+      if (inFlight + n > tierCapacity(tier)) return false;
+    }
+
+    batch.waveAgentIds = [];
+    for (const node of wave) {
+      // Defense in depth: one node index must never spawn twice. Today this is
+      // guaranteed by `currentWave` monotonicity, but that guarantee is emergent;
+      // making it local means a future refactor cannot silently double-spawn.
+      if (batch.launched.has(node.index)) {
+        // Already launched: keep it inside this wave's terminality set so
+        // waveFinished still covers the whole wave.
+        const known = batch.nodeAgent.get(node.index);
+        if (known) batch.waveAgentIds.push(known);
+        continue;
+      }
+      const spec = batch.taskByIndex.get(node.index);
+      const tier: AgentTier = (spec?.tier as AgentTier) || "active";
+      const taskText = spec?.task ?? node.task;
+      const syntheticId = `#${node.index}-${node.task.slice(0, 24)}`;
+
+      if (!tierHasModel(tier)) {
+        const agentId = `err-${tier}-${batch.agentIds.length + 1}`;
+        batch.agentIds.push(agentId);
+        batch.waveAgentIds.push(agentId);
+        batch.launched.add(node.index);
+        batch.results.set(agentId, {
+          agentId,
+          tier,
+          task: taskText,
+          status: "error",
+          output: "",
+          finalOutput: "",
+          stderr: `No model configured for ${formatTierLabel(tier)}.`,
+          stopReason: "no_model",
+          usage: zeroUsage(),
+        });
+        batch.taskDetails.push({ agentId, tier, task: taskText, status: "error", wave: node.wave, needs: node.needs });
+        continue;
+      }
+
+      let taskModelOverride = spawnModelOverride(tier);
+      if (config.redundantAgents && tier !== "active") {
+        const pool = getModelPool(config[tier], true);
+        const pick = selectAvailableModel(tier, pool, config[tier].maxParallel);
+        if (pick) taskModelOverride = pick;
+      }
+
+      const upstream = buildUpstreamBlock(node, batch);
+      const launchTaskText = upstream ? `${upstream}${taskText}` : taskText;
+
+      try {
+        // Register the ORIGINAL task text (not the upstream preamble) so the
+        // cross-call dedup registry keeps comparing like with like.
+        if (config.dedupeTasks) registerTask(tier, taskText);
+        const agent = launchAgent(tier, launchTaskText, config[tier], spec?.cwd || batch.cwd, undefined, taskModelOverride, config.redundantAgents);
+        batch.agentIds.push(agent.id);
+        batch.waveAgentIds.push(agent.id);
+        batch.nodeAgent.set(node.index, agent.id);
+        batch.launched.add(node.index);
+        batch.taskDetails.push({
+          agentId: agent.id,
+          tier: agent.tier,
+          task: taskText,
+          status: agent.status,
+          wave: node.wave,
+          needs: node.needs,
+        });
+        // Hand the ORIGINAL task text to the result collector. The launched text
+        // carries the upstream preamble, and using it downstream breaks two
+        // things: `forgetTask(result.task)` no longer matches the string that
+        // `registerTask` stored (so a legitimate retry is blocked as a duplicate
+        // for the whole 5-minute window), and the reconciliation would print the
+        // injected preamble in the task column.
+        agent.resolve = (result) => recordResult(batch, { ...result, task: taskText });
+      } catch (err: any) {
+        const agentId = syntheticId;
+        // The task was registered just before launchAgent; a launch failure must
+        // unregister it or the next legitimate retry is rejected as a duplicate.
+        if (config.dedupeTasks) forgetTask(taskText);
+        batch.agentIds.push(agentId);
+        batch.waveAgentIds.push(agentId);
+        batch.launched.add(node.index);
+        batch.results.set(agentId, {
+          agentId,
+          tier,
+          task: taskText,
+          status: "error",
+          output: "",
+          finalOutput: "",
+          stderr: `Launch failed: ${err?.message || String(err)}`,
+          stopReason: "launch_error",
+          usage: zeroUsage(),
+        });
+        batch.taskDetails.push({ agentId, tier, task: taskText, status: "error", wave: node.wave, needs: node.needs });
+      }
+    }
+    return true;
+  }
+
+  function recordResult(batch: PendingBatch, result: any): void {
+    if (batch.settled) return;
+    // Allow a legitimate retry if the accepted spawn failed outright
+    if (result.status === "error" || result.status === "killed") forgetTask(result.task);
+    batch.results.set(result.agentId, result);
+    advanceBatch(batch);
+  }
+
+  /**
+   * Drive a batch across its waves and settle it exactly once at the end.
+   *
+   * The loop, the "one wave at a time" rule and the RE-ENTRANCY guard live in
+   * `src/wave-scheduler.ts` (tested directly by `test-wave-scheduler.ts`); this
+   * adapter only injects the batch's facts and effects. Re-entrancy is real:
+   * `launchAgent` calls `notifyStateChange()` synchronously while registering the
+   * agent, which drives the state-change callback back through `sweepBatches`
+   * before `currentWave` has advanced.
+   */
+  function advanceBatch(batch: PendingBatch): void {
+    advanceWaves(batch, {
+      waveCount: batch.waves.length,
+      isCurrentWaveTerminal: (currentWave) => (currentWave < 0 ? true : waveFinished(batch)),
+      isStopped: () => batch.waveAgentIds.some((id) => {
+        // Read the LIVE agent state too: a kill without a close event never
+        // produces a captured result.
+        const r = batch.results.get(id);
+        const live = getAgent(id);
+        const status = r?.status ?? live?.status;
+        const stopReason = r?.stopReason ?? live?.stopReason;
+        return status === "killed" || stopReason === "halted" || stopReason === "killed";
+      }),
+      isHalted: () => isHalted(),
+      isEnabled: () => config.enabled,
+      isDeadlineReached: () => Date.now() >= batch.deadlineAt,
+      launchWave: (waveIndex) => launchWave(batch, batch.waves[waveIndex]),
+      settle: (reason) => settleBatch(batch, reason),
+    });
+  }
+
+  /** Settle every batch whose current wave is done, or that passed its deadline. */
+  function sweepBatches(): void {
+    if (pendingBatches.length === 0) return;
+    for (const batch of [...pendingBatches]) {
+      if (batch.settled) continue;
+      try { advanceBatch(batch); } catch { /* never break the host on a sweep */ }
+    }
+  }
+
+  // Safety net for agents killed without a close event (killAgent/haltAll) and
+  // for batches whose watchdog is disabled: never leave a batch unsettled.
+  const batchSweepInterval = setInterval(() => {
+    if (disposed) return;
+    try { sweepBatches(); } catch { /* never crash the session on a sweep */ }
+  }, 2000);
+  (batchSweepInterval as any).unref?.();
 
   // ── Model health (circuit breaker) ─────────────────────
   // Pauses spawns on a model that keeps failing at the provider level, so a
@@ -158,10 +570,8 @@ export default function (pi: ExtensionAPI) {
 
   modelHealth.setOnTrip((entry, info) => {
     const secs = Math.max(1, Math.ceil(info.remainingMs / 1000));
-    safeSendMessage({
-      customType: "trimegisto-log",
-      content: `🚫 **[Trimegisto model health]** ${entry.model} paused after ${entry.failures} model-level failure(s) — ${entry.lastReason || "provider error"}. Spawns on it are refused for ~${secs}s. Switch model via /tmg config or clear with /tmg reset-models.`,
-      display: true,
+    safeAppendEntry("trimegisto-log", {
+      text: `🚫 **[Trimegisto model health]** ${entry.model} paused after ${entry.failures} model-level failure(s) — ${entry.lastReason || "provider error"}. Spawns on it are refused for ~${secs}s. Switch model via /tmg config or clear with /tmg reset-models.`,
     });
     try {
       if (ctxRef?.hasUI) ctxRef.ui.notify(`Model ${entry.model} paused (~${secs}s): spawns refused`, "error");
@@ -219,10 +629,8 @@ export default function (pi: ExtensionAPI) {
     const isTurn = alert.type === "turn_limit";
     const emoji = isDup ? "♻️" : isTurn ? "⏳" : "🚧";
     const label = isDup ? "Redundancy" : isTurn ? "Turn limit" : "Spawn depth";
-    safeSendMessage({
-      customType: "trimegisto-log",
-      content: `${emoji} **[Trimegisto ${label}]** ${alert.message}`,
-      display: true,
+    safeAppendEntry("trimegisto-log", {
+      text: `${emoji} **[Trimegisto ${label}]** ${alert.message}`,
     });
     try {
       if (ctxRef?.hasUI) {
@@ -285,11 +693,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
     if (lines.length > 0) {
-      safeSendMessage({
-        customType: "trimegisto-log",
-        content: lines.join("\n"),
-        display: true,
-      });
+      safeAppendEntry("trimegisto-log", { text: lines.join("\n") });
       // Force TUI re-render so messages appear immediately
       try {
         if (ctxRef?.hasUI) {
@@ -592,6 +996,9 @@ export default function (pi: ExtensionAPI) {
       tierStatusLine("t2"),
       tierStatusLine("t3"),
       "Default active/t0 = main pi model; prefer several active agents for mass parallel work across DIFFERENT files/areas.",
+      "PLAN CONTRACT (this is what keeps cost down): always pass `goal` (the overall objective) and, per task, `why` (the part of the goal it serves). Declare `needs: [i]` ONLY when a task really reads another task's output — a declared edge runs in waves and the upstream verdict is injected into the dependent task; tasks WITHOUT an edge run in parallel. Declare `writes: [paths]` when you know the files a task will write: writers of the same file are serialised automatically. Pass `lane` only to override the automatic blast-radius lane.",
+      "A deterministic plan gate runs BEFORE anything is spawned: it merges near-duplicate tasks inside the batch, serialises same-file writers, warns when a task looks like a pure code transformation (do it with bash instead of a model), warns when `needs` reads like a pipeline step but no edge was declared, and REFUSES the batch when any task lands in the closed lane (irreversible/high-consequence: deletions, deploy, publish, migrations, production data, credentials). Design the graph, never a flat pile: parallel only what is independent, serialise what is not, and never re-spawn work already in flight.",
+      "When a batch settles, Trimegisto sends ONE deterministic reconciliation (per-agent verdicts, status counts, overlaps, INCOMPLETE list). When you receive it, write the unified final answer for the user; do not re-spawn the same work, and do not answer before it arrives.",
       "Roles: active=t0 mass worker; t3=mechanical; t2=reasoning; t1=deep planning only.",
       "Only spawn ✓ ENABLED tiers; ✗ unavailable fails. IDs: t0a,t1a,t2b,t3c... Disabled tool returns error.",
     ].join("\n");
@@ -606,8 +1013,11 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "TRIMEGISTO ACTIVE: spawn parallel agents before decomposable work. After launch, never sleep/poll to wait; continue work or call trimegisto_harvest. Default tier active; use only ENABLED tiers.",
     parameters: Type.Object({
       tasks: Type.Array(TrimegistoTaskItem, {
-        description: "Tasks. Max 8. Default tier active.",
+        description: "Tasks. Max 8. Default tier active. Tasks without a 'needs' edge run in parallel; declared dependencies are executed in waves.",
       }),
+      goal: Type.Optional(Type.String({
+        description: "The overall objective this batch must advance. Used by the plan gate to check that every task serves a real need.",
+      })),
       cwd: Type.Optional(Type.String({ description: "Shared cwd" })),
     }),
 
@@ -652,18 +1062,26 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // ── Pre-launch dedup: skip near-duplicate tasks ──────────
+      // ── Pre-launch registry dedup (cross-call, check-only) ───
+      // Compared against tasks spawned in the last few minutes. A duplicate is
+      // NOT registered so it can still be retried later. Original 1-based
+      // indices are preserved in `remap` so the coordinator's `needs` still line
+      // up with what it proposed.
       const dedupedTasks: any[] = [];
       const skippedTasks: { task: string; tier: string; matchedTask: string; matchedTier?: string }[] = [];
-      if (config.dedupeTasks) {
-        const batch = dedupeTaskBatch(params.tasks as any);
-        dedupedTasks.push(...batch.accepted);
-        for (const s of batch.skipped) {
-          skippedTasks.push({ task: s.task, tier: s.tier, matchedTask: s.matchedTask, matchedTier: s.matchedTier });
+      const origToKept = new Map<number, number>();
+      params.tasks.forEach((t: any, i: number) => {
+        const origIndex = i + 1;
+        if (config.dedupeTasks) {
+          const dup = isDuplicateTask(t.task);
+          if (dup.duplicate) {
+            skippedTasks.push({ task: t.task, tier: t.tier, matchedTask: dup.matchedTask ?? "", matchedTier: dup.matchedTier });
+            return;
+          }
         }
-      } else {
-        dedupedTasks.push(...params.tasks);
-      }
+        origToKept.set(origIndex, dedupedTasks.length + 1);
+        dedupedTasks.push(t);
+      });
 
       if (dedupedTasks.length === 0) {
         return {
@@ -671,10 +1089,96 @@ export default function (pi: ExtensionAPI) {
             type: "text",
             text: `⏭ All ${params.tasks.length} task(s) are near-duplicates of already-spawned work:\n` +
               skippedTasks.map(s => `  - "${s.task.slice(0, 80)}" ≈ "${s.matchedTask.slice(0, 80)}"${s.matchedTier ? ` [${s.matchedTier}]` : ""}`).join("\n") +
-              `\n\nNo new agents launched. The original agents' results are already being harvested.`,
+              `\n\nNo new agents launched. The original agents' results are already being reconciled.`,
           }],
           details: { tasks: [], skipped: skippedTasks },
         };
+      }
+
+      // ── Plan gate: validate the batch as a GRAPH before spending anything ──
+      // Which nodes exist, which are duplicates, which must be serialised and
+      // which must not run at all. Deterministic and model-free.
+      const droppedNeeds: string[] = [];
+      const planInputs: PlanTaskInput[] = dedupedTasks.map((t: any, i: number) => {
+        const declared = Array.isArray(t.needs) ? t.needs : [];
+        const needs: number[] = [];
+        for (const raw of declared) {
+          const n = Number(raw);
+          const mapped = origToKept.get(n);
+          if (!Number.isFinite(n)) continue;
+          if (mapped === undefined) {
+            droppedNeeds.push(`task #${i + 1} declared a dependency on #${n}, which was skipped as already-spawned work — the edge was dropped`);
+          } else if (!needs.includes(mapped)) {
+            needs.push(mapped);
+          }
+        }
+        return {
+          task: String(t.task ?? ""),
+          needs: needs.length > 0 ? needs : undefined,
+          why: typeof t.why === "string" ? t.why : undefined,
+          writes: Array.isArray(t.writes) ? t.writes.map(String) : undefined,
+          lane: t.lane,
+          cwd: t.cwd,
+        } as PlanTaskInput;
+      });
+
+      const planGoal = typeof params.goal === "string" && params.goal.trim() ? params.goal.trim() : undefined;
+      const plan = planBatch(planInputs, planGoal ? { goal: planGoal, maxTasks: 8 } : { maxTasks: 8 });
+      const planDetails = {
+        accept: plan.accept,
+        counts: plan.counts,
+        waves: plan.waves,
+        warnings: plan.warnings,
+        blockers: plan.blockers,
+      };
+
+      // Human-readable notes about how the plan was reshaped. Computed here so
+      // EVERY branch (including the refusals) can report what changed.
+      const planNotes: string[] = [];
+      if (plan.counts.duplicates > 0) planNotes.push(`⏭ Merged ${plan.counts.duplicates} duplicate task(s) inside this batch.`);
+      if (plan.counts.serialized > 0) planNotes.push(`🔗 Serialised ${plan.counts.serialized} task(s) that would race on the same file.`);
+      for (const w of droppedNeeds) planNotes.push(`⚠️ ${w}`);
+      if (skippedTasks.length > 0) {
+        planNotes.push(`⏭ Skipped ${skippedTasks.length} near-duplicate task(s) of already-spawned work:\n` +
+          skippedTasks.map(s => `  - "${s.task.slice(0, 60)}" ≈ "${s.matchedTask.slice(0, 60)}"`).join("\n"));
+      }
+      if (!plan.accept) {
+        return {
+          content: [{
+            type: "text",
+            text: `${plan.summary}\n\n⛔ **No agents launched.** Trimegisto refuses high-consequence work (closed lane). ` +
+              `Resolve the blockers, move the task to an open lane, or ask the user to decide explicitly.` +
+              (planNotes.length > 0 ? `\n\n${planNotes.join("\n")}` : ""),
+          }],
+          details: { plan: planDetails, tasks: [] },
+          isError: true,
+        };
+      }
+
+      // Per-wave feasibility: a wave larger than the tier capacity could never
+      // start (the scheduler would defer it until the deadline), so refuse it
+      // with an actionable message instead of hanging silently.
+      for (let w = 0; w < plan.waves.length; w++) {
+        const perTier: Record<string, number> = { active: 0, t1: 0, t2: 0, t3: 0 };
+        for (const idx of plan.waves[w]) {
+          const t = (dedupedTasks[idx - 1]?.tier as AgentTier) || "active";
+          perTier[t] = (perTier[t] || 0) + 1;
+        }
+        for (const tier of ["active", "t1", "t2", "t3"] as const) {
+          if (perTier[tier] > tierCapacity(tier)) {
+            return {
+              content: [{
+                type: "text",
+                text: `${plan.summary}\n\n❌ **No agents launched.** Wave ${w + 1} needs ${perTier[tier]} ${formatTierLabel(tier)} agent(s) ` +
+                  `but the capacity is ${tierCapacity(tier)}. Split that wave with explicit \`needs\` so it runs in more waves, ` +
+                  `reduce the batch, or raise maxParallel via /tmg config.` +
+                  (planNotes.length > 0 ? `\n\n${planNotes.join("\n")}` : ""),
+              }],
+              details: { plan: planDetails, tasks: [] },
+              isError: true,
+            };
+          }
+        }
       }
 
       // Reject tiers that are disabled or have no model — the coordinator should
@@ -690,25 +1194,6 @@ export default function (pi: ExtensionAPI) {
           details: { unavailable: bad, available: ["active","t1","t2","t3"].filter(tierAvailable) },
           isError: true,
         };
-      }
-
-      // Check tier limits
-      const taskCounts: Record<string, number> = { active: 0, t1: 0, t2: 0, t3: 0 };
-      for (const t of dedupedTasks) {
-        taskCounts[t.tier] = (taskCounts[t.tier] || 0) + 1;
-      }
-
-      // Check tier limits — with redundant agents ON, capacity is maxParallel × pool size
-      const effectiveLimit = (tier: AgentTier): number =>
-        config[tier].maxParallel * Math.max(1, getModelPool(config[tier], config.redundantAgents).length);
-
-      for (const t of ["active", "t1", "t2", "t3"] as const) {
-        if (taskCounts[t] > effectiveLimit(t)) {
-          return {
-            content: [{ type: "text", text: `Too many ${formatTierLabel(t)} tasks (max ${effectiveLimit(t)}).` }],
-            details: { tasks: [] },
-          };
-        }
       }
 
       // ── Model circuit breaker: refuse a batch that targets a paused model ──
@@ -737,145 +1222,88 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Check existing running agents vs limits (pooled capacity when redundant agents are ON)
-      for (const t of dedupedTasks) {
-        if (!canSpawnPooled(t.tier, config[t.tier], config.redundantAgents, undefined, spawnModelOverride(t.tier))) {
-          const poolSize = getModelPool(config[t.tier], config.redundantAgents).length;
-          return {
-            content: [{
-              type: "text",
-              text: `Cannot spawn ${formatTierLabel(t.tier)}: max parallel limit (${config[t.tier].maxParallel}/model × ${poolSize} model(s)) reached.`,
-            }],
-            details: { tasks: [] },
-          };
-        }
-      }
+      // (Capacity is checked per wave by the scheduler, which defers a wave
+      // instead of refusing it when the tier is momentarily full.)
 
-      // Launch all agents in background — DO NOT BLOCK
-      const launchedAgents: AgentInstance[] = [];
-      const sentHarvests = new Set<string>();
-      const harvestResult = (r: any): void => {
-        const harvestKey = r.agentId || `${r.tier}:${r.task}`;
-        if (sentHarvests.has(harvestKey)) return;
-        sentHarvests.add(harvestKey);
-        const ok = r.status === "done";
-        const output = (r.output || "").trim();
-        const stderr = (r.stderr || "").trim();
-        const preview = output
-          ? output.slice(0, 1800)
-          : (stderr ? `❌ ${stderr.slice(0, 800)}` : "_(no output)_");
-        safeSendMessage({
-          customType: "trimegisto-harvest",
-          content: `## ${ok ? "✅" : "⚠️"} Harvest ${r.agentId || "?"} [${formatTierLabel(r.tier || "?")}] — ${r.status}\n\n**Task:** ${(r.task || "").slice(0, 160)}\n\n${preview}${r.usage?.turns > 0 ? `\n\n*${r.usage.turns} turns, ↑${r.usage.input} ↓${r.usage.output}*` : ""}`,
-          display: true,
-        });
+      // ── Register the batch and launch its FIRST wave ──────────
+      const taskByIndex = new Map<number, any>();
+      dedupedTasks.forEach((spec: any, i: number) => taskByIndex.set(i + 1, spec));
+      const nodeByIndex = new Map<number, PlanNode>();
+      for (const n of plan.launch) nodeByIndex.set(n.index, n);
+      const waves: PlanNode[][] = plan.waves
+        .map((w) => w.map((i) => nodeByIndex.get(i)).filter((n): n is PlanNode => !!n))
+        .filter((w) => w.length > 0);
+
+      const batch: PendingBatch = {
+        id: `batch-${++batchSeq}`,
+        startedAt: Date.now(),
+        deadlineAt: Date.now() + BATCH_DEADLINE_MS,
+        agentIds: [],
+        skipped: skippedTasks,
+        results: new Map(),
+        settled: false,
+        goal: planGoal,
+        cwd,
+        waves,
+        currentWave: -1,
+        waveAgentIds: [],
+        taskByIndex,
+        nodeAgent: new Map(),
+        launched: new Set(),
+        taskDetails: [],
+        planSummary: plan.summary,
       };
-      const collectedResults: any[] = [];
-      const taskDetails: any[] = [];
-      let completedCount = 0;
+      pendingBatches.push(batch);
+      advanceBatch(batch);
 
-      for (const task of dedupedTasks) {
-        const tier = task.tier;
-        if (!tierHasModel(tier)) {
-          const errResult = {
-            agentId: `err-${tier}`,
-            tier,
-            task: task.task,
-            status: "error",
-            output: "",
-            stderr: `No model configured for ${formatTierLabel(tier)}.`,
-            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-            log: [{ ts: Date.now(), level: "error", text: `No model configured for ${formatTierLabel(tier)}` }],
-          };
-          collectedResults.push(errResult);
-          taskDetails.push(errResult);
-          completedCount++;
-          continue;
-        }
+      const taskDetails = batch.taskDetails;
+      const taskList = taskDetails.map((t: any) =>
+        `- **${t.agentId}**${t.wave ? ` (wave ${t.wave})` : ""} [${formatTierLabel(t.tier)}]: ${t.task.slice(0, 80)}`
+      ).join("\n");
 
-        // Pick the least-loaded model from the tier pool when redundant agents are ON
-        let taskModelOverride = spawnModelOverride(tier);
-        if (config.redundantAgents && tier !== "active") {
-          const pool = getModelPool(config[tier], true);
-          const pick = selectAvailableModel(tier, pool, config[tier].maxParallel);
-          if (pick) taskModelOverride = pick;
-        }
-
-        // Commit to the dedup registry now that the task is really launching
-        if (config.dedupeTasks) registerTask(tier, task.task);
-        const agent = launchAgent(tier, task.task, config[tier], task.cwd || cwd, undefined, taskModelOverride, config.redundantAgents);
-        launchedAgents.push(agent);
-        taskDetails.push({
-          agentId: agent.id,
-          tier: agent.tier,
-          task: agent.task,
-          status: agent.status,
-        });
-
-        // Set resolve callback to collect results and send summary when all done
-        agent.resolve = (result) => {
-          // Allow a legitimate retry if the accepted spawn failed outright
-          if (result.status === "error" || result.status === "killed") forgetTask(result.task);
-          collectedResults.push(result);
-          completedCount++;
-          harvestResult(result);
-
-          // When all agents complete, send summary as a chat message
-          if (completedCount >= dedupedTasks.length) {
-            const successCount = collectedResults.filter(r => r.status === "done").length;
-            const failCount = collectedResults.filter(r => r.status === "error" || r.status === "killed").length;
-
-            const summaryLines: string[] = [
-              `## Trimegisto Results: ${successCount}/${collectedResults.length} succeeded, ${failCount} failed`,
-              "",
-            ];
-
-            for (const r of collectedResults) {
-              const icon = r.status === "done" ? "✓" : "✗";
-              const label = r.agentId || "?";
-
-              summaryLines.push(`### ${icon} **\`${label}\`** ${r.task.slice(0, 80)}`);
-              summaryLines.push("");
-
-              if (r.output) {
-                const outputPreview = r.output.slice(0, 2000).trim();
-                summaryLines.push(`\`\`\`\n${outputPreview}\n\`\`\``);
-              } else if (r.stderr) {
-                summaryLines.push(`❌ ${r.stderr.slice(0, 500)}`);
-              }
-
-              if (r.usage?.turns > 0) {
-                summaryLines.push(`  *${r.usage.turns} turns, ↑${r.usage.input} ↓${r.usage.output} $${r.usage.cost.toFixed(4)}*`);
-              }
-              summaryLines.push("");
-              summaryLines.push("---");
-              summaryLines.push("");
-            }
-
-            safeSendMessage({
-              customType: "trimegisto-results",
-              content: summaryLines.join("\n"),
-              display: true,
-            });
-          }
+      // Wave 1 deferred because the tier was momentarily full: say so and ask the
+      // coordinator NOT to retry (a retry would duplicate the whole plan).
+      if (taskDetails.length === 0 && !batch.settled) {
+        return {
+          content: [{
+            type: "text",
+            text: plan.summary +
+              `\n\n⏳ **Queued, not spawned yet:** ${waves[0]?.length ?? 0} task(s) waiting for tier capacity. ` +
+              `Trimegisto launches them automatically as soon as a slot frees and still delivers ONE reconciliation. ` +
+              `Do NOT call trimegisto again for this work — retrying would duplicate it.` +
+              (planNotes.length > 0 ? `\n\n${planNotes.join("\n")}` : ""),
+          }],
+          details: { tasks: [], plan: planDetails },
         };
       }
 
-      // Return immediately — don't block pi
-      const taskList = taskDetails.map(t =>
-        `- **${t.agentId}** [${formatTierLabel(t.tier)}]: ${t.task.slice(0, 80)}`
-      ).join("\n");
+      // Already settled while launching (e.g. every node of wave 1 failed
+      // instantly): the reconciliation was delivered, so say so instead of
+      // claiming a launch.
+      if (batch.settled && taskDetails.length > 0) {
+        return {
+          content: [{
+            type: "text",
+            text: plan.summary +
+              `\n\n⚠️ The batch settled immediately without any runnable work. The reconciliation above was already delivered to the chat.` +
+              (planNotes.length > 0 ? `\n\n${planNotes.join("\n")}` : ""),
+          }],
+          details: { tasks: taskDetails, plan: planDetails },
+          isError: true,
+        };
+      }
 
       return {
         content: [{
           type: "text",
-          text: `🚀 Launched ${dedupedTasks.length} Trimegisto agent(s):\n${taskList}` +
-            (skippedTasks.length > 0
-              ? `\n\n⏭ Skipped ${skippedTasks.length} near-duplicate task(s):\n` + skippedTasks.map(s => `  - "${s.task.slice(0, 60)}" ≈ "${s.matchedTask.slice(0, 60)}"`).join("\n")
-              : "") +
-            `\n\nDo not block or sleep waiting for them. Continue useful foreground work; harvested results will be injected as agents finish. For an instant non-blocking snapshot, call trimegisto_harvest.`,
+          text: plan.summary +
+            `\n\n🚀 **Wave 1 of ${waves.length} is running now: ${taskDetails.length} of ${plan.launch.length} planned agent(s).**` +
+            `\nThe list below is wave 1 only — later waves start when their dependencies settle:\n${taskList}` +
+            (planNotes.length > 0 ? `\n\n${planNotes.join("\n")}` : "") +
+            `\n\nA wave only starts when the previous one is terminal, so a declared \`needs\` edge really carries the upstream verdict. ` +
+            `Do not block or sleep waiting: Trimegisto delivers ONE reconciliation with every agent's conclusion when the whole batch settles — even if an agent is killed or times out. For an on-demand snapshot, call trimegisto_harvest.`,
         }],
-        details: { tasks: taskDetails },
+        details: { tasks: taskDetails, plan: planDetails },
       };
     },
 
@@ -1064,6 +1492,18 @@ export default function (pi: ExtensionAPI) {
   pi.registerMessageRenderer("trimegisto-results", suppressHeader);
   pi.registerMessageRenderer("trimegisto-harvest", suppressHeader);
   pi.registerMessageRenderer("trimegisto-command", suppressHeader);
+
+  // TUI-only progress entries. These render in the transcript exactly like the
+  // old log messages but never reach the model's conversation.
+  const renderLogEntry = (entry: any): Container => {
+    const mdTheme = getMarkdownTheme();
+    const data: any = entry?.data ?? {};
+    const text = typeof data === "string" ? data : String(data.text ?? data.markdown ?? "");
+    const container = new Container();
+    container.addChild(new Markdown(text, 0, 0, mdTheme));
+    return container;
+  };
+  pi.registerEntryRenderer("trimegisto-log", renderLogEntry);
 
   // ── Register commands (lazy handlers) ───────────────────
   const commandRuntime = () => ({
@@ -1259,6 +1699,9 @@ export default function (pi: ExtensionAPI) {
 
     // Dashboard reactivity — uses callbacks, NOT footer replacement
     setStateChangeCallback(() => {
+      // Safety net: a batch settles as soon as every agent is terminal, even if
+      // no resolve callback ran (killed without a close event, watchers off).
+      try { sweepBatches(); } catch { /* never break the host on a sweep error */ }
       if (ctx.hasUI && dashboardVisible) {
         // Widgets re-render on each tui.requestRender cycle
       }
@@ -1293,6 +1736,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    clearInterval(batchSweepInterval);
+    // Flush any unsettled batch BEFORE disposed=true so a reload/kill still
+    // produces a conclusion instead of leaving orphaned fragments.
+    for (const batch of [...pendingBatches]) {
+      try { settleBatch(batch, "session shutdown"); } catch { /* ignore */ }
+    }
     disposed = true;
     // Stop late callbacks before pi invalidates this extension context on /reload.
     setAgentLogCallback(() => {});
@@ -1382,6 +1831,57 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // ── Provider diagnostics (opt-in, off by default) ─────────────────────────
+  // The exact cause of the repeated `400 invalid_request_error` is still a
+  // hypothesis because nobody has seen the rejected payload. Capturing every
+  // request would be invasive, so this is a POST-MORTEM window instead: nothing
+  // is written until a provider answers >= 400, and then the *next* requests are
+  // recorded for a bounded period. `TRIMEGISTO_CAPTURE_PAYLOADS=1` forces it on.
+  const CAPTURE_WINDOW_MS = 10 * 60_000;
+  let captureUntil = 0;
+  let providerDiagnostics: ProviderDiagnostics | null = null;
+  const diagnostics = (): ProviderDiagnostics => {
+    if (!providerDiagnostics) providerDiagnostics = new ProviderDiagnostics({ enabled: true });
+    return providerDiagnostics;
+  };
+  const captureActive = (): boolean => diagnosticsEnabledFromEnv() || Date.now() <= captureUntil;
+
+  // MUST NOT return a value: a returned payload would replace the real request.
+  pi.on("before_provider_request", (event) => {
+    if (disposed || !config.enabled || !captureActive()) return;
+    try { diagnostics().recordRequest(event.payload); } catch { /* diagnostics never break a request */ }
+  });
+
+  pi.on("after_provider_response", (event) => {
+    if (disposed || !config.enabled) return;
+    try {
+      if (event.status >= 400) {
+        const wasArmed = Date.now() <= captureUntil;
+        captureUntil = Date.now() + CAPTURE_WINDOW_MS;
+        if (!wasArmed && !diagnosticsEnabledFromEnv()) {
+          safeAppendEntry("trimegisto-log", {
+            text: `📸 Provider answered **${event.status}** — capturing request payloads for 10 min so the next failure can be diagnosed (see the diagnostics file path in /tmg diagnostics).`,
+          });
+        }
+      }
+      if (captureActive()) diagnostics().recordResponse(event.status, event.headers);
+    } catch { /* diagnostics never break a request */ }
+  });
+
+  // ── Context hygiene: keep Trimegisto noise out of the model request ──
+  // Progress is now TUI-only, but a session can still carry old trimegisto-*
+  // custom messages (reloaded sessions, earlier versions) plus one
+  // orchestration directive per turn. Providers that validate message order or
+  // size answer 400 invalid_request_error, so prune them before every call.
+  // Non-custom messages are never touched (tool pairing is safe).
+  pi.on("context", async (event) => {
+    if (!config.enabled) return;
+    const messages: any[] = event.messages as any[];
+    if (!Array.isArray(messages) || messages.length === 0) return;
+    const pruned = pruneContextMessages(messages, MAX_PROGRESS_MESSAGES);
+    if (pruned !== messages) return { messages: pruned };
+  });
+
   // ── Before agent start: inject trimegisto context ──────
   pi.on("before_agent_start", async (_event, ctx) => {
     // Check compaction proactively before the agent processes input
@@ -1408,10 +1908,12 @@ export default function (pi: ExtensionAPI) {
           "If it is decomposable, your FIRST assistant action MUST be a `trimegisto` batch tool call that launches parallel agents; then do only coordination and synthesis while they run.",
           "Do NOT solve decomposable work entirely in the main agent before spawning. Use the main agent for orchestration, final integration, and genuinely single-threaded steps.",
           "Assign DISJOINT, non-overlapping subtasks so no two agents redo the same work. Never give two agents the same file or the same question.",
+          "Draw the graph before spawning: pass a `goal` plus a one-line `why` per task, declare `needs` only for real data dependencies (those run in waves, not in parallel), and `writes` for known output files (same-file writers are serialised). A task that cannot state which part of the goal it serves should not be spawned.",
+          "Prefer one agent per independent unit of work. If two proposed tasks would read the same inputs and produce overlapping answers, they are ONE task, not two. If a step is a mechanical transformation (parse, count, rename, format, diff), do it with bash yourself instead of paying a model for it. Work that cannot be undone (deletions, deploy, publish, migrations, production data, credentials) is refused: ask the user instead.",
           "Only spawn redundant 'scout' agents (same task, different angle) when you explicitly need verification/consensus — not by default.",
           "Skip spawning only when the task is trivial, a single indivisible/non-parallelizable step, or the user explicitly asks not to delegate.",
           "Assign DISJOINT, non-overlapping subtasks; never two agents on the same file/question. Only spawn redundant scouts when you need verification/consensus.",
-          "After spawning, never run sleep/poll loops just to wait. Continue useful foreground work or call `trimegisto_harvest` for an instant available-results snapshot. Harvested completions are injected automatically.",
+          "After spawning, never run sleep/poll loops just to wait. Continue useful foreground work; Trimegisto injects ONE final reconciliation with every agent's conclusion when the batch settles — use it to write the unified final answer instead of re-spawning or answering early. Call `trimegisto_harvest` only for an explicit on-demand snapshot.",
         ].join("\n")
       : "Trimegisto is enabled but auto-spawn is OFF: delegate only when explicitly requested or clearly useful.";
 
