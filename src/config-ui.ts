@@ -154,7 +154,10 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
       while (true) {
         const warn = tl.maxAgentTurns ?? 50;
         const grace = tl.turnLimitGrace ?? 15;
-        const tlChoice = await ctx.ui.select("Turn limit (off by default):", [
+        // The header used to read "Turn limit (off by default):", which sits right
+        // above "Enabled: ON" and reads as if it described the CURRENT state — the
+        // exact confusion the guard-bug report started from. It now states it.
+        const tlChoice = await ctx.ui.select(`Turn limit — currently ${tl.turnLimitEnabled ? "ON" : "OFF"}:`, [
           `Enabled: ${tl.turnLimitEnabled ? "ON" : "OFF"}`,
           `Warn at: ${warn} turns`,
           `Kill after: +${grace} turns (hard kill at ${warn + grace})`,
