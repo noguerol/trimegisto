@@ -1525,6 +1525,8 @@ export default function (pi: ExtensionAPI) {
   // ── Register commands (lazy handlers) ───────────────────
   const commandRuntime = () => ({
     configs: { active: config.active, t1: config.t1, t2: config.t2, t3: config.t3 },
+    // Lets /tmg guard show LIVE vs SAVED instead of making a divergence invisible.
+    guardConfig: () => config.loopSupervisor,
     launchFn: doLaunch,
     cwd: process.cwd(),
     isEnabled: () => config.enabled,

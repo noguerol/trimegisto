@@ -7,6 +7,7 @@
 // Run: node --experimental-strip-types test-loop.ts
 import { LoopSupervisor, DEFAULT_LOOP_CONFIG } from "./src/loop-supervisor.ts";
 import { sanitizeLoopSupervisorConfig, applyGuardConfig } from "./src/config.ts";
+import { formatGuardTurnLimit } from "./src/commands.ts";
 import { setAgentStatus, agentIdleMs } from "./src/agent-manager.ts";
 import type { AgentInstance } from "./src/types.ts";
 
@@ -313,6 +314,24 @@ console.log("Turn-limit opt-in / config drift:");
   const d = { enabled: true, maxSpawnDepth: 5, turnLimitEnabled: false, maxAgentTurns: 50, turnLimitGrace: 15, dedupeCrossAgent: false };
   const out: any = sanitizeLoopSupervisorConfig({ maxAgentTurns: 20 }, d);
   check("sanitized config always carries turnLimitEnabled", typeof out.turnLimitEnabled === "boolean" && out.turnLimitEnabled === false, out.turnLimitEnabled);
+}
+
+// ── /tmg guard must SHOW a live-vs-saved divergence, not hide it ──
+console.log("Guard display (live vs saved):");
+{
+  const off = { enabled: true, maxSpawnDepth: 5, turnLimitEnabled: false, maxAgentTurns: 20, turnLimitGrace: 15, dedupeCrossAgent: false };
+  const on = { ...off, turnLimitEnabled: true };
+  check("both OFF -> plain OFF", formatGuardTurnLimit(off, off) === "turn limit OFF");
+  check("both ON -> the kill bound", formatGuardTurnLimit(on, on) === "turns ≤ 20+15");
+  const diverged = formatGuardTurnLimit(on, off);
+  check("LIVE ON but saved OFF is reported as live ON", diverged.startsWith("turns ≤ 20+15"));
+  check("...and names the saved value", diverged.includes("saved: turn limit OFF"));
+  check("...and tells the user how to apply it", diverged.includes("/reload"));
+  const reverse = formatGuardTurnLimit(off, on);
+  check("LIVE OFF but saved ON is reported as live OFF", reverse.startsWith("turn limit OFF") && reverse.includes("saved: turns ≤ 20+15"));
+  check("missing saved config does not crash", formatGuardTurnLimit(on, undefined) === "turns ≤ 20+15");
+  check("a partial config falls back to the documented defaults", formatGuardTurnLimit({ turnLimitEnabled: true }, undefined) === "turns ≤ 50+15");
+  check("only an explicit true counts as ON in the display too", formatGuardTurnLimit({ turnLimitEnabled: 1 as any }, undefined) === "turn limit OFF");
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
