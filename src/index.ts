@@ -57,6 +57,7 @@ import { LoopSupervisor, type LoopAlert } from "./loop-supervisor.ts";
 import { ModelHealth, sanitizeModelHealthConfig, MODEL_HEALTH_DEFAULTS } from "./model-health.ts";
 import { speed, MAIN_TARGET } from "./speed.ts";
 import { formatTmgStatus } from "./branding.ts";
+import { ProgressLogBuffer } from "./progress-log.ts";
 
 // ── Configuration entry type ────────────────────────────
 const CONFIG_ENTRY = "trimegisto-config-v1";
@@ -180,6 +181,39 @@ export default function (pi: ExtensionAPI) {
     } catch {
       // Stale pi context after /reload/session replacement; ignore late entry.
     }
+  }
+
+  // Progress entries must not land in the transcript while the main session is
+  // streaming: pi splices a new custom entry BEFORE the streaming assistant
+  // component, and when that component is taller than the viewport every
+  // splice forces TuiMainScreen into a full redraw that also clears the
+  // scrollback — the "whole TUI re-scrolls on every update" symptom. Buffering
+  // until the stream ends keeps every entry appended at the end of the
+  // transcript, where the differential renderer only touches the new lines.
+  const progressLog = new ProgressLogBuffer();
+  function appendProgress(text: string): void {
+    const ready = progressLog.push(text);
+    if (!ready) return;
+    // A buffer left over from a stream that just ended is released together
+    // with this entry, so nothing is dropped and order is preserved.
+    const deferred = progressLog.drain();
+    safeAppendEntry("trimegisto-log", { text: deferred ? `${deferred}\n${ready}` : ready });
+  }
+  function flushDeferredProgress(): void {
+    if (progressLog.isStreaming()) return;
+    const text = progressLog.drain();
+    if (text) safeAppendEntry("trimegisto-log", { text });
+  }
+  /**
+   * Release buffered progress on the NEXT task. pi emits an event to
+   * extensions BEFORE its own listeners run, and the interactive listener is
+   * what drops the streaming component; flushing synchronously here would race
+   * it and splice before the still-present component. A 0ms timer runs after
+   * the whole event dispatch, when appending is back to end-of-transcript.
+   */
+  function scheduleFlushDeferredProgress(): void {
+    const timer = setTimeout(() => { if (!disposed) flushDeferredProgress(); }, 0);
+    (timer as any).unref?.();
   }
 
   // ── Guaranteed reconciliation: session-wide batch registry ───────────────
@@ -520,9 +554,7 @@ export default function (pi: ExtensionAPI) {
     try {
       advanceBatch(batch);
     } catch (err: any) {
-      safeAppendEntry("trimegisto-log", {
-        text: `⚠️ Scheduler error while handling a result for ${batch.id}: ${err?.message || String(err)}`,
-      });
+      appendProgress(`⚠️ Scheduler error while handling a result for ${batch.id}: ${err?.message || String(err)}`);
     }
   }
 
@@ -587,9 +619,7 @@ export default function (pi: ExtensionAPI) {
 
   modelHealth.setOnTrip((entry, info) => {
     const secs = Math.max(1, Math.ceil(info.remainingMs / 1000));
-    safeAppendEntry("trimegisto-log", {
-      text: `🚫 **[Trimegisto model health]** ${entry.model} paused after ${entry.failures} model-level failure(s) — ${entry.lastReason || "provider error"}. Spawns on it are refused for ~${secs}s. Switch model via /tmg config or clear with /tmg reset-models.`,
-    });
+    appendProgress(`🚫 **[Trimegisto model health]** ${entry.model} paused after ${entry.failures} model-level failure(s) — ${entry.lastReason || "provider error"}. Spawns on it are refused for ~${secs}s. Switch model via /tmg config or clear with /tmg reset-models.`);
     try {
       if (ctxRef?.hasUI) ctxRef.ui.notify(`Model ${entry.model} paused (~${secs}s): spawns refused`, "error");
     } catch { /* stale ctx after session reload */ }
@@ -646,9 +676,7 @@ export default function (pi: ExtensionAPI) {
     const isTurn = alert.type === "turn_limit";
     const emoji = isDup ? "♻️" : isTurn ? "⏳" : "🚧";
     const label = isDup ? "Redundancy" : isTurn ? "Turn limit" : "Spawn depth";
-    safeAppendEntry("trimegisto-log", {
-      text: `${emoji} **[Trimegisto ${label}]** ${alert.message}`,
-    });
+    appendProgress(`${emoji} **[Trimegisto ${label}]** ${alert.message}`);
     try {
       if (ctxRef?.hasUI) {
         ctxRef.ui.notify(
@@ -716,7 +744,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
     if (lines.length > 0) {
-      safeAppendEntry("trimegisto-log", { text: lines.join("\n") });
+      appendProgress(lines.join("\n"));
       // Force TUI re-render so messages appear immediately
       try {
         if (ctxRef?.hasUI) {
@@ -1805,6 +1833,10 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
     for (const batch of [...pendingBatches]) {
       try { settleBatch(batch, "session shutdown"); } catch { /* ignore */ }
     }
+    // Release buffered progress before disposed=true: the streaming component is
+    // gone on shutdown, so an append here is safe and nothing is lost.
+    progressLog.setStreaming(false);
+    flushDeferredProgress();
     disposed = true;
     // Stop late callbacks before pi invalidates this extension context on /reload.
     setAgentLogCallback(() => {});
@@ -1931,9 +1963,7 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
         captureUntil = Date.now() + CAPTURE_WINDOW_MS;
         const { diagnosticsEnabledFromEnv } = await diagnosticsModule();
         if (!wasArmed && !diagnosticsEnabledFromEnv()) {
-          safeAppendEntry("trimegisto-log", {
-            text: `📸 Provider answered **${event.status}** — capturing request payloads for 10 min so the next failure can be diagnosed (see the diagnostics file path in /tmg diagnostics).`,
-          });
+          appendProgress(`📸 Provider answered **${event.status}** — capturing request payloads for 10 min so the next failure can be diagnosed (see the diagnostics file path in /tmg diagnostics).`);
         }
       }
       if (Date.now() <= captureUntil) (await ensureDiagnostics()).recordResponse(event.status, event.headers);
@@ -2057,6 +2087,14 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
     speed.startRequest(MAIN_TARGET);
   });
 
+  // An assistant message is about to stream into the transcript. pi renders
+  // custom entries BEFORE this component, so from here until `message_end`
+  // progress entries must be buffered instead of appended.
+  pi.on("message_start", (event: any) => {
+    if (event?.message?.role !== "assistant") return;
+    progressLog.setStreaming(true);
+  });
+
   pi.on("message_update", (event: any) => {
     if (event?.message?.role !== "assistant") return;
     const ev = event.assistantMessageEvent;
@@ -2068,7 +2106,12 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
 
   pi.on("message_end", (event: any) => {
     const msg = event?.message;
-    if (msg?.role !== "assistant" || !msg.usage) return;
+    if (msg?.role !== "assistant") return;
+    // The streaming component is consumed here: deferred progress can now be
+    // appended at the end of the transcript without forcing a full redraw.
+    progressLog.setStreaming(false);
+    scheduleFlushDeferredProgress();
+    if (!msg.usage) return;
     speed.endRequest(MAIN_TARGET, {
       input: msg.usage.input || 0,
       cacheRead: msg.usage.cacheRead || 0,
@@ -2077,9 +2120,12 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
     });
   });
 
-  // Nothing in flight any more: keep the last measurements, stop live phases.
+  // Nothing in flight any more: keep the last measurements, stop live phases,
+  // and make sure no buffered progress is left behind by an interrupted stream.
   pi.on("agent_settled", () => {
     speed.finalize(MAIN_TARGET);
+    progressLog.setStreaming(false);
+    scheduleFlushDeferredProgress();
   });
 
   // ── Persist config ─────────────────────────────────────
