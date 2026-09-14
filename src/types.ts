@@ -215,7 +215,9 @@ export interface TrimegistoConfig {
    * DIFFERENT agents (redundant parallel work) and reports wasted tokens.
    */
   dedupeCrossAgent: boolean;
-  /** Whether the dashboard is visible */
+  /** Dashboard mode (persisted). "off" implies dashboardVisible = false. */
+  dashboardMode: DashboardMode;
+  /** Legacy boolean mirror of dashboardMode ("off" -> false, anything else -> true). */
   dashboardVisible: boolean;
   /** Watchdog timeouts (seconds; 0 disables that watchdog) */
   watchdog: WatchdogConfig;
@@ -224,6 +226,8 @@ export interface TrimegistoConfig {
   /** Model-level circuit breaker (pauses spawns on a failing model) */
   modelHealth: ModelHealthConfig;
 }
+
+export type DashboardMode = "compact" | "widget" | "off";
 
 export interface SpawnRequest {
   requestId: string;

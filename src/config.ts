@@ -251,6 +251,7 @@ export function getDefaultConfig(): TrimegistoConfig {
     redundantAgents: false,
     dedupeTasks: true,
     dedupeCrossAgent: false,
+    dashboardMode: "compact",
     dashboardVisible: true,
     watchdog: {
       firstResponseSeconds: envWatchdogSeconds("TRIMEGISTO_FIRST_RESPONSE_TIMEOUT_MS", WATCHDOG_DEFAULTS.firstResponseSeconds),

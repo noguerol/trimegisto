@@ -183,6 +183,9 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
       const modes: Array<"widget" | "compact" | "off"> = ["compact", "widget", "off"];
       const mode = modes[(modes.indexOf(rt.dashboardMode) + 1) % modes.length];
       rt.setDashboardMode(mode);
+      // Persist the FULL mode (off|compact|widget); legacy `dashboardVisible` is
+      // mirrored from it so older reading paths and saved configs keep working.
+      config.dashboardMode = mode;
       config.dashboardVisible = mode !== "off";
       await rt.updateDashboard();
       ctx.ui.notify(`Dashboard: ${mode}`, "info");
