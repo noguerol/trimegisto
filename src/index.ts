@@ -1697,12 +1697,12 @@ export default function (pi: ExtensionAPI) {
       // value equal to an old default is not reset on every load.
       if (Object.keys(migratedCompaction).length > 0) saveConfig();
 
-      // Apply swarm guard config
-      if (savedConfig.loopSupervisor) {
-        loopSupervisor.updateConfig(config.loopSupervisor);
-      }
-      // Keep the supervisor's cross-agent dedup flag in sync with the top-level flag
-      loopSupervisor.updateConfig({ dedupeCrossAgent: config.dedupeCrossAgent });
+      // Apply the swarm guard config through the SAME choke point the save path
+      // uses: fold the top-level dedupe flag into the guard block, then push once.
+      // This was two ordered pushes whose correctness depended on the bare
+      // `{dedupeCrossAgent}` one running last — an ordering accident, not a
+      // guarantee (ANGLE A of the guard QA: fragile-order dependency).
+      applyGuardConfig(loopSupervisor, foldDedupeFlagIntoGuard(config) ?? config.loopSupervisor);
     }
 
     // If config was loaded from session entry but not yet in the file, sync it
