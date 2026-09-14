@@ -16,6 +16,27 @@ export interface CommandRuntime {
   sendToAgent?: (agentId: string, instruction: string) => any | Promise<any>;
   toggleDashboard?: () => void;
   openConfig?: (ctx: any) => void | Promise<void>;
+  /** Persisted guard config (what the UI edits) — used to spot a live/disk divergence. */
+  guardConfig?: () => any;
+}
+
+/**
+ * Render the turn-limit state for `/tmg guard`.
+ *
+ * `live` is the supervisor's own config (what actually enforces agents' fate) and
+ * `saved` is the persisted config the user edits in `/tmg config`. Both are pushed
+ * through one choke point so they normally agree; when they do NOT, the user has
+ * to SEE it — otherwise the only symptom is "shows OFF but agents still die".
+ */
+export function formatGuardTurnLimit(live: any, saved?: any): string {
+  const label = (c: any): string =>
+    c?.turnLimitEnabled === true
+      ? `turns ≤ ${c.maxAgentTurns ?? 50}+${c.turnLimitGrace ?? 15}`
+      : "turn limit OFF";
+  const liveLabel = label(live);
+  if (!saved) return liveLabel;
+  const savedLabel = label(saved);
+  return savedLabel === liveLabel ? liveLabel : `${liveLabel} (saved: ${savedLabel} — /reload to apply)`;
 }
 
 const TIERS = ["active", "t1", "t2", "t3"] as const;
@@ -140,7 +161,7 @@ export async function handleTmgCommand(pi: ExtensionAPI, args: string | undefine
       if (!supervisor) return ctx.ui.notify("◇ Swarm guard unavailable.", "warning");
       const state = supervisor.getState();
       const cfg = supervisor.getConfig();
-      const turnLimit = cfg.turnLimitEnabled ? `turns ≤ ${cfg.maxAgentTurns}+${cfg.turnLimitGrace ?? 15}` : "turn limit OFF";
+      const turnLimit = formatGuardTurnLimit(cfg, rt.guardConfig?.());
       const lines = [`◇ Swarm guard (spawn depth ≤ ${cfg.maxSpawnDepth}, ${turnLimit}${cfg.dedupeCrossAgent ? ", cross-agent dedup ON" : ""})`];
       let totalDups = 0, totalWasted = 0;
       for (const tier of TIERS) {
