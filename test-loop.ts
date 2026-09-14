@@ -8,6 +8,7 @@
 import { LoopSupervisor, DEFAULT_LOOP_CONFIG } from "./src/loop-supervisor.ts";
 import { sanitizeLoopSupervisorConfig, applyGuardConfig } from "./src/config.ts";
 import { formatGuardTurnLimit } from "./src/commands.ts";
+import { foldDedupeFlagIntoGuard } from "./src/config.ts";
 import { setAgentStatus, agentIdleMs } from "./src/agent-manager.ts";
 import type { AgentInstance } from "./src/types.ts";
 
@@ -332,6 +333,28 @@ console.log("Guard display (live vs saved):");
   check("missing saved config does not crash", formatGuardTurnLimit(on, undefined) === "turns ≤ 20+15");
   check("a partial config falls back to the documented defaults", formatGuardTurnLimit({ turnLimitEnabled: true }, undefined) === "turns ≤ 50+15");
   check("only an explicit true counts as ON in the display too", formatGuardTurnLimit({ turnLimitEnabled: 1 as any }, undefined) === "turn limit OFF");
+}
+
+// ── the top-level dedupe flag must be folded into the guard before pushing ──
+console.log("Guard push folds the top-level dedupe flag:");
+{
+  // Legacy file: top-level true, block WITHOUT the key (pre-1.5.0 shape).
+  const legacyBlock: any = { enabled: true, maxSpawnDepth: 5, turnLimitEnabled: false, maxAgentTurns: 20, turnLimitGrace: 15 };
+  const cfg: any = { loopSupervisor: legacyBlock, dedupeCrossAgent: true };
+  const folded = foldDedupeFlagIntoGuard(cfg);
+  check("the fold returns the same block (in place)", folded === legacyBlock);
+  check("top-level true is written into the block", legacyBlock.dedupeCrossAgent === true);
+  const s = new LoopSupervisor({ dedupeCrossAgent: false });
+  applyGuardConfig(s, folded);
+  check("and the live guard ends up with dedupe ON", s.getConfig().dedupeCrossAgent === true);
+
+  // The opposite direction: top-level OFF must not be overridden by a stale block.
+  const staleBlock: any = { ...legacyBlock, dedupeCrossAgent: true };
+  foldDedupeFlagIntoGuard({ loopSupervisor: staleBlock, dedupeCrossAgent: false });
+  check("top-level false clears a stale block value", staleBlock.dedupeCrossAgent === false);
+
+  check("no guard block -> nothing to push", foldDedupeFlagIntoGuard({ dedupeCrossAgent: true }) === undefined);
+  check("a non-object guard block is ignored", foldDedupeFlagIntoGuard({ loopSupervisor: "nope", dedupeCrossAgent: true } as any) === undefined);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

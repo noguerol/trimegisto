@@ -20,6 +20,7 @@ import {
   effectiveCompactionThreshold,
   sanitizeLoopSupervisorConfig,
   applyGuardConfig,
+  foldDedupeFlagIntoGuard,
 } from "./config.ts";
 import {
   launchAgent,
@@ -1578,8 +1579,7 @@ export default function (pi: ExtensionAPI) {
           // a reference to it across submenu edits; reassigning would orphan
           // later edits.
           if (!config.loopSupervisor) config.loopSupervisor = {};
-          config.loopSupervisor.dedupeCrossAgent = config.dedupeCrossAgent;
-          applyGuardConfig(loopSupervisor, config.loopSupervisor);
+          applyGuardConfig(loopSupervisor, foldDedupeFlagIntoGuard(config) ?? config.loopSupervisor);
         },
         syncWatchdog: applyWatchdogConfig,
         syncModelHealth: applyModelHealthConfig,
@@ -2034,8 +2034,10 @@ export default function (pi: ExtensionAPI) {
     // symptom being "the UI says turn limit OFF while agents are still killed at
     // the hard limit". Pushing the whole object on every save makes that
     // divergence impossible through the config path.
-    // Single choke point: see applyGuardConfig's contract note.
-    applyGuardConfig(loopSupervisor, config.loopSupervisor);
+    // Single choke point: see applyGuardConfig's contract note. The top-level
+    // dedupe flag is folded in first, otherwise saving an unrelated setting would
+    // push a stale in-block value and silently turn cross-agent dedup off.
+    applyGuardConfig(loopSupervisor, foldDedupeFlagIntoGuard(config));
     // Save to dedicated config file (survives session changes)
     persistConfig(config);
     if (disposed) return;
