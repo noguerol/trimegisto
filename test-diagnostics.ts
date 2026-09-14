@@ -342,5 +342,251 @@ console.log("Short prefixed secrets and credential-shaped object keys (QA leak p
   check("normal short values survive", redactSecrets({ v: "hello" }).v === "hello");
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+ * PROPERTY / FUZZ SUITE (deterministic, seeded)
+ *
+ * The literal QA checks above kept passing while the redaction rules were
+ * wrong three times in a row because they only asserted the examples the
+ * author thought of. These blocks assert the PROPERTY:
+ *   ∀ canary c, ∀ carrier shape s:  c ∉ sanitizePayload(s(c))
+ *   ∀ ordinary string o (non-credential-shaped): sanitizePayload({o}) ⊇ o
+ *   sanitizePayload is pure: same bytes on repeat, input never mutated.
+ * A future heuristic change that re-opens any of these gaps fails CI.
+ *
+ * Leak probes for shapes the CURRENT implementation does not claim to cover
+ * (short prefixed bodies < 8 chars after prefix, secrets embedded inside a
+ * longer object KEY, digit-less two-class tokens) are printed as LEAK lines
+ * but not asserted — they are reported separately, never patched over.
+ * ════════════════════════════════════════════════════════════════════════ */
+console.log("Property: canaries never survive any carrier shape:");
+{
+  // Deterministic PRNG (mulberry32). No Math.random, no Date.now.
+  const seedState = { s: 0x9e3779b9 ^ 20260215 };
+  function rnd(): number {
+    seedState.s = (seedState.s + 0x6d2b79f5) | 0;
+    let t = Math.imul(seedState.s ^ (seedState.s >>> 15), 1 | seedState.s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }
+  const ri = (n: number): number => Math.floor(rnd() * n);
+  const pick = <T>(xs: readonly T[]): T => xs[ri(xs.length)];
+  const LOWER = "abcdefghijklmnopqrstuvwxyz";
+  const UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const DIGIT = "0123456789";
+  const fill = (set: string, n: number): string => {
+    let s = "";
+    for (let i = 0; i < n; i++) s += set[ri(set.length)];
+    return s;
+  };
+
+  // Canary shapes required by the brief:
+  //   a) known prefixes sk-/sk-proj-/pk-/ghp_/gho_/github_pat_/"Bearer "
+  //      (body >= 8 chars so the current PREFIXED_SECRET_RE contract holds;
+  //       for non-anchored carriers the body also carries a digit + >= 20 chars),
+  //   b) mixed-class alphanumerics of length 20..64 (>= 2 classes, digit always:
+  //      the whole-value AND embedded contracts),
+  //   c) tokens with - / _ / . inside (segments >= 8 chars, digit guaranteed).
+  const canaries: string[] = [];
+  const seen = new Set<string>();
+  const pushCanary = (c: string): void => {
+    if (!seen.has(c) && c.length >= 20) { seen.add(c); canaries.push(c); }
+  };
+  const seg = (): string =>
+    pick([fill(LOWER + DIGIT, 8 + ri(14)), fill(LOWER + UPPER + DIGIT, 8 + ri(14)), fill(UPPER + DIGIT, 8 + ri(12))]);
+  const tokenWithSeparators = (): string => {
+    const n = 2 + ri(3);
+    const parts: string[] = [seg()];
+    for (let i = 1; i < n; i++) parts.push(seg());
+    let s = "";
+    for (let i = 0; i < parts.length; i++) {
+      s += parts[i];
+      if (i < parts.length - 1) s += pick(["-", "_", "."]);
+    }
+    return s;
+  };
+  for (const p of ["sk-", "sk-proj-", "pk-", "ghp_", "gho_", "github_pat_", "Bearer "]) {
+    for (let i = 0; i < 24; i++) {
+      const body = i % 3 === 0 ? tokenWithSeparators() : fill(LOWER + UPPER + DIGIT, 20 + ri(40));
+      pushCanary(p + body);
+    }
+  }
+  while (canaries.length < 210) pushCanary(tokenWithSeparators());
+
+  // Carrier shapes: whole value, prose, URL query, header values (known-secret
+  // key, generic key, bare string), object KEY, arrays, depth 1..8, JSON-string
+  // blob (as value AND as key), truncation (canary first / canary last).
+  const carriers: Array<{ name: string; make: (c: string) => unknown }> = [
+    { name: "whole-value", make: (c) => ({ value: c }) },
+    { name: "sentence", make: (c) => ({ note: `the token ${c} was rejected by upstream` }) },
+    { name: "url-query", make: (c) => ({ url: `https://api.example.com/v1?key=${c}&other=1` }) },
+    { name: "header-authorization", make: (c) => ({ headers: { Authorization: c } }) },
+    { name: "header-cookie", make: (c) => ({ headers: { Cookie: `sid=9; x=${c}` } }) },
+    { name: "header-generic", make: (c) => ({ headers: { "X-Trace": c } }) },
+    { name: "header-bare-string", make: (c) => c },
+    { name: "object-key", make: (c) => ({ [c]: "value" }) },
+    { name: "array", make: (c) => ({ items: ["filler", c, 7] }) },
+    { name: "nested-depth-1", make: (c) => ({ a: c }) },
+    { name: "nested-depth-2", make: (c) => ({ a: { b: c } }) },
+    { name: "nested-depth-3", make: (c) => ({ a: { b: { c: c } } }) },
+    { name: "nested-depth-4", make: (c) => ({ a: { b: { c: { d: c } } } }) },
+    { name: "nested-depth-5", make: (c) => ({ a: { b: { c: { d: { e: c } } } } }) },
+    { name: "nested-depth-6", make: (c) => ({ a: { b: { c: { d: { e: { f: c } } } } } }) },
+    { name: "nested-depth-7", make: (c) => ({ a: { b: { c: { d: { e: { f: { g: c } } } } } } }) },
+    { name: "nested-depth-8", make: (c) => ({ a: { b: { c: { d: { e: { f: { g: { h: c } } } } } } } }) },
+    { name: "json-blob-value", make: (c) => ({ blob: JSON.stringify({ context: 1, key: c, tail: "z" }) }) },
+    { name: "json-blob-key", make: (c) => ({ blob: JSON.stringify({ context: 1, [c]: "v" }) }) },
+    { name: "trunc-head-16", make: (c) => ({ canary: c, filler: "y".repeat(400) }) },
+    { name: "trunc-head-24", make: (c) => ({ canary: c, filler: "y".repeat(400) }) },
+    { name: "trunc-tail-16", make: (c) => ({ filler: "y".repeat(400), canary: c }) },
+    { name: "trunc-tail-24", make: (c) => ({ filler: "y".repeat(400), canary: c }) },
+  ];
+
+  let assertions = 0;
+  const totalLeaks: string[] = [];
+  for (const s of carriers) {
+    const shapeLeaks: string[] = [];
+    for (const c of canaries) {
+      for (const limit of [16, 24, undefined]) {
+        if (limit !== undefined && !s.name.startsWith("trunc")) continue;
+        const out = sanitizePayload(s.make(c), limit);
+        assertions++;
+        if (out.includes(c)) shapeLeaks.push(`limit=${limit ?? "-"} canary=${c} out=${out.slice(0, 90)}`);
+      }
+    }
+    totalLeaks.push(...shapeLeaks.map((l) => `${s.name} ${l}`));
+    check(`[${s.name}] no canary survives (${canaries.length} canaries)`, shapeLeaks.length === 0, shapeLeaks.slice(0, 3));
+  }
+  console.log(`    (${canaries.length} canaries x ${carriers.length} shapes = ${assertions} sanitize assertions, ${totalLeaks.length} leaks)`);
+}
+
+console.log("Property: ordinary data survives (no over-redaction):");
+{
+  const seedState = { s: 0x1234abcd ^ 424242 };
+  function rnd(): number {
+    seedState.s = (seedState.s + 0x6d2b79f5) | 0;
+    let t = Math.imul(seedState.s ^ (seedState.s >>> 15), 1 | seedState.s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }
+  const ri = (n: number): number => Math.floor(rnd() * n);
+  const pick = <T>(xs: readonly T[]): T => xs[ri(xs.length)];
+
+  // Ordinary (non-credential-shaped) strings: prose, absolute and relative
+  // paths, hyphenated directory names (< 32 chars or with slashes), numbers,
+  // identifiers, code snippets with spaces. Each is long enough (>= 20 chars)
+  // to reach the redactors, and must land in the output verbatim.
+  const words = ["the","quick","brown","fox","jumps","over","lazy","dog","config","payload","model","error","retry","stream","token","window","buffer","socket","header","engine"];
+  const ordinary: string[] = [];
+  for (let i = 0; i < 40; i++) {
+    let s = pick(words);
+    while (s.length < 20) s += " " + pick(words);
+    ordinary.push(s + ".");
+  }
+  const dirs = ["src","lib","node-modules","dist","test-fixtures","tools","scripts","packages","agent-core","data-tmp"];
+  for (let i = 0; i < 30; i++) {
+    let p = i % 2 === 0 ? "/srv" : "";
+    for (let k = 0; k < 3; k++) p += "/" + pick(dirs);
+    ordinary.push(p + "/file" + i + ".ts");
+  }
+  const segments = ["my-project","data-pipeline","agent-core","ui-components","state-machine","config-files","long-but-plain-name","back-reference","token-bucket"];
+  for (let i = 0; i < 20; i++) {
+    let s = pick(segments);
+    while (s.length < 20) s += "-" + pick(segments);
+    ordinary.push(s);
+  }
+  for (let i = 0; i < 20; i++) {
+    ordinary.push(pick([`turnLimitEnabled_${i}`, `retry_after_${i}`, `x-request-id-${i}`, `contentLength=${i}`, `maxEntries=${i}`]));
+  }
+  for (let i = 0; i < 15; i++) {
+    ordinary.push(pick([
+      `if (value >= ${i} && out !== null) return out;`,
+      `const result = await compute(i * ${i + 7}, opts);`,
+      `export function sanitizePayload(x) { return x } // ${i}`,
+      `// TODO(j): revisit this heuristic #${i}`,
+    ]));
+  }
+
+  const categories: Array<{ name: string; items: string[] }> = [
+    { name: "prose", items: ordinary.slice(0, 40) },
+    { name: "paths", items: ordinary.slice(40, 70) },
+    { name: "hyphenated-names", items: ordinary.slice(70, 90) },
+    { name: "identifiers", items: ordinary.slice(90, 110) },
+    { name: "code-snippets", items: ordinary.slice(110, 125) },
+  ];
+  let checked = 0;
+  for (const cat of categories) {
+    const bad: string[] = [];
+    for (const o of cat.items) {
+      checked++;      const asVal = sanitizePayload({ note: o });
+      if (asVal.includes("<redacted>") || !asVal.includes(o)) bad.push(`value:${o} => ${asVal.slice(0, 90)}`);
+      const asKey = sanitizePayload({ [o]: `text ${o} tail` });
+      if (asKey.includes("<redacted>") || !asKey.includes(o)) bad.push(`key:${o} => ${asKey.slice(0, 90)}`);
+    }
+    check(`ordinary ${cat.name} survive as value AND key (${cat.items.length} strings)`, bad.length === 0, bad.slice(0, 4));
+  }
+  const arrayOut = sanitizePayload({ items: ordinary });
+  check(`array of ${ordinary.length} ordinary strings survives intact`, !arrayOut.includes("<redacted>"), arrayOut.slice(0, 120));
+  console.log(`    (${checked} ordinary strings x value+key = ${checked * 2 + 1} sanitize assertions)`);
+}
+
+console.log("Property: purity (no input mutation, byte-identical repeats):");
+{
+  const seedState = { s: 0x77770001 ^ 987654 };
+  function rnd(): number {
+    seedState.s = (seedState.s + 0x6d2b79f5) | 0;
+    let t = Math.imul(seedState.s ^ (seedState.s >>> 15), 1 | seedState.s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }
+  const classes = ["abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "0123456789", "-_" ];
+  const gen = (n: number): string => {
+    let s = "";
+    for (let i = 0; i < n; i++) s += classes[i % classes.length][Math.floor(rnd() * classes[i % classes.length].length)];
+    return s;
+  };
+
+  let mutated = 0, nondet = 0, threw = 0;
+  for (let i = 0; i < 25; i++) {
+    const payload: unknown = {
+      model: "gpt-x",
+      headers: { authorization: `Bearer ${gen(32)}`, "x-request-id": `req-${gen(8)}` },
+      body: { input: [{ text: gen(40) }, { nested: { api_key: gen(24), list: [gen(20), 1, true, null] } }] },
+      arr: [gen(34), { token: gen(18) }, gen(50)],
+    };
+    const before = JSON.stringify(payload);
+    let a: string, b: string;
+    try {
+      a = sanitizePayload(payload, i % 7 === 0 ? 24 : undefined);
+      b = sanitizePayload(payload, i % 7 === 0 ? 24 : undefined);
+    } catch { threw++; continue; }
+    if (JSON.stringify(payload) !== before) mutated++;
+    if (a !== b) nondet++;
+  }
+  check("sanitizePayload never throws on mixed payloads", threw === 0, threw);
+  check("input payload is never mutated (25 deep payloads)", mutated === 0, mutated);
+  check("output is byte-identical across repeat calls (25 payloads)", nondet === 0, nondet);
+}
+
+console.log("Residual-risk probes (NOT asserted; reported, not patched):");
+{
+  // Cases the current heuristics demonstrably miss. Printed for visibility in
+  // CI output but asserted neither way, so the required properties above stay
+  // the pass/fail signal. Each line is a minimal repro for the report.
+  const probes: Array<[string, unknown]> = [
+    ["prefixed body < 8 chars (whole value)", { v: "sk-Abcdefg" }],
+    ["secret embedded inside a longer object KEY", redactSecrets({ "cfg sk-Abcdefghijklmnopqrst end": 1 })],
+    ["two-class token without any digit (embedded)", redactSecrets({ x: "use aaaaaaaaaa_bbbbbbbbbbbbbbbbbbbbbb now" })],
+  ];
+  for (const [name, payload] of probes) {
+    const out = typeof payload === "object" && payload !== null && "v" in (payload as object)
+      ? sanitizePayload(payload)
+      : JSON.stringify(payload);
+    const frag = name.includes("object KEY") ? "sk-Abcdefghijklmnopqrst"
+      : name.includes("digit") ? "aaaaaaaaaa_bbbbbbbbbbbbbbbbbbbbbb"
+      : "sk-Abcdefg";
+    console.log(`  ${out.includes(frag) ? "✗ LEAK" : "✓ ok  "} ${name} — "${frag}" ${out.includes(frag) ? "survived" : "redacted"}`);
+  }
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

@@ -96,11 +96,15 @@ function markerFor(value: object): string {
 function looksLikeCredential(value: string): boolean {
   if (/^(sk-|pk-|ghp_|gho_|github_pat_|Bearer\s)/.test(value)) return true;
   if (!/^[A-Za-z0-9_-]{32,}$/.test(value)) return false;
+  // Count only ALPHANUMERIC classes (lower/upper/digit). Separators `_-`
+  // are not a class — a hyphenated directory name with only one case
+  // (e.g. `long-but-plain-name-token-bucket`) used to count as 2 classes
+  // (`lower` + `_`) and was redacted. Real credentials always mix two
+  // alphanumeric classes, so this does not regress any current red.
   let classes = 0;
   if (/[a-z]/.test(value)) classes++;
   if (/[A-Z]/.test(value)) classes++;
   if (/[0-9]/.test(value)) classes++;
-  if (/[_-]/.test(value)) classes++;
   return classes >= 2;
 }
 
@@ -108,7 +112,10 @@ function looksLikeCredential(value: string): boolean {
  * Candidate token inside a longer string (a key pasted into a sentence, a URL or a
  * header value). Deliberately broad: the callback below decides.
  */
-const EMBEDDED_TOKEN_RE = /[A-Za-z0-9_.~+/=-]{20,}/g;
+// `/` and `=` deliberately excluded: paths and `key=value` strings must NOT
+// match as one token. Each `/`-separated segment is scanned independently;
+// each `=`-separated segment too — `looksLikeEmbeddedCredential` decides.
+const EMBEDDED_TOKEN_RE = /[A-Za-z0-9_.~+-]{20,}/g;
 
 /**
  * True when an EMBEDDED token really looks like a key.
@@ -144,7 +151,13 @@ function maybeRedactString(value: string): string {
 function maybeRedactKey(key: string): string {
   if (PREFIXED_SECRET_RE.test(key)) return REDACTED;
   if (key.length >= 20 && looksLikeCredential(key)) return REDACTED;
-  return key;
+  if (key.length < 20) return key;
+  // A credential used as an OBJECT KEY is data, not a field name. The whole-
+  // value check above misses keys whose shape includes characters outside
+  // `[A-Za-z0-9_-]` (the regex requires the whole string to be that class).
+  // Run the same embedded-token scan as maybeRedactString so a credential
+  // hidden in punctuation (e.g. canaries with `.`) is still caught.
+  return key.replace(EMBEDDED_TOKEN_RE, (token) => (looksLikeEmbeddedCredential(token) ? REDACTED : token));
 }
 
 function redactInner(value: unknown, depth: number, seen: WeakSet<object>): unknown {
