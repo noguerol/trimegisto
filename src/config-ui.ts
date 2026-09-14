@@ -94,7 +94,9 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
       "Dedupe cross-agent output: " + (config.dedupeCrossAgent ? "ON" : "OFF"),
       "Turn limit: " + (() => {
         const tl = config.loopSupervisor ?? {};
-        if (!tl.turnLimitEnabled) return "OFF";
+        // Same default-deny comparison the enforcer (checkTurnLimit) and /tmg
+        // guard use, so the menu can never show ON while the gate is off.
+        if (tl.turnLimitEnabled !== true) return "OFF";
         const warn = tl.maxAgentTurns ?? 50;
         return `ON | warn ${warn} | kill ${warn + (tl.turnLimitGrace ?? 15)}`;
       })(),
@@ -157,8 +159,8 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
         // The header used to read "Turn limit (off by default):", which sits right
         // above "Enabled: ON" and reads as if it described the CURRENT state — the
         // exact confusion the guard-bug report started from. It now states it.
-        const tlChoice = await ctx.ui.select(`Turn limit — currently ${tl.turnLimitEnabled ? "ON" : "OFF"}:`, [
-          `Enabled: ${tl.turnLimitEnabled ? "ON" : "OFF"}`,
+        const tlChoice = await ctx.ui.select(`Turn limit — currently ${tl.turnLimitEnabled === true ? "ON" : "OFF"}:`, [
+          `Enabled: ${tl.turnLimitEnabled === true ? "ON" : "OFF"}`,
           `Warn at: ${warn} turns`,
           `Kill after: +${grace} turns (hard kill at ${warn + grace})`,
           "Back",
@@ -167,7 +169,7 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
         if (tlChoice.startsWith("Enabled")) {
           tl.turnLimitEnabled = !tl.turnLimitEnabled;
           rt.syncLoopSupervisor?.();
-          ctx.ui.notify(`Turn limit: ${tl.turnLimitEnabled ? "ON" : "OFF"}`, "info");
+          ctx.ui.notify(`Turn limit: ${tl.turnLimitEnabled === true ? "ON" : "OFF"}`, "info");
           rt.saveConfig();
         } else if (tlChoice.startsWith("Warn at")) {
           await editTurns("Warn at", warn, 1, n => { tl.maxAgentTurns = n; });

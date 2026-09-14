@@ -314,20 +314,29 @@ export function applyGuardConfig(
   guardConfig: unknown,
 ): boolean {
   if (!supervisor || typeof supervisor.updateConfig !== "function") return false;
-  if (!guardConfig || typeof guardConfig !== "object" || Array.isArray(guardConfig)) return false;
-  // An empty object would apply nothing while reporting success, which is exactly
-  // the kind of silent no-op a caller would trust.
-  if (Object.keys(guardConfig as Record<string, unknown>).length === 0) return false;
-  // Coerce BEFORE it reaches the live guard. This is the only place config can
-  // enter the supervisor, so it must not forward junk keys, a string limit (which
-  // turns `softLimit + grace` into string concatenation and silently moves the
-  // hard kill), or a truthy non-boolean `turnLimitEnabled`. Missing keys fall back
-  // to the guard's CURRENT values, so a partial push can no longer be poisoned.
-  const base = (typeof supervisor.getConfig === "function" ? supervisor.getConfig() : null)
-    ?? getDefaultConfig().loopSupervisor;
-  const clean = sanitizeLoopSupervisorConfig(guardConfig as Record<string, unknown>, base);
-  supervisor.updateConfig(clean);
-  return true;
+  // try/catch around EVERY property access: even the shape checks touch the
+  // argument, and a hostile object (Proxy throwing on get/ownKeys) must never
+  // propagate into the save/UI path that calls this. On any failure nothing is
+  // pushed and we report false.
+  try {
+    if (!guardConfig || typeof guardConfig !== "object" || Array.isArray(guardConfig)) return false;
+    // An empty object would apply nothing while reporting success, which is the
+    // kind of silent no-op a caller would trust.
+    if (Object.keys(guardConfig as Record<string, unknown>).length === 0) return false;
+    // Coerce BEFORE it reaches the live guard. This is the only place config can
+    // enter the supervisor, so it must not forward junk keys, a string limit
+    // (which turns `softLimit + grace` into string concatenation and silently
+    // moves the hard kill), or a truthy non-boolean `turnLimitEnabled`. Missing
+    // keys fall back to the guard's CURRENT values, so a partial push cannot be
+    // poisoned.
+    const base = (typeof supervisor.getConfig === "function" ? supervisor.getConfig() : null)
+      ?? getDefaultConfig().loopSupervisor;
+    const clean = sanitizeLoopSupervisorConfig(guardConfig as Record<string, unknown>, base);
+    supervisor.updateConfig(clean);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export const WATCHDOG_DEFAULTS = {

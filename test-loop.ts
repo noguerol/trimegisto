@@ -396,6 +396,20 @@ console.log("Guard choke point (static invariant):");
   check("the grace survives an undefined push", guarded.getConfig().turnLimitGrace === 15);
   check("junk keys are dropped, not merged in", !("junkKey" in guarded.getConfig()));
   check("a valid push still works", applyGuardConfig(guarded, { turnLimitEnabled: true }) === true && guarded.getConfig().turnLimitEnabled === true);
+  // Guard-config QA D2, the worst latent cases, now provably dead:
+  const killer = new LoopSupervisor({ enabled: true, turnLimitEnabled: false, maxAgentTurns: 20, turnLimitGrace: 15, dedupeCrossAgent: false });
+  applyGuardConfig(killer, { turnLimitEnabled: true, maxAgentTurns: undefined });
+  check("undefined limit cannot erase the live 20", killer.getConfig().maxAgentTurns === 20, killer.getConfig().maxAgentTurns);
+  check("...so the gate cannot kill at turn 1", killer.checkTurnLimit("z", "active", 1) === false);
+  check("...and still honours 20+15", killer.checkTurnLimit("z", "active", 35) === false && killer.checkTurnLimit("z2", "active", 36) === true);
+  applyGuardConfig(killer, { turnLimitGrace: NaN });
+  check("NaN grace cannot evaporate (hard kill stays 35)", killer.getConfig().turnLimitGrace === 15 && killer.checkTurnLimit("z3", "active", 35) === false);
+  let hostileThrew = false;
+  const hostile = new Proxy({}, { get() { throw new Error("boom"); }, ownKeys() { throw new Error("boom"); } });
+  let hostileRet: unknown;
+  try { hostileRet = applyGuardConfig(killer, hostile); } catch { hostileThrew = true; }
+  check("a Proxy that throws returns false and never propagates", hostileThrew === false && hostileRet === false, { hostileThrew, hostileRet });
+  check("...and left the live config intact", killer.getConfig().maxAgentTurns === 20 && killer.getConfig().turnLimitGrace === 15 && killer.getConfig().turnLimitEnabled === true);
   check("and the gate then enforces it", guarded.checkTurnLimit("g", "active", 36) === true);
 }
 
