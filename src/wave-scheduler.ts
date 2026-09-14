@@ -52,6 +52,27 @@ export interface WaveRunDeps {
 }
 
 /**
+ * Internal safety net: the maximum number of wave launches a single
+ * `advanceWaves` call may perform before stopping cleanly. With the entry
+ * normalisation below the loop is already monotone for every input; this cap
+ * bounds it even if an injected dependency tampers with the counter, so the
+ * function terminates for EVERY input within
+ * `min(waveCount, MAX_WAVE_ITERATIONS) + 1` loop passes.
+ */
+export const MAX_WAVE_ITERATIONS = 64;
+
+/**
+ * Normalise a wave counter to a safe integer >= -1.
+ * NaN / ±Infinity / anything non-finite behaves like "before the first wave";
+ * fractional values floor down; finite values beyond the safe-integer range
+ * clamp to `Number.MAX_SAFE_INTEGER`.
+ */
+function normalizeWave(value: number): number {
+  if (!Number.isFinite(value)) return -1;
+  return Math.max(-1, Math.min(Math.floor(value), Number.MAX_SAFE_INTEGER));
+}
+
+/**
  * States currently inside `advanceWaves`. A WeakSet keeps this leak-free: the
  * entry disappears with the batch object.
  */
@@ -75,8 +96,15 @@ export function isAdvancing(state: WaveRunState): boolean {
 export function advanceWaves(state: WaveRunState, deps: WaveRunDeps): void {
   if (!state || state.settled) return;
   if (advancing.has(state)) return; // nested call: the outer frame owns the truth
+  // The scheduler owns this counter: normalise it at entry and WRITE the
+  // normalised value back to the caller's object, so a non-finite or
+  // fractional value can never survive a call (a raw NaN made the
+  // `currentWave++` loop below non-terminating, and 1.5 / -2 passed
+  // fractional or negative indexes to `launchWave`).
+  state.currentWave = normalizeWave(state.currentWave);
   advancing.add(state);
   try {
+    let iterations = 0;
     for (;;) {
       if (state.settled) return;
 
@@ -108,7 +136,35 @@ export function advanceWaves(state: WaveRunState, deps: WaveRunDeps): void {
 
       // "launch-next": a wave that cannot start yet (tier capacity) defers the
       // whole batch; the caller retries later and nothing is half-launched.
-      if (!deps.launchWave(state.currentWave + 1)) return;
+
+      // Iteration cap: stop cleanly instead of spinning. Settles AT MOST once
+      // and respects `state.settled` (the single-settle contract). The check
+      // runs AFTER the decision so a batch that completes legitimately keeps
+      // its real settle reason.
+      if (++iterations > MAX_WAVE_ITERATIONS) {
+        if (!state.settled) deps.settle(`wave iteration cap exceeded (${MAX_WAVE_ITERATIONS})`);
+        return;
+      }
+
+      const nextWave = state.currentWave + 1;
+      let started: boolean;
+      try {
+        started = !!deps.launchWave(nextWave);
+      } catch (err) {
+        // A `launchWave` that throws mid-wave can leave the adapter's wave set
+        // inconsistent (e.g. still holding the PREVIOUS wave). Re-launching
+        // the same index would then double-spawn agents, so the batch settles
+        // exactly once and that index is never launched again.
+        if (!state.settled) {
+          deps.settle(`wave launch failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        return;
+      }
+      if (!started) return;
+      // DOUBLE-SPAWN GUARD (invariant): this increment runs ONLY after
+      // `launchWave` returned success. A deferred, failed or throwing launch
+      // therefore leaves `currentWave` untouched and the scheduler can never
+      // launch the same wave index twice.
       state.currentWave++;
       // Loop, do not recurse: a wave may be terminal immediately (e.g. every
       // node failed synthetically), and 1000 waves must not grow the stack.

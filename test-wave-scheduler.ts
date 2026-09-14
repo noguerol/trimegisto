@@ -12,9 +12,17 @@
  *  - iterative: a thousand waves must not grow the stack
  *  - a stopped/halted wave is awaited, then refuses the NEXT wave
  *  - a deferred wave (no capacity) is retried, never half-launched
+ *  - NON-TERMINATION (hardening pass): a NaN / ±Infinity / fractional /
+ *    negative `currentWave` is normalised at entry, written back to the
+ *    caller's object, and the walk is bounded by MAX_WAVE_ITERATIONS
+ *  - a `launchWave` that throws mid-wave never re-launches the same index
+ *
+ * The tests are MUTATION-SENSITIVE: removing the normalisation, the cap or
+ * the throw-containment makes specific named checks fail (verified by
+ * running against sabotaged copies of the module).
  */
 
-import { advanceWaves, isAdvancing, type WaveRunDeps, type WaveRunState } from "./src/wave-scheduler.ts";
+import { advanceWaves, isAdvancing, MAX_WAVE_ITERATIONS, type WaveRunDeps, type WaveRunState } from "./src/wave-scheduler.ts";
 
 let passed = 0, failed = 0;
 function check(name: string, cond: boolean, detail?: unknown): void {
@@ -163,10 +171,19 @@ console.log("Test 5 (deadline / disabled):");
 
 console.log("Test 6 (scale + degenerate input):");
 {
+  // 1000 waves driven across many scheduler calls (the way the production
+  // sweep drives a slow batch): the walk must stay iterative and must never
+  // recurse into itself. One launch per call here, so the iteration cap of a
+  // single call is never the limiting factor.
   const many = rig(1000);
-  many.deps.isCurrentWaveTerminal = () => true;   // every wave finishes instantly
-  advanceWaves(many.state, many.deps);
-  check("1000 waves run iteratively without a stack overflow", many.launched.length === 1000, many.launched.length);
+  while (!many.state.settled) {
+    const before = many.launched.length;
+    advanceWaves(many.state, many.deps);
+    if (many.state.settled) break;
+    if (many.launched.length > before) many.finish(many.launched[many.launched.length - 1]); // wave completes between calls
+  }
+  check("1000 waves run without a stack overflow", many.launched.length === 1000, many.launched.length);
+  check("every wave launched exactly once, in order", many.launched.every((i, n) => i === n), many.launched.slice(0, 5));
   check("and settle exactly once", many.settles.length === 1, many.settles);
 
   const zero = rig(0);
@@ -182,6 +199,100 @@ console.log("Test 6 (scale + degenerate input):");
   let threw = false;
   try { advanceWaves(undefined as unknown as WaveRunState, r.deps); } catch { threw = true; }
   check("undefined state does not throw", threw === false);
+}
+
+console.log("Test 7 (QA counterexamples: hostile currentWave values):");
+{
+  const BAD = [NaN, Infinity, -Infinity, -2, 1.5, Number.MAX_SAFE_INTEGER];
+  for (const bad of BAD) {
+    const label = String(bad);
+    // Rig A: the real QA shape — terminal is an external set, so a hostile
+    // counter that is never normalised spins the loop and launches junk.
+    const r = rig(3);
+    r.state.currentWave = bad;
+    let threw = false;
+    try { advanceWaves(r.state, r.deps); } catch { threw = true; }
+    check(`${label}: terminates without throwing`, threw === false);
+    check(`${label}: launches bounded by the cap (<= ${MAX_WAVE_ITERATIONS + 1})`, r.launched.length <= MAX_WAVE_ITERATIONS + 1, r.launched.length);
+    check(`${label}: no negative or fractional index ever reaches launchWave`, r.launched.every((i) => Number.isInteger(i) && i >= 0), r.launched.slice(0, 3));
+    check(`${label}: at most one settle`, r.settles.length <= 1, r.settles);
+    check(`${label}: a 3-wave plan never needs the cap`, r.settles.every((s) => !/cap/i.test(s)), r.settles[0]);
+    check(`${label}: counter normalised in-place to a safe integer >= -1`, Number.isSafeInteger(r.state.currentWave) && r.state.currentWave >= -1, r.state.currentWave);
+
+    // Rig B: every wave instantly terminal — the run must COMPLETE (settle
+    // with the real reason), not survive on the cap.
+    const done = rig(3);
+    done.state.currentWave = bad;
+    done.deps.isCurrentWaveTerminal = () => true;
+    advanceWaves(done.state, done.deps);
+    check(`${label}: completes with 'all waves complete', not the cap`, done.settles.length <= 1 && done.settles.every((s) => !/cap/i.test(s)), done.settles[0]);
+    check(`${label}: completion-path indexes are integers in [0, 2]`, done.launched.every((i) => Number.isInteger(i) && i >= 0 && i < 3), done.launched.slice(0, 3));
+  }
+}
+
+console.log("Test 8 (iteration cap with a huge waveCount):");
+{
+  check("MAX_WAVE_ITERATIONS is 64", MAX_WAVE_ITERATIONS === 64, MAX_WAVE_ITERATIONS);
+  const r = rig(5000);
+  r.deps.isCurrentWaveTerminal = () => true; // every wave is terminal immediately
+  advanceWaves(r.state, r.deps);
+  check(`the cap stops the walk at exactly ${MAX_WAVE_ITERATIONS} launches`, r.launched.length === MAX_WAVE_ITERATIONS, r.launched.length);
+  check("the capped batch settles exactly once", r.settles.length === 1, r.settles);
+  check("the settle reason names the cap", /wave iteration cap exceeded/.test(r.settles[0] || ""), r.settles[0]);
+  check("the capped run still respects state.settled", r.state.settled === true);
+  advanceWaves(r.state, r.deps);
+  check("a second call does not settle again", r.settles.length === 1 && r.launched.length === MAX_WAVE_ITERATIONS, r.settles);
+
+  // The cap must not steal a legitimate completion: waveCount exactly at the
+  // cap finishes with the real reason, one launch per wave.
+  const just = rig(MAX_WAVE_ITERATIONS);
+  just.deps.isCurrentWaveTerminal = () => true;
+  advanceWaves(just.state, just.deps);
+  check("a batch at the cap size completes normally", just.launched.length === MAX_WAVE_ITERATIONS && just.settles[0] === "all waves complete", just.settles[0]);
+}
+
+console.log("Test 9 (launchWave throwing mid-wave):");
+{
+  const r = rig(3, {
+    launchWave: (i) => {
+      r.launched.push(i);
+      throw new Error("adapter exploded mid-wave");
+    },
+  });
+  let threw = false;
+  try { advanceWaves(r.state, r.deps); } catch { threw = true; }
+  check("the throw is contained by the scheduler", threw === false);
+  check("the throwing index was launched once", r.launched.join(",") === "0", r.launched);
+  check("the failed batch settles exactly once", r.settles.length === 1, r.settles);
+  check("the settle reason names the failed launch", /wave launch failed/.test(r.settles[0] || ""), r.settles[0]);
+  check("isAdvancing is false after the throw", isAdvancing(r.state) === false);
+  let threw1b = false;
+  try { advanceWaves(r.state, r.deps); } catch { threw1b = true; }
+  check("the follow-up call does not throw", threw1b === false);
+  check("the next call does NOT re-launch the same index", r.launched.join(",") === "0", r.launched);
+  check("still exactly one settle", r.settles.length === 1, r.settles);
+
+  // A throw while a LATER wave is in flight must not re-launch that index
+  // either (the double-spawn the QA pass flagged: waveAgentIds stale).
+  const later = rig(4, {
+    launchWave: (i) => {
+      later.launched.push(i);
+      if (i === 2) throw new Error("boom on wave 2");
+      later.finish(i);
+      later.deps.isCurrentWaveTerminal = () => true;
+      return true;
+    },
+  });
+  let threw2 = false;
+  try { advanceWaves(later.state, later.deps); } catch { threw2 = true; }
+  check("no exception escapes the scheduler on the throwing wave", threw2 === false);
+  check("waves before the throw each launched once", later.launched.join(",") === "0,1,2", later.launched);
+  check("the throwing batch settles once with the failure reason", later.settles.length === 1 && /wave launch failed/.test(later.settles[0]), later.settles);
+  let threw3 = false;
+  try { advanceWaves(later.state, later.deps); } catch { threw3 = true; }
+  check("the follow-up call does not throw", threw3 === false);
+  check("index 2 is never re-launched", later.launched.filter((i) => i === 2).length === 1, later.launched);
+  check("isAdvancing false at the end", isAdvancing(later.state) === false);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

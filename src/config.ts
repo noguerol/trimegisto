@@ -314,7 +314,7 @@ export function foldDedupeFlagIntoGuard(config: { loopSupervisor?: any; dedupeCr
 }
 
 export function applyGuardConfig(
-  supervisor: { updateConfig(partial: any): void } | null | undefined,
+  supervisor: { updateConfig(partial: any): void; getConfig?(): any } | null | undefined,
   guardConfig: unknown,
 ): boolean {
   if (!supervisor || typeof supervisor.updateConfig !== "function") return false;
@@ -322,7 +322,15 @@ export function applyGuardConfig(
   // An empty object would apply nothing while reporting success, which is exactly
   // the kind of silent no-op a caller would trust.
   if (Object.keys(guardConfig as Record<string, unknown>).length === 0) return false;
-  supervisor.updateConfig(guardConfig as any);
+  // Coerce BEFORE it reaches the live guard. This is the only place config can
+  // enter the supervisor, so it must not forward junk keys, a string limit (which
+  // turns `softLimit + grace` into string concatenation and silently moves the
+  // hard kill), or a truthy non-boolean `turnLimitEnabled`. Missing keys fall back
+  // to the guard's CURRENT values, so a partial push can no longer be poisoned.
+  const base = (typeof supervisor.getConfig === "function" ? supervisor.getConfig() : null)
+    ?? getDefaultConfig().loopSupervisor;
+  const clean = sanitizeLoopSupervisorConfig(guardConfig as Record<string, unknown>, base);
+  supervisor.updateConfig(clean);
   return true;
 }
 
