@@ -52,8 +52,6 @@ import { cleanupOldNotifications } from "./context-broker.ts";
 import { reconcileBatch, decideBatchSettle, distillConclusion } from "./reconcile.ts";
 import { planBatch, type PlanNode, type PlanTaskInput } from "./plan-graph.ts";
 import { advanceWaves } from "./wave-scheduler.ts";
-import { ProviderDiagnostics, diagnosticsEnabledFromEnv } from "./diagnostics.ts";
-import { pruneContextMessages, MAX_PROGRESS_MESSAGES } from "./context-prune.ts";
 import { LoopSupervisor, type LoopAlert } from "./loop-supervisor.ts";
 import { ModelHealth, sanitizeModelHealthConfig, MODEL_HEALTH_DEFAULTS } from "./model-health.ts";
 import { speed, MAIN_TARGET } from "./speed.ts";
@@ -112,21 +110,21 @@ const TierEnum = StringEnum(["active", "t1", "t2", "t3"] as const, {
 });
 
 const LaneEnum = StringEnum(["open", "gated", "closed"] as const, {
-  description: "Blast-radius lane. 'closed' = irreversible/high-consequence (deploy, migrate, drop, force-push, credentials) and is REFUSED: ask the user to decide instead. 'gated' = wide but reversible (shared utils, schema, public API, config). 'open' = contained/reversible (default).",
+  description: "Blast radius. 'closed' = irreversible (deploy, migrate, drop, force-push, credentials) => REFUSED, ask the user. 'gated' = wide but reversible (shared utils, schema, public API, config). 'open' = contained (default).",
 });
 
 const TrimegistoTaskItem = Type.Object({
   tier: Type.Optional(TierEnum),
-  task: Type.String({ description: "Agent task (one bounded unit of work, one input in, one output out)." }),
+  task: Type.String({ description: "Task: one bounded unit, one input in, one output out." }),
   cwd: Type.Optional(Type.String({ description: "Agent cwd" })),
   needs: Type.Optional(Type.Array(Type.Number(), {
-    description: "1-based indices of OTHER tasks in THIS same call whose output this task consumes. Declare an edge only if this task genuinely reads their result; two tasks with no edge run in parallel. Example: needs: [1,2].",
+    description: "1-based indices of tasks in THIS call whose output this one consumes. Declare only real deps; no edge = parallel. e.g. [1,2].",
   })),
   why: Type.Optional(Type.String({
-    description: "One line: which part of the overall goal this task serves. Required in practice — a task that cannot name its need should not be spawned.",
+    description: "One line: which part of the goal this serves. Omit it and the task should not spawn.",
   })),
   writes: Type.Optional(Type.Array(Type.String(), {
-    description: "Files this task will write. Two tasks writing the same file are serialised automatically instead of racing.",
+    description: "Files this task writes. Same-file writers are serialised, not raced.",
   })),
   lane: Type.Optional(LaneEnum),
 });
@@ -1004,37 +1002,51 @@ export default function (pi: ExtensionAPI) {
     return rm.length > 0 ? ` (+${rm.length} redundant)` : "";
   }
 
+  /**
+ * ONE source of truth for the coordinator rules, reused by the tool description
+ * and by the per-turn policy so the same instruction is not stored twice.
+ */
+const RULE_DISJOINT = "Subtasks must be DISJOINT: never two agents on the same file or question.";
+const RULE_SCOUTS = "Redundant scouts (same task, different angle) only when you need verification/consensus.";
+const RULE_GRAPH = "Pass `goal`; per task: `why` (need it serves), `needs:[i]` ONLY for real data deps (those run in waves), `writes` for known files (same-file writers are serialised).";
+const RULE_ONENEED = "A task that cannot name the need it serves, or that duplicates another task's inputs and answer, should not be spawned.";
+const RULE_SERIAL = "Mechanical steps (parse, count, rename, format, diff) go in bash, not a model. Irreversible work (delete, deploy, publish, migrate, production data, credentials) is refused: ask the user.";
+const RULE_SETTLE = "Trimegisto delivers ONE reconciliation when the batch settles: use it for the unified final answer; do not re-spawn or answer early.";
+const RULE_NOWAIT = "Never sleep/poll waiting for agents; `trimegisto_harvest` only for an explicit snapshot.";
+
+let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = null;
+  const loadContextPrune = () => (contextPruneImport ??= import("./context-prune.ts"));
+
   function buildToolDescription(): string {
     return [
       "Launch parallel Trimegisto sub-agents.",
-      "PROACTIVE POLICY: when Trimegisto is enabled, decompose and call this tool FIRST for any request with 2+ independent subtasks/files/areas. Skip only for a single indivisible/non-parallelizable/trivial task or explicit user opt-out. Assign DISJOINT, non-overlapping subtasks so no two agents redo the same work; only spawn redundant scouts (same task, different angle) when you explicitly need verification/consensus. After launching, NEVER sleep/poll/wait idly for agents; continue useful foreground work or call trimegisto_harvest for an instant snapshot.",
+      "PROACTIVE POLICY: when enabled, decompose and call this FIRST for any request with 2+ independent subtasks/files/areas/checks; skip only for single indivisible/trivial work or an explicit opt-out.",
+      "Assign DISJOINT subtasks so no two agents redo the same work; scouts only for verification.",
+      RULE_GRAPH,
+      RULE_SETTLE,
       "Tiers now:",
       tierStatusLine("active"),
       tierStatusLine("t1"),
       tierStatusLine("t2"),
       tierStatusLine("t3"),
       "Default active/t0 = main pi model; prefer several active agents for mass parallel work across DIFFERENT files/areas.",
-      "PLAN CONTRACT (this is what keeps cost down): always pass `goal` (the overall objective) and, per task, `why` (the part of the goal it serves). Declare `needs: [i]` ONLY when a task really reads another task's output — a declared edge runs in waves and the upstream verdict is injected into the dependent task; tasks WITHOUT an edge run in parallel. Declare `writes: [paths]` when you know the files a task will write: writers of the same file are serialised automatically. Pass `lane` only to override the automatic blast-radius lane.",
-      "A deterministic plan gate runs BEFORE anything is spawned: it merges near-duplicate tasks inside the batch, serialises same-file writers, warns when a task looks like a pure code transformation (do it with bash instead of a model), warns when `needs` reads like a pipeline step but no edge was declared, and REFUSES the batch when any task lands in the closed lane (irreversible/high-consequence: deletions, deploy, publish, migrations, production data, credentials). Design the graph, never a flat pile: parallel only what is independent, serialise what is not, and never re-spawn work already in flight.",
-      "When a batch settles, Trimegisto sends ONE deterministic reconciliation (per-agent verdicts, status counts, overlaps, INCOMPLETE list). When you receive it, write the unified final answer for the user; do not re-spawn the same work, and do not answer before it arrives.",
-      "Roles: active=t0 mass worker; t3=mechanical; t2=reasoning; t1=deep planning only.",
-      "Only spawn ✓ ENABLED tiers; ✗ unavailable fails. IDs: t0a,t1a,t2b,t3c... Disabled tool returns error.",
+      "Roles: active=t0 mass worker; t3 mechanical; t2 reasoning; t1 planning only.",
+      "Only spawn ✓ ENABLED tiers; ✗ fails. IDs: t0a,t1a,t2b,t3c. Disabled tool returns error.",
     ].join("\n");
   }
-
   // ── Register the main Trimegisto tool ──────────────────
   function registerMainTool(): void {
   pi.registerTool({
     name: "trimegisto",
     label: "Trimegisto Multi-Agent",
     description: buildToolDescription(),
-    promptSnippet: "TRIMEGISTO ACTIVE: spawn parallel agents before decomposable work. After launch, never sleep/poll to wait; continue work or call trimegisto_harvest. Default tier active; use only ENABLED tiers.",
+    promptSnippet: "Spawn first for decomposable work; never poll to wait. Only ENABLED tiers; default active.",
     parameters: Type.Object({
       tasks: Type.Array(TrimegistoTaskItem, {
-        description: "Tasks. Max 8. Default tier active. Tasks without a 'needs' edge run in parallel; declared dependencies are executed in waves.",
+        description: "Tasks (max 8). No `needs` edge = runs in parallel; declared deps run in waves.",
       }),
       goal: Type.Optional(Type.String({
-        description: "The overall objective this batch must advance. Used by the plan gate to check that every task serves a real need.",
+        description: "Overall objective of the batch; the plan gate checks every task serves it.",
       })),
       cwd: Type.Optional(Type.String({ description: "Shared cwd" })),
     }),
@@ -1153,8 +1165,8 @@ export default function (pi: ExtensionAPI) {
       // Human-readable notes about how the plan was reshaped. Computed here so
       // EVERY branch (including the refusals) can report what changed.
       const planNotes: string[] = [];
-      if (plan.counts.duplicates > 0) planNotes.push(`⏭ Merged ${plan.counts.duplicates} duplicate task(s) inside this batch.`);
-      if (plan.counts.serialized > 0) planNotes.push(`🔗 Serialised ${plan.counts.serialized} task(s) that would race on the same file.`);
+      if (plan.counts.duplicates > 0) planNotes.push(`⏭ Merged ${plan.counts.duplicates} in-batch duplicate(s).`);
+      if (plan.counts.serialized > 0) planNotes.push(`🔗 Serialised ${plan.counts.serialized} same-file racer(s).`);
       for (const w of droppedNeeds) planNotes.push(`⚠️ ${w}`);
       if (skippedTasks.length > 0) {
         planNotes.push(`⏭ Skipped ${skippedTasks.length} near-duplicate task(s) of already-spawned work:\n` +
@@ -1286,9 +1298,8 @@ export default function (pi: ExtensionAPI) {
           content: [{
             type: "text",
             text: plan.summary +
-              `\n\n⏳ **Queued, not spawned yet:** ${waves[0]?.length ?? 0} task(s) waiting for tier capacity. ` +
-              `Trimegisto launches them automatically as soon as a slot frees and still delivers ONE reconciliation. ` +
-              `Do NOT call trimegisto again for this work — retrying would duplicate it.` +
+              `\n\n⏳ **Queued:** ${waves[0]?.length ?? 0} task(s) waiting for capacity; they launch when a slot frees and still yield ONE reconciliation. ` +
+              `Do NOT re-call trimegisto for this work — a retry duplicates it.` +
               (planNotes.length > 0 ? `\n\n${planNotes.join("\n")}` : ""),
           }],
           details: { tasks: [], plan: planDetails },
@@ -1303,7 +1314,7 @@ export default function (pi: ExtensionAPI) {
           content: [{
             type: "text",
             text: plan.summary +
-              `\n\n⚠️ The batch settled immediately without any runnable work. The reconciliation above was already delivered to the chat.` +
+              `\n\n⚠️ Batch settled with no runnable work; the reconciliation is already in chat.` +
               (planNotes.length > 0 ? `\n\n${planNotes.join("\n")}` : ""),
           }],
           details: { tasks: taskDetails, plan: planDetails },
@@ -1315,7 +1326,7 @@ export default function (pi: ExtensionAPI) {
         content: [{
           type: "text",
           text: plan.summary +
-            `\n\n🚀 **Wave 1 of ${waves.length} is running now: ${taskDetails.length} of ${plan.launch.length} planned agent(s).**` +
+            `\n\n🚀 **Wave 1/${waves.length} running: ${taskDetails.length}/${plan.launch.length} planned.**` +
             `\nThe list below is wave 1 only — later waves start when their dependencies settle:\n${taskList}` +
             (planNotes.length > 0 ? `\n\n${planNotes.join("\n")}` : "") +
             `\n\nA wave only starts when the previous one is terminal, so a declared \`needs\` edge really carries the upstream verdict. ` +
@@ -1437,7 +1448,7 @@ export default function (pi: ExtensionAPI) {
     name: "trimegisto_harvest",
     label: "Trimegisto Harvest",
     description: "Instant, non-blocking snapshot of Trimegisto agents. Use this instead of sleep/polling when you need to integrate available results. Never waits for running agents.",
-    promptSnippet: "Use trimegisto_harvest for immediate available results; never run sleep/poll loops waiting for agents.",
+    promptSnippet: "Instant agent snapshot; never poll waiting.",
     parameters: Type.Object({
       includeOutput: Type.Optional(Type.Boolean({ description: "Include output previews (default true)" })),
       maxOutputChars: Type.Optional(Type.Number({ description: "Max chars per agent output preview (default 1200)" })),
@@ -1447,7 +1458,7 @@ export default function (pi: ExtensionAPI) {
       const maxOutputChars = Math.max(200, Math.min(8000, Math.floor(params.maxOutputChars || 1200)));
       const agents = Array.from(getAgents().values()).sort((a, b) => a.startedAt - b.startedAt);
       if (agents.length === 0) {
-        return { content: [{ type: "text", text: "No Trimegisto agents in this session." }], details: { agents: [] } };
+        return { content: [{ type: "text", text: "No agents this session." }], details: { agents: [] } };
       }
 
       const lines: string[] = ["## Trimegisto harvest (instant snapshot)", ""];
@@ -1858,32 +1869,41 @@ export default function (pi: ExtensionAPI) {
   // recorded for a bounded period. `TRIMEGISTO_CAPTURE_PAYLOADS=1` forces it on.
   const CAPTURE_WINDOW_MS = 10 * 60_000;
   let captureUntil = 0;
-  let providerDiagnostics: ProviderDiagnostics | null = null;
-  const diagnostics = (): ProviderDiagnostics => {
-    if (!providerDiagnostics) providerDiagnostics = new ProviderDiagnostics({ enabled: true });
-    return providerDiagnostics;
+  let diagnosticsImport: Promise<typeof import("./diagnostics.ts")> | null = null;
+  let providerDiagnostics: import("./diagnostics.ts").ProviderDiagnostics | null = null;
+  /** Lazily loaded (the module pulls fs/os/path): pi awaits these handlers, so
+   * awaiting here adds no turn latency beyond the first capture. */
+  const diagnosticsModule = async () => (diagnosticsImport ??= import("./diagnostics.ts"));
+  const ensureDiagnostics = async () => {
+    const { ProviderDiagnostics } = await diagnosticsModule();
+    return (providerDiagnostics ??= new ProviderDiagnostics({ enabled: true }));
   };
-  const captureActive = (): boolean => diagnosticsEnabledFromEnv() || Date.now() <= captureUntil;
+  const captureActive = async (): Promise<boolean> => {
+    if (Date.now() <= captureUntil) return true;
+    const { diagnosticsEnabledFromEnv } = await diagnosticsModule();
+    return diagnosticsEnabledFromEnv();
+  };
 
   // MUST NOT return a value: a returned payload would replace the real request.
-  pi.on("before_provider_request", (event) => {
-    if (disposed || !config.enabled || !captureActive()) return;
-    try { diagnostics().recordRequest(event.payload); } catch { /* diagnostics never break a request */ }
+  pi.on("before_provider_request", async (event) => {
+    if (disposed || !config.enabled || !(await captureActive())) return;
+    try { (await ensureDiagnostics()).recordRequest(event.payload); } catch { /* never break a request */ }
   });
 
-  pi.on("after_provider_response", (event) => {
+  pi.on("after_provider_response", async (event) => {
     if (disposed || !config.enabled) return;
     try {
       if (event.status >= 400) {
         const wasArmed = Date.now() <= captureUntil;
         captureUntil = Date.now() + CAPTURE_WINDOW_MS;
+        const { diagnosticsEnabledFromEnv } = await diagnosticsModule();
         if (!wasArmed && !diagnosticsEnabledFromEnv()) {
           safeAppendEntry("trimegisto-log", {
             text: `📸 Provider answered **${event.status}** — capturing request payloads for 10 min so the next failure can be diagnosed (see the diagnostics file path in /tmg diagnostics).`,
           });
         }
       }
-      if (captureActive()) diagnostics().recordResponse(event.status, event.headers);
+      if (Date.now() <= captureUntil) (await ensureDiagnostics()).recordResponse(event.status, event.headers);
     } catch { /* diagnostics never break a request */ }
   });
 
@@ -1897,6 +1917,7 @@ export default function (pi: ExtensionAPI) {
     if (!config.enabled) return;
     const messages: any[] = event.messages as any[];
     if (!Array.isArray(messages) || messages.length === 0) return;
+    const { pruneContextMessages, MAX_PROGRESS_MESSAGES } = await loadContextPrune();
     const pruned = pruneContextMessages(messages, MAX_PROGRESS_MESSAGES);
     if (pruned !== messages) return { messages: pruned };
   });
@@ -1922,20 +1943,16 @@ export default function (pi: ExtensionAPI) {
 
     const proactivePolicy = config.autoSpawn
       ? [
-          "TRIMEGISTO IS ACTIVE: you are operating in multi-agent mode.",
-          "For every user request, first decide whether it has 2+ independent subtasks/files/areas/checks.",
-          "If it is decomposable, your FIRST assistant action MUST be a `trimegisto` batch tool call that launches parallel agents; then do only coordination and synthesis while they run.",
-          "Do NOT solve decomposable work entirely in the main agent before spawning. Use the main agent for orchestration, final integration, and genuinely single-threaded steps.",
-          "Assign DISJOINT, non-overlapping subtasks so no two agents redo the same work. Never give two agents the same file or the same question.",
-          "Draw the graph before spawning: pass a `goal` plus a one-line `why` per task, declare `needs` only for real data dependencies (those run in waves, not in parallel), and `writes` for known output files (same-file writers are serialised). A task that cannot state which part of the goal it serves should not be spawned.",
-          "Prefer one agent per independent unit of work. If two proposed tasks would read the same inputs and produce overlapping answers, they are ONE task, not two. If a step is a mechanical transformation (parse, count, rename, format, diff), do it with bash yourself instead of paying a model for it. Work that cannot be undone (deletions, deploy, publish, migrations, production data, credentials) is refused: ask the user instead.",
-          "Only spawn redundant 'scout' agents (same task, different angle) when you explicitly need verification/consensus — not by default.",
-          "Skip spawning only when the task is trivial, a single indivisible/non-parallelizable step, or the user explicitly asks not to delegate.",
-          "Assign DISJOINT, non-overlapping subtasks; never two agents on the same file/question. Only spawn redundant scouts when you need verification/consensus.",
-          "After spawning, never run sleep/poll loops just to wait. Continue useful foreground work; Trimegisto injects ONE final reconciliation with every agent's conclusion when the batch settles — use it to write the unified final answer instead of re-spawning or answering early. Call `trimegisto_harvest` only for an explicit on-demand snapshot.",
+          "TRIMEGISTO ACTIVE (multi-agent mode). For every request, first check for 2+ independent subtasks/files/areas/checks; if decomposable, your FIRST action MUST be a `trimegisto` batch call — do not solve it serially first. Then orchestrate and integrate.",
+          RULE_DISJOINT,
+          RULE_SCOUTS,
+          RULE_GRAPH,
+          RULE_ONENEED,
+          RULE_SERIAL,
+          RULE_NOWAIT,
+          "Skip spawning only for trivial/indivisible work or an explicit opt-out.",
         ].join("\n")
       : "Trimegisto is enabled but auto-spawn is OFF: delegate only when explicitly requested or clearly useful.";
-
     return {
       message: {
         customType: "trimegisto-context",
