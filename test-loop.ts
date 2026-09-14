@@ -383,6 +383,20 @@ console.log("Guard choke point (static invariant):");
   }
   check("no file bypasses applyGuardConfig to push guard config", violations.length === 0, violations);
   check("the choke point exists exactly once in src/config.ts", chokeHits === 1, chokeHits);
+
+  // The choke point must not let junk reach the live guard (type hole found by
+  // adversarial QA: it forwarded `unknown` straight into a merge).
+  const guarded = new LoopSupervisor({ enabled: true, maxAgentTurns: 20, turnLimitGrace: 15, dedupeCrossAgent: false });
+  applyGuardConfig(guarded, { turnLimitEnabled: 1 });
+  check("a truthy 1 cannot be pushed into the live config", guarded.getConfig().turnLimitEnabled === false, guarded.getConfig().turnLimitEnabled);
+  applyGuardConfig(guarded, { turnLimitEnabled: "yes" });
+  check('a string "yes" cannot be pushed either', guarded.getConfig().turnLimitEnabled === false);
+  applyGuardConfig(guarded, { maxAgentTurns: "5", turnLimitGrace: undefined, junkKey: 1 });
+  check("a string limit is not forwarded (no string concat on the hard kill)", guarded.getConfig().maxAgentTurns === 20, guarded.getConfig().maxAgentTurns);
+  check("the grace survives an undefined push", guarded.getConfig().turnLimitGrace === 15);
+  check("junk keys are dropped, not merged in", !("junkKey" in guarded.getConfig()));
+  check("a valid push still works", applyGuardConfig(guarded, { turnLimitEnabled: true }) === true && guarded.getConfig().turnLimitEnabled === true);
+  check("and the gate then enforces it", guarded.checkTurnLimit("g", "active", 36) === true);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
