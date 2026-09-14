@@ -511,7 +511,18 @@ export default function (pi: ExtensionAPI) {
     // Allow a legitimate retry if the accepted spawn failed outright
     if (result.status === "error" || result.status === "killed") forgetTask(result.task);
     batch.results.set(result.agentId, result);
-    advanceBatch(batch);
+    // This runs inside agent-manager's child-process close callback
+    // (`instance.resolve?.(buildResult())`), which has NO handler of its own: an
+    // exception here would propagate into pi's process exit path and can take the
+    // host down. No scheduling bookkeeping is worth crashing pi for — report it
+    // and let the deadline sweep settle the batch.
+    try {
+      advanceBatch(batch);
+    } catch (err: any) {
+      safeAppendEntry("trimegisto-log", {
+        text: `⚠️ Scheduler error while handling a result for ${batch.id}: ${err?.message || String(err)}`,
+      });
+    }
   }
 
   /**
