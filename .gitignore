@@ -26,3 +26,7 @@ plan_*_[0-9a-zA-Z]*.md
 plan.md
 # t-plan: plan files are private runtime state — never commit or publish them
 plan_*.md
+
+# package-lock: the package has no installable deps (peer-only, optional)
+# and CI publishes without npm install; the lock would be dead weight.
+package-lock.json
