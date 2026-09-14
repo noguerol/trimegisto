@@ -71,6 +71,7 @@ export function saveConfig(config: TrimegistoConfig): void {
       dedupeTasks: config.dedupeTasks,
       dedupeCrossAgent: config.dedupeCrossAgent,
       dashboardVisible: config.dashboardVisible,
+      dashboardMode: config.dashboardMode,
       watchdog: config.watchdog,
       loopSupervisor: config.loopSupervisor,
       modelHealth: config.modelHealth,
@@ -108,6 +109,7 @@ export function loadConfig(): {
   dedupeTasks?: boolean;
   dedupeCrossAgent?: boolean;
   dashboardVisible?: boolean;
+  dashboardMode?: "compact" | "widget" | "off";
   watchdog?: Partial<{ firstResponseSeconds: number; idleSeconds: number; maxRuntimeSeconds: number }>;
   _schemaVersion?: number;
   loopSupervisor?: Partial<{ enabled: boolean; maxSpawnDepth: number; turnLimitEnabled: boolean; maxAgentTurns: number; turnLimitGrace: number; dedupeCrossAgent: boolean }>;
@@ -136,6 +138,7 @@ export function loadConfig(): {
       dedupeTasks: typeof data.dedupeTasks === "boolean" ? data.dedupeTasks : undefined,
       dedupeCrossAgent: typeof data.dedupeCrossAgent === "boolean" ? data.dedupeCrossAgent : undefined,
       dashboardVisible: typeof data.dashboardVisible === "boolean" ? data.dashboardVisible : undefined,
+      dashboardMode: data.dashboardMode === "compact" || data.dashboardMode === "widget" || data.dashboardMode === "off" ? data.dashboardMode : (data.dashboardVisible === false ? "off" : "compact"),
       watchdog: data.watchdog && typeof data.watchdog === "object" ? data.watchdog : undefined,
       _schemaVersion: typeof data._schemaVersion === "number" ? data._schemaVersion : undefined,
       loopSupervisor: data.loopSupervisor && typeof data.loopSupervisor === "object" ? data.loopSupervisor : undefined,

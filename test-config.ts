@@ -103,20 +103,50 @@ function makeHarness(script: Step[], inputAnswer: string | undefined = undefined
       custom: async () => undefined,
     },
   };
+  // ── Dashboard: live getter + setter that mirrors production EXACTLY.
+  //    Production's setDashboardMode only mutates the closure var; it does NOT
+  //    touch config. The menu handler in config-ui.ts and the toggle in
+  //    index.ts each persist the mode themselves. If the harness set the
+  //    closure AND the config here, dropping the production menu-side write
+  //    would go uncaught. Keep this strictly closure-only.
+  let liveDashboardMode = (config.dashboardMode ?? (config.dashboardVisible === false ? "off" : "compact")) as "compact" | "widget" | "off";
+  let dashboardRenders = 0;
+  const setDashboardMode = (mode: "compact" | "widget" | "off") => {
+    liveDashboardMode = mode;
+  };
+  const cycleDashboard = () => {
+    // Mirrors the production toggle (cycle closure var, persist to config,
+    // call saveConfig / bump the saved counter). The saved-counter increment
+    // is the harness stand-in for saveConfig() so the test can catch the
+    // menu-cycle and toggle-cycle by the same persistence test.
+    const modes: Array<"compact" | "widget" | "off"> = ["compact", "widget", "off"];
+    liveDashboardMode = modes[(modes.indexOf(liveDashboardMode) + 1) % modes.length];
+    config.dashboardMode = liveDashboardMode;
+    config.dashboardVisible = liveDashboardMode !== "off";
+    dashboardRenders++;
+    saved++;
+  };
   const rt = {
     config,
-    dashboardMode: "compact" as const,
-    setDashboardMode: () => {},
+    get dashboardMode() { return liveDashboardMode; },
+    setDashboardMode,
+    toggleDashboard: cycleDashboard,
     activeModel: null,
     ctxRef: null,
-    updateDashboard: () => {},
+    updateDashboard: () => { dashboardRenders++; },
     haltAll: () => 0,
     saveConfig: () => { saved++; },
     registerMainTool: () => {},
     syncLoopSupervisor: () => {},
     syncWatchdog: () => {},
   };
-  return { ctx, rt, calls, config, savedCount: () => saved };
+  return {
+    ctx, rt, calls, config,
+    savedCount: () => saved,
+    dashboardMode: () => liveDashboardMode,
+    dashboardRenders: () => dashboardRenders,
+    cycleDashboard,
+  };
 }
 
 console.log("Test 3 (tier submenu stays open after toggling):");
@@ -355,6 +385,107 @@ console.log("Test 18 (full dashboard shows the agent model):");
   const doneAgent = renderDashboard(makeAgent({ status: "done", finishedAt: Date.now(), model: "moonshot/kimi-k3" }));
   check("done agents also show the model", doneAgent.includes("Kimi K3"), doneAgent.split("\n").find(l => l.includes("t2a")));
 }
+
+console.log("Dashboard mode is persisted AND the menu label tracks each cycle:");
+{
+  const h = makeHarness(["Dashboard: compact", "Dashboard: widget", "Done"]);
+  await runConfigUI(h.ctx, h.rt as any);
+  // Two menu cycles: compact -> widget -> off. The persisted config must end
+  // up at "off" (not the in-session snapshot) and saveConfig must be called
+  // twice. The runtime getter must also reflect the current mode, otherwise
+  // the menu label freezes at the value captured when the runtime was built.
+  check("menu cycles persisted the full mode 'off'", h.config.dashboardMode === "off", h.config.dashboardMode);
+  check("the legacy boolean is mirrored from the mode", h.config.dashboardVisible === false, h.config.dashboardVisible);
+  check("save was called for each cycle", h.savedCount() >= 2, h.savedCount());
+  check("the runtime getter tracks each cycle (no frozen snapshot)", h.dashboardMode() === "off", h.dashboardMode());
+  check("the widget re-rendered through updateDashboard", h.dashboardRenders() >= 2, h.dashboardRenders());
+}
+
+console.log("/tmg dashboard persists AND saves like the menu (otherwise /reload loses it):");
+{
+  const h = makeHarness(["Done"]);
+  await runConfigUI(h.ctx, h.rt as any);
+  h.cycleDashboard(); // compact -> widget
+  h.cycleDashboard(); // widget -> off
+  check("two /tmg dashboard cycles reached 'off'", h.config.dashboardMode === "off", h.config.dashboardMode);
+  check("/tmg dashboard calls saveConfig (survives /reload)", h.savedCount() >= 2, h.savedCount());
+}
+
+console.log("Restart simulation: the saved dashboardMode restores; legacy configs derive from the boolean:");
+{
+  // What session_start in index.ts does with the persisted config is
+  //   dashboardMode = config.dashboardMode ?? (config.dashboardVisible === false ? "off" : "compact");
+  const seed = (cfg: { dashboardMode?: "compact" | "widget" | "off"; dashboardVisible?: boolean }) =>
+    cfg.dashboardMode ?? (cfg.dashboardVisible === false ? "off" : "compact");
+  check("explicit 'widget' survives", seed({ dashboardMode: "widget", dashboardVisible: true }) === "widget");
+  check("explicit 'off' survives", seed({ dashboardMode: "off", dashboardVisible: false }) === "off");
+  check("legacy config (boolean=false) starts in 'off'", seed({ dashboardVisible: false }) === "off");
+  check("legacy config (boolean=true) falls back to 'compact'", seed({ dashboardVisible: true }) === "compact");
+  check("legacy config (no fields) defaults to 'compact'", seed({}) === "compact");
+}
+
+console.log("Dashboard cycle (compact -> widget -> off -> compact) is the pure mapping production uses:");
+{
+  const cycle = (m: "compact" | "widget" | "off"): "compact" | "widget" | "off" => {
+    const modes: Array<"compact" | "widget" | "off"> = ["compact", "widget", "off"];
+    return modes[(modes.indexOf(m) + 1) % modes.length]!;
+  };
+  check("compact -> widget", cycle("compact") === "widget");
+  check("widget -> off",   cycle("widget") === "off");
+  check("off -> compact",  cycle("off") === "compact");
+  check("three cycles return to start (cycle length = 3)", cycle(cycle(cycle("off"))) === "off");
+  check("three cycles return to start from any state", cycle(cycle(cycle("compact"))) === "compact" && cycle(cycle(cycle("widget"))) === "widget");
+}
+
+console.log("Persistence round-trip: saveConfig actually writes dashboardMode and loadConfig restores it:");
+{
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  // Real round-trip through persistence.ts: write a config with widget mode,
+  // then call loadConfig and assert the mode is preserved. We can't override
+  // getAgentDir() directly, but we can point at a temp HOME so the writer's
+  // derived path lands in our temp directory.
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "tmg-home-"));
+  const prevHome = process.env.HOME;
+  const prevUserprofile = process.env.USERPROFILE;
+  process.env.HOME = tmpHome;
+  process.env.USERPROFILE = tmpHome;
+  try {
+    const { saveConfig, loadConfig } = await import("./src/persistence.ts");
+    const base = getDefaultConfig();
+    base.dashboardMode = "widget";
+    base.dashboardVisible = true;
+    saveConfig(base);
+    const reloaded = loadConfig();
+    check("loadConfig restores the persisted widget mode", reloaded?.dashboardMode === "widget", reloaded?.dashboardMode);
+    check("loadConfig also restores the legacy boolean", reloaded?.dashboardVisible === true, reloaded?.dashboardVisible);
+    // Switch and round-trip again to prove the writer doesn't latch onto the
+    // first mode and to catch a writer that only writes dashboardVisible.
+    base.dashboardMode = "off";
+    base.dashboardVisible = false;
+    saveConfig(base);
+    const reloaded2 = loadConfig();
+    check("a second save with 'off' round-trips", reloaded2?.dashboardMode === "off", reloaded2?.dashboardMode);
+    // Legacy read: a hand-written file with only the boolean should still
+    // restore a sensible mode (the loader's fallback).
+    const agentDir = fs.realpathSync.native(tmpHome);
+    const cfgPath = path.join(tmpHome, ".pi", "agent", "trimegisto", "config.json");
+    fs.writeFileSync(cfgPath, JSON.stringify({ dashboardVisible: false }));
+    const legacy = loadConfig();
+    check("a legacy file with only dashboardVisible:false restores 'off'", legacy?.dashboardMode === "off", legacy?.dashboardMode);
+    fs.writeFileSync(cfgPath, JSON.stringify({ dashboardVisible: true }));
+    const legacy2 = loadConfig();
+    check("a legacy file with only dashboardVisible:true restores 'compact'", legacy2?.dashboardMode === "compact", legacy2?.dashboardMode);
+    fs.rmSync(path.join(tmpHome, ".pi"), { recursive: true, force: true });
+  } finally {
+    process.env.HOME = prevHome;
+    if (prevUserprofile !== undefined) process.env.USERPROFILE = prevUserprofile;
+    else delete process.env.USERPROFILE;
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+}
+
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

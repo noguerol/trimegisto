@@ -660,11 +660,17 @@ export default function (pi: ExtensionAPI) {
 
   // Store toggle function on pi for commands to access
   (pi as any)._trimegistoToggleDashboard = () => {
-    // Cycle through modes: compact -> widget -> off -> compact
+    // Cycle through modes: compact -> widget -> off -> compact. Persist the FULL
+    // mode (not just the boolean legacy field) and save so the choice survives
+    // a restart; otherwise dashboardMode resets to the hardcoded default on the
+    // next session and the cycle looks like it never happened.
     const modes: Array<"widget" | "compact" | "off"> = ["compact", "widget", "off"];
     const idx = modes.indexOf(dashboardMode);
     dashboardMode = modes[(idx + 1) % modes.length];
-    updateDashboard();
+    config.dashboardMode = dashboardMode;
+    config.dashboardVisible = dashboardMode !== "off";
+    void updateDashboard();
+    saveConfig();
   };
 
   // ── Agent log buffers for chat streaming ──────────────
@@ -1575,7 +1581,12 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
       const { runConfigUI } = await import("./config-ui.ts");
       return runConfigUI(ctx, {
         config,
-        dashboardMode,
+        // Live getter on `dashboardMode` so the menu label "Dashboard: …" reads
+        // the CURRENT value each time the menu is rendered, not the stale value
+        // captured at the moment the runtime was built. Without this the label
+        // freezes at the initial mode after the first cycle and the selector
+        // looks broken.
+        get dashboardMode() { return dashboardMode; },
         setDashboardMode: (mode) => { dashboardMode = mode; },
         activeModel,
         ctxRef,
@@ -1677,6 +1688,10 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
         redundantAgents: savedConfig.redundantAgents ?? config.redundantAgents,
         dedupeTasks: savedConfig.dedupeTasks ?? config.dedupeTasks,
         dedupeCrossAgent: savedConfig.dedupeCrossAgent ?? config.dedupeCrossAgent,
+        // Restore the dashboard mode from saved config; legacy entries that
+        // only kept the boolean get the matching mode. The closure variable is
+        // separately synced in this session_start after the config merge below.
+        dashboardMode: savedConfig.dashboardMode ?? (savedConfig.dashboardVisible === false ? "off" : "compact"),
         dashboardVisible: savedConfig.dashboardVisible ?? config.dashboardVisible,
         watchdog: {
           firstResponseSeconds: clampWatchdogSeconds(savedConfig.watchdog?.firstResponseSeconds ?? config.watchdog.firstResponseSeconds, WATCHDOG_DEFAULTS.firstResponseSeconds),
@@ -1725,6 +1740,9 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
     // current tier availability (enabled/disabled, models loaded)
     try { registerMainTool(); } catch { /* tool not registered yet on first load */ }
 
+    // Restore the dashboard mode from config; legacy saved configs that only
+    // store dashboardVisible get a sensible mode derived from it (false -> off).
+    dashboardMode = config.dashboardMode ?? (config.dashboardVisible === false ? "off" : "compact");
     dashboardVisible = config.dashboardVisible;
 
     // Dashboard reactivity — uses callbacks, NOT footer replacement
