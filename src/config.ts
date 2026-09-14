@@ -295,6 +295,24 @@ export const MAX_WATCHDOG_SECONDS = Math.floor(2_147_483_647 / 1000); // ~24.8 d
  *
  * Returns true when a config was applied.
  */
+/**
+ * Fold the TOP-LEVEL `dedupeCrossAgent` flag into the guard config before pushing it.
+ *
+ * There are two copies of that setting (a top-level shortcut and the guard's own
+ * field) and a legacy config file written before they existed kept only the
+ * top-level one. Pushing the guard block without this fold silently reverted
+ * cross-agent dedup to the stale in-block value whenever any unrelated setting was
+ * saved — the same file/instance divergence class as the turn-limit bug.
+ *
+ * Mutates `config.loopSupervisor` in place on purpose: the config UI holds a
+ * reference to it across submenu edits.
+ */
+export function foldDedupeFlagIntoGuard(config: { loopSupervisor?: any; dedupeCrossAgent?: boolean }): any | undefined {
+  if (!config || !config.loopSupervisor || typeof config.loopSupervisor !== "object") return undefined;
+  config.loopSupervisor.dedupeCrossAgent = config.dedupeCrossAgent === true;
+  return config.loopSupervisor;
+}
+
 export function applyGuardConfig(
   supervisor: { updateConfig(partial: any): void } | null | undefined,
   guardConfig: unknown,
