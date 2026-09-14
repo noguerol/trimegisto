@@ -2025,6 +2025,13 @@ export default function (pi: ExtensionAPI) {
 
   // ── Persist config ─────────────────────────────────────
   function saveConfig(): void {
+    // Whatever was just edited must reach the LIVE guard as well. The config UI
+    // and the supervisor are two views of the same settings, and a save whose
+    // push was skipped leaves the guard running on a stale value — the reported
+    // symptom being "the UI says turn limit OFF while agents are still killed at
+    // the hard limit". Pushing the whole object on every save makes that
+    // divergence impossible through the config path.
+    if (config.loopSupervisor) loopSupervisor.updateConfig(config.loopSupervisor);
     // Save to dedicated config file (survives session changes)
     persistConfig(config);
     if (disposed) return;
