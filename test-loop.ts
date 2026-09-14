@@ -6,7 +6,7 @@
 //
 // Run: node --experimental-strip-types test-loop.ts
 import { LoopSupervisor, DEFAULT_LOOP_CONFIG } from "./src/loop-supervisor.ts";
-import { sanitizeLoopSupervisorConfig } from "./src/config.ts";
+import { sanitizeLoopSupervisorConfig, applyGuardConfig } from "./src/config.ts";
 import { setAgentStatus, agentIdleMs } from "./src/agent-manager.ts";
 import type { AgentInstance } from "./src/types.ts";
 
@@ -283,12 +283,20 @@ console.log("Turn-limit opt-in / config drift:");
   // the guard ON while the UI shows OFF. These pin the two invariants the fix
   // relies on.
   const s = new LoopSupervisor({ enabled: true, turnLimitEnabled: true, maxAgentTurns: 20, turnLimitGrace: 15 });
-  check("hard limit fires while ON", s.checkTurnLimit("a", "active", 36) === true || s.checkTurnLimit("b", "active", 36) === true);
+  check("warning fires past the soft limit", s.checkTurnLimit("w", "active", 21) === false);
+  check("kill fires past the grace", s.checkTurnLimit("k", "active", 36) === true);
   s.updateConfig({ maxAgentTurns: 20 });
   check("a partial update PRESERVES the flag (documented hazard)", s.getConfig().turnLimitEnabled === true);
-  s.updateConfig({ enabled: true, maxSpawnDepth: 5, turnLimitEnabled: false, maxAgentTurns: 20, turnLimitGrace: 15, dedupeCrossAgent: false });
+  // The fix's choke point, exercised with the REAL supervisor: if someone drops
+  // the applyGuardConfig call from a save path, the instance keeps killing while
+  // the persisted config says OFF.
+  check("applyGuardConfig reports success", applyGuardConfig(s, { enabled: true, maxSpawnDepth: 5, turnLimitEnabled: false, maxAgentTurns: 20, turnLimitGrace: 15, dedupeCrossAgent: false }) === true);
   check("pushing the whole object turns the limit off", s.getConfig().turnLimitEnabled === false);
   check("and then it never warns or kills", s.checkTurnLimit("c", "active", 999) === false);
+  check("the push preserves guard state (no silent warning reset)", s.getState().tiers.active.turnWarned >= 1, s.getState().tiers.active.turnWarned);
+  check("missing guard config is a safe no-op", applyGuardConfig(s, undefined) === false);
+  check("non-object guard config is rejected", applyGuardConfig(s, "nope") === false && applyGuardConfig(s, [1]) === false);
+  check("no supervisor is a safe no-op", applyGuardConfig(null, {}) === false);
 
   // sanitizeLoopSupervisorConfig always returns the flag explicitly, so a config
   // loaded from disk can never be pushed with the field missing.

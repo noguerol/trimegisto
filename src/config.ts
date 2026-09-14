@@ -283,6 +283,28 @@ export const DEFAULT_PROMPTS_MAP = DEFAULT_PROMPTS;
 export const MAX_WATCHDOG_SECONDS = Math.floor(2_147_483_647 / 1000); // ~24.8 days
 
 /** Default watchdog timeouts in seconds (0 = disabled). */
+/**
+ * Push the persisted guard config onto the live supervisor.
+ *
+ * EVERY save/sync path must go through this. `LoopSupervisor.updateConfig`
+ * MERGES, so a path that forgets to push leaves the instance on a stale value
+ * while the file (and therefore the UI) says otherwise — the reported "turn
+ * limit OFF but agents still warned and killed at the hard limit" divergence.
+ * Single choke point on purpose: it is the one place that can be tested without
+ * importing the extension, and the one place a future save path has to call.
+ *
+ * Returns true when a config was applied.
+ */
+export function applyGuardConfig(
+  supervisor: { updateConfig(partial: any): void } | null | undefined,
+  guardConfig: unknown,
+): boolean {
+  if (!supervisor || typeof supervisor.updateConfig !== "function") return false;
+  if (!guardConfig || typeof guardConfig !== "object" || Array.isArray(guardConfig)) return false;
+  supervisor.updateConfig(guardConfig as any);
+  return true;
+}
+
 export const WATCHDOG_DEFAULTS = {
   firstResponseSeconds: 90,
   idleSeconds: 120,
