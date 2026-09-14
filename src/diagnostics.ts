@@ -104,10 +104,32 @@ function looksLikeCredential(value: string): boolean {
   return classes >= 2;
 }
 
+/**
+ * Candidate token inside a longer string (a key pasted into a sentence, a URL or a
+ * header value). Deliberately broad: the callback below decides.
+ */
+const EMBEDDED_TOKEN_RE = /[A-Za-z0-9_.~+/=-]{20,}/g;
+
+/**
+ * True when an EMBEDDED token really looks like a key.
+ *
+ * Stricter than the whole-value rule on purpose: a long hyphenated path segment
+ * ("very-long-directory-name") must survive, so an embedded token needs a known
+ * prefix or both a digit and a letter — which every real API key has.
+ */
+function looksLikeEmbeddedCredential(token: string): boolean {
+  if (/^(sk-|pk-|ghp_|gho_|github_pat_|Bearer\s)/.test(token)) return true;
+  return /[0-9]/.test(token) && /[A-Za-z]/.test(token);
+}
+
 /** Redact a bare string value that looks like a credential, never prose/paths. */
 function maybeRedactString(value: string): string {
   if (value.length >= 20 && looksLikeCredential(value)) return REDACTED;
-  return value;
+  if (value.length < 20) return value;
+  // A key embedded in prose/URL/header would otherwise land on disk verbatim.
+  // Diagnostics exist to be read by a human after a failure, so this file is the
+  // one place where over-redacting is the safe direction.
+  return value.replace(EMBEDDED_TOKEN_RE, (token) => (looksLikeEmbeddedCredential(token) ? REDACTED : token));
 }
 
 function redactInner(value: unknown, depth: number, seen: WeakSet<object>): unknown {

@@ -246,6 +246,7 @@ export default function (pi: ExtensionAPI) {
   function settleBatch(batch: PendingBatch, reason: string): void {
     if (batch.settled) return;
     batch.settled = true;
+    try {
 
     const results = batch.agentIds.map((id) => {
       const captured = batch.results.get(id);
@@ -313,9 +314,6 @@ export default function (pi: ExtensionAPI) {
       markdown = lines.join("\n");
     }
 
-    const idx = pendingBatches.indexOf(batch);
-    if (idx >= 0) pendingBatches.splice(idx, 1);
-
     // The message is rendered the instant it is sent, so the user always gets
     // the conclusion even if the main model's next request fails. followUp +
     // triggerTurn asks for exactly ONE reconciling turn without interrupting
@@ -330,6 +328,13 @@ export default function (pi: ExtensionAPI) {
       { deliverAs: "followUp", triggerTurn: true },
     );
     try { ctxRef?.ui?.notify(`Trimegisto: ${headline}`, "info"); } catch { /* no UI */ }
+    } finally {
+      // A batch marked settled must never stay in the registry: an unexpected
+      // throw above would otherwise leak it AND suppress its conclusion forever
+      // (the deadline rescue skips batches that are already `settled`).
+      const idx = pendingBatches.indexOf(batch);
+      if (idx >= 0) pendingBatches.splice(idx, 1);
+    }
   }
 
   // ── Dependency-aware wave scheduler ───────────────────────────────────────

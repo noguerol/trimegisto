@@ -237,7 +237,7 @@ Twice now the coordinator has died with a provider `400 invalid_request_error` a
 
 - Nothing is written while the provider behaves. When it answers **≥ 400**, Trimegisto starts recording the next requests and responses for **10 minutes** and says so in the transcript.
 - Set `TRIMEGISTO_CAPTURE_PAYLOADS=1` to force capture on from the start (or `0`/`false`/`off` to disable the automatic window).
-- Records go to `<instance dir>/diagnostics/provider.jsonl` as JSONL. Secret-named keys (`api_key`, `authorization`, `token`, `secret`, …) are always `<redacted>`, and a long token that **mixes character classes** is redacted too — while prose, file paths and low-entropy filler are preserved, because blanking the payload would defeat the purpose.
+- Records go to `<instance dir>/diagnostics/provider.jsonl` as JSONL. Secret-named keys (`api_key`, `authorization`, `token`, `secret`, …) are always `<redacted>`, and a long token that **mixes character classes** is redacted too, and a credential embedded inside a longer string (a sentence, a URL, a header value) is redacted in place — while prose, file paths and low-entropy filler are preserved, because blanking the payload would defeat the purpose.
 - Diagnostics can never break a request: recording is wrapped, the parent directory is created lazily and any filesystem error is swallowed.
 
 ### Loop detection (antiloop) & Swarm Guard

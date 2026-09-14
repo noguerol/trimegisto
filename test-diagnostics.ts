@@ -310,5 +310,23 @@ try {
 }
 check("temp dir cleaned up", cleanupOk);
 
+console.log("Embedded credentials (QA: a key pasted into prose was written in clear):");
+{
+  const key = "sk-proj-9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c";
+  const r: any = redactSecrets({
+    sentence: `my key is ${key} ok`,
+    url: `https://api.example.com?token=${key}`,
+    header: `Bearer ${key}`,
+  });
+  const dump = JSON.stringify(r);
+  check("a key inside a sentence is redacted", !dump.includes(key), r.sentence);
+  check("a key inside a URL is redacted", !dump.includes(key), r.url);
+  check("the rest of the sentence survives", String(r.sentence).includes("my key is") && String(r.sentence).includes("ok"), r.sentence);
+  // Over-redaction is the safe direction here, but a long hyphenated path segment
+  // is not a credential and must survive (it has no digit).
+  const pathy = "very-long-directory-name-here";
+  check("a long hyphenated non-credential token survives", redactSecrets({ p: pathy }).p === pathy);
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
