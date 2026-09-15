@@ -28,6 +28,8 @@ export interface PlanTaskInput {
   why?: string;
   /** Files this task will write (optional; used to serialise colliding writers). */
   writes?: string[];
+  /** Execution tier ("active" | "t1" | "t2" | "t3"); used for capacity-aware waves. */
+  tier?: string;
   /** Explicit lane override; when absent the lane is derived from the task text. */
   lane?: "open" | "gated" | "closed";
   cwd?: string;
@@ -39,6 +41,7 @@ export interface PlanNode {
   index: number;          // 1-based, as the coordinator sees it
   task: string;
   needs: number[];        // validated deps (1-based, same batch)
+  tier: string;           // "active" | "t1" | "t2" | "t3"
   wave: number;           // 1-based topological level
   lane: PlanLane;
   laneReason: string;
@@ -56,13 +59,20 @@ export interface PlanDecision {
   warnings: string[];
   blockers: string[];
   summary: string;        // deterministic human-readable markdown
-  counts: { proposed: number; launch: number; duplicates: number; serialized: number; closed: number };
+  counts: { proposed: number; launch: number; duplicates: number; serialized: number; closed: number; capacityDeferred: number };
 }
 
 export interface PlanOptions {
   goal?: string;
   duplicateThreshold?: number;  // default 0.72
   maxTasks?: number;            // default 8
+  /**
+   * Per-tier concurrency caps ("active" | "t1" | "t2" | "t3" => max parallel).
+   * When a wave would exceed a tier's cap the planner defers nodes to the NEXT
+   * wave instead of planning a wave the launcher could never start. Omitted or
+   * non-finite values mean "unlimited" (previous behaviour).
+   */
+  tierCapacity?: Record<string, number>;
 }
 
 // ── Tunables ────────────────────────────────────────────────
@@ -384,6 +394,7 @@ interface InternalNode {
   why?: string;
   writes: string[];
   needs: number[];
+  tier: string;
   lane: PlanLane;
   laneReason: string;
   warnings: string[];
@@ -399,15 +410,16 @@ interface Entry {
   writes: unknown;
   why: unknown;
   lane: unknown;
+  tier: unknown;
 }
 
 function entryOf(raw: unknown): Entry | null {
   if (!raw) return null;
   if (typeof raw === "string") {
-    return { task: raw, needs: undefined, writes: undefined, why: undefined, lane: undefined };
+    return { task: raw, needs: undefined, writes: undefined, why: undefined, lane: undefined, tier: undefined };
   }
   if (typeof raw === "number" || typeof raw === "boolean") {
-    return { task: String(raw), needs: undefined, writes: undefined, why: undefined, lane: undefined };
+    return { task: String(raw), needs: undefined, writes: undefined, why: undefined, lane: undefined, tier: undefined };
   }
   if (typeof raw === "object") {
     const o = raw as Record<string, unknown>;
@@ -417,6 +429,7 @@ function entryOf(raw: unknown): Entry | null {
       writes: o.writes,
       why: o.why,
       lane: o.lane,
+      tier: o.tier,
     };
   }
   return null;
@@ -491,6 +504,129 @@ function reachable(feeds: Map<number, number[]>, start: number, target: number):
     for (const v of feeds.get(u) || []) if (!seen.has(v)) stack.push(v);
   }
   return false;
+}
+
+// ── Tier capacity spread ────────────────────────────────────
+
+/** Canonical tier key: "t0"/"active" collapse to "active"; unknown values are kept lowercased. */
+function normalizeTierKey(tier: unknown): string {
+  if (typeof tier !== "string") return "active";
+  const t = tier.trim().toLowerCase();
+  return t === "" || t === "t0" || t === "active" ? "active" : t;
+}
+
+/**
+ * Defer nodes to later waves until no wave exceeds its tier's concurrency cap.
+ *
+ * Only WAVE NUMBERS move: `needs` keeps the task's real data dependencies, so
+ * the scheduler still passes an upstream verdict only where the coordinator
+ * asked for one. Two nodes that already share a wave are mutually unreachable
+ * (an edge between them would have put them in different topological levels),
+ * so deferring one behind the other can never introduce a cycle.
+ *
+ * The plan gate used to hand a 5-wide t2 wave to a 2-slot config; the launcher
+ * then refused the WHOLE batch because it could never start that wave. This is
+ * the planning half of that fix.
+ *
+ * Deterministic: waves ascend, tiers are visited in sorted order and nodes in
+ * ascending index order. Every deferral strictly increases a node's wave, and a
+ * wave can never exceed the node count, so the loop always terminates.
+ */
+function enforceTierCapacity(
+  launched: InternalNode[],
+  feedsOf: Map<number, number[]>,
+  waveOf: Map<number, number>,
+  capacity: Record<string, number> | undefined,
+): { deferred: number; notes: string[] } {
+  if (!capacity || launched.length === 0) return { deferred: 0, notes: [] };
+
+  const tierOf = new Map<number, string>();
+  const initial = new Map<number, number>();
+  for (const nd of launched) {
+    tierOf.set(nd.index, normalizeTierKey(nd.tier));
+    initial.set(nd.index, waveOf.get(nd.index) || 1);
+  }
+  const capOf = (tier: string): number => {
+    const raw = capacity[tier];
+    return typeof raw === "number" && Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : Infinity;
+  };
+
+  const maxMoves = launched.length * launched.length + launched.length + 1;
+  let moves = 0;
+
+  /** Move `start` to at least `minWave`, then pull its dependents forward after it. */
+  const bump = (start: number, minWave: number): void => {
+    if ((waveOf.get(start) || 1) >= minWave) return;
+    waveOf.set(start, minWave);
+    moves++;
+    const queue = [start];
+    while (queue.length > 0 && moves <= maxMoves) {
+      const u = queue.shift() as number;
+      const need = (waveOf.get(u) || 1) + 1;
+      for (const v of feedsOf.get(u) || []) {
+        if ((waveOf.get(v) || 1) < need) {
+          waveOf.set(v, need);
+          moves++;
+          queue.push(v);
+        }
+      }
+    }
+  };
+
+  for (;;) {
+    if (moves > maxMoves) break;
+    // Index the CURRENT waves by tier so the overflow of the earliest wave is
+    // pushed first (deterministic and keeps the deferral minimal-ish).
+    const byWave = new Map<number, Map<string, number[]>>();
+    let maxWave = 0;
+    for (const nd of launched) {
+      const w = waveOf.get(nd.index) || 1;
+      if (w > maxWave) maxWave = w;
+      let tm = byWave.get(w);
+      if (!tm) { tm = new Map(); byWave.set(w, tm); }
+      const t = tierOf.get(nd.index) || "active";
+      const arr = tm.get(t);
+      if (arr) arr.push(nd.index);
+      else tm.set(t, [nd.index]);
+    }
+    let changed = false;
+    for (let w = 1; w <= maxWave && !changed; w++) {
+      const tm = byWave.get(w);
+      if (!tm) continue;
+      for (const tier of [...tm.keys()].sort()) {
+        const cap = capOf(tier);
+        if (!Number.isFinite(cap)) continue;
+        const group = (tm.get(tier) as number[]).slice().sort((a, b) => a - b);
+        if (group.length <= cap) continue;
+        // Keep the first `cap` in this wave; defer the rest. `bump` also moves
+        // any dependent that would otherwise overtake a deferred node.
+        for (const idx of group.slice(cap)) bump(idx, w + 1);
+        changed = true;
+        break;
+      }
+    }
+    if (!changed) break;
+  }
+
+  const movedByTier = new Map<string, number[]>();
+  for (const nd of launched) {
+    const from = initial.get(nd.index) || 1;
+    const to = waveOf.get(nd.index) || 1;
+    if (to <= from) continue;
+    const t = tierOf.get(nd.index) || "active";
+    const arr = movedByTier.get(t);
+    if (arr) arr.push(nd.index);
+    else movedByTier.set(t, [nd.index]);
+  }
+
+  const notes: string[] = [];
+  let deferred = 0;
+  for (const tier of [...movedByTier.keys()].sort()) {
+    const idxs = (movedByTier.get(tier) as number[]).slice().sort((a, b) => a - b);
+    deferred += idxs.length;
+    notes.push(`tier \`${tier}\` cap ${capOf(tier)}/wave: deferred ${idxs.length} node(s) to a later wave — ${idxs.map(i => `#${i}`).join(", ")}`);
+  }
+  return { deferred, notes };
 }
 
 // ── Planner ─────────────────────────────────────────────────
@@ -625,6 +761,7 @@ export function planBatch(tasks: PlanTaskInput[], options?: PlanOptions): PlanDe
       why: typeof e.why === "string" ? e.why : undefined,
       writes: coerceWrites(e.writes),
       needs,
+      tier: normalizeTierKey(e.tier),
       lane,
       laneReason,
       warnings,
@@ -829,6 +966,12 @@ export function planBatch(tasks: PlanTaskInput[], options?: PlanOptions): PlanDe
   }
   for (const nd of launchedInternals) if (!waveOf.has(nd.index)) waveOf.set(nd.index, 1);
 
+  // 6b) Capacity: keep every wave within its tier's concurrency cap. Planning a
+  // wave the launcher can never start is what made the whole batch get refused.
+  // Deferring is free — it only moves wave numbers; `needs` (the real data
+  // edges) is left untouched, so no false upstream dependency is injected.
+  const capacityResult = enforceTierCapacity(launchedInternals, launchFeeds, waveOf, opts.tierCapacity);
+
   const waveMap = new Map<number, number[]>();
   for (const nd of launchedInternals) {
     nd.wave = waveOf.get(nd.index) || 1;
@@ -860,6 +1003,7 @@ export function planBatch(tasks: PlanTaskInput[], options?: PlanOptions): PlanDe
       index: nd.index,
       task: nd.task,
       needs: nd.needs.slice(),
+      tier: nd.tier,
       wave: nd.wave,
       lane: nd.lane,
       laneReason: nd.laneReason,
@@ -881,6 +1025,7 @@ export function planBatch(tasks: PlanTaskInput[], options?: PlanOptions): PlanDe
     duplicates,
     serialized,
     closed: nodes.filter(nd => nd.lane === "closed").length,
+    capacityDeferred: capacityResult.deferred,
   };
 
   const taskByIndex = new Map<number, string>();
@@ -914,6 +1059,14 @@ export function planBatch(tasks: PlanTaskInput[], options?: PlanOptions): PlanDe
   if (edgeNotes.length === 0) lines.push("None.");
   else for (const e of edgeNotes) lines.push(`- ${e}`);
   lines.push("");
+
+  // Only emitted when a tier cap actually reshaped the plan, so plans that fit
+  // their configuration keep byte-identical summaries.
+  if (capacityResult.notes.length > 0) {
+    lines.push("### Capacity splits");
+    for (const note of capacityResult.notes) lines.push(`- ${note}`);
+    lines.push("");
+  }
 
   lines.push("### Duplicates merged");
   if (dupNotes.length === 0) lines.push("None.");

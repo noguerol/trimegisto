@@ -514,8 +514,100 @@ console.log("(s) transitive duplicates (union-find) and normalised writes:");
     { task: "update the beta module", writes: ["/"] },
   ]);
   check("dot-only writes never collide", dots.counts.serialized === 0 && dots.waves.length === 1, dots.counts);
+}
 
-  // Determinism: the same input twice yields byte-identical summaries.
+// ── (l) capacity-aware waves ─────────────────────────────────
+// Regression: the plan gate planned a 5-wide t2 wave against a 2-slot config,
+// and the launcher then refused the WHOLE batch. Planning must respect the
+// per-tier concurrency cap instead of emitting a wave that can never start.
+console.log("(l) tier capacity spread:");
+{
+  const allCap = (n: number) => ({ active: n, t1: n, t2: n, t3: n });
+  const fiveT2: PlanTaskInput[] = [
+    { task: "audit the authentication flow for timing leaks", tier: "t2" },
+    { task: "rewrite the retry policy of the billing worker", tier: "t2" },
+    { task: "profile the image resizer memory usage", tier: "t2" },
+    { task: "document the webhook signature verification", tier: "t2" },
+    { task: "verify the cache eviction invariants", tier: "t2" },
+  ];
+  const spread = planBatch(fiveT2, { tierCapacity: allCap(2) });
+  check("capacity: batch still accepted", spread.accept === true, spread.blockers);
+  check("capacity: all 5 launched", spread.counts.launch === 5, spread.counts);
+  check("capacity: 5 t2 tasks split into 3 waves", spread.waves.length === 3, spread.waves);
+  check("capacity: wave sizes are 2/2/1", deep(spread.waves.map(w => w.length), [2, 2, 1]), spread.waves);
+  check("capacity: every wave stays within the cap", spread.waves.every(w => w.length <= 2), spread.waves);
+  check("capacity: 3 nodes deferred", spread.counts.capacityDeferred === 3, spread.counts);
+  check("capacity: real needs stay empty (no false dependency injected)",
+    spread.launch.every(n => n.needs.length === 0), spread.launch.map(n => n.needs));
+  check("capacity: summary explains the split",
+    spread.summary.includes("### Capacity splits") && spread.summary.includes("tier `t2` cap 2/wave"), spread.summary);
+
+  // Caps are PER TIER: a full t2 wave must not throttle independent active work.
+  const perTier = planBatch([
+    { task: "draft the rollout checklist for the new endpoint", tier: "active" },
+    { task: "benchmark the parser on the sample corpus", tier: "active" },
+    { task: "trace the slow query in the reporting service", tier: "active" },
+    { task: "summarise the incident timeline from the logs", tier: "t2" },
+    { task: "outline the retry semantics of the gateway", tier: "t2" },
+    { task: "sketch the state machine of the job runner", tier: "t2" },
+  ], { tierCapacity: allCap(2) });
+  check("per-tier: accepted and fully launched", perTier.launch.length === 6, perTier.counts);
+  check("per-tier: two waves, not three", perTier.waves.length === 2, perTier.waves);
+  const tierCount = (w: number[], tier: string): number =>
+    w.filter(i => perTier.nodes[i - 1].tier === tier).length;
+  check("per-tier: wave 1 carries 2 active + 2 t2",
+    tierCount(perTier.waves[0], "active") === 2 && tierCount(perTier.waves[0], "t2") === 2, perTier.waves);
+  check("per-tier: wave 2 carries the remaining 1 + 1",
+    tierCount(perTier.waves[1], "active") === 1 && tierCount(perTier.waves[1], "t2") === 1, perTier.waves);
+
+  // A declared edge must survive the spread: #3 still runs after #1.
+  const withDep = planBatch([
+    { task: "audit the authentication flow for timing leaks", tier: "t2" },
+    { task: "rewrite the retry policy of the billing worker", tier: "t2" },
+    { task: "verify the cache eviction invariants", tier: "t2", needs: [1] },
+    { task: "profile the image resizer memory usage", tier: "t2" },
+  ], { tierCapacity: allCap(2) });
+  const n1 = withDep.nodes[0];
+  const n3 = withDep.nodes[2];
+  check("dependency: #3 keeps needs [1]", deep(n3.needs, [1]), n3.needs);
+  check("dependency: #3 stays strictly after #1", n3.wave > n1.wave, { n1: n1.wave, n3: n3.wave });
+  check("dependency: waves respect the cap too", withDep.waves.every(w => w.length <= 2), withDep.waves);
+
+  // Every spread plan must stay acyclic: a dep always lands in an earlier wave.
+  const acyclic = withDep.launch.every(n => n.needs.every(d => withDep.nodes[d - 1].wave < n.wave));
+  check("capacity: spreading never breaks the topological order", acyclic);
+
+  // cap=1 is the strictest case: one node per wave, in index order.
+  const serial = planBatch(fiveT2.slice(0, 3), { tierCapacity: allCap(1) });
+  check("cap 1: three waves of one", deep(serial.waves, [[1], [2], [3]]), serial.waves);
+
+  // "t0" is an alias of the active tier.
+  const t0 = planBatch([
+    { task: "draft the rollout checklist for the new endpoint", tier: "t0" },
+    { task: "benchmark the parser on the sample corpus", tier: "t0" },
+    { task: "trace the slow query in the reporting service", tier: "t0" },
+  ], { tierCapacity: allCap(2) });
+  check("t0 normalises to the active cap", t0.waves.length === 2 && t0.counts.capacityDeferred === 1, t0.waves);
+
+  // Omitting the option is a no-op: old behaviour and old summary shape.
+  const noCap = planBatch(fiveT2);
+  check("no capacity option: single wave (previous behaviour)", noCap.waves.length === 1, noCap.waves);
+  check("no capacity option: nothing deferred", noCap.counts.capacityDeferred === 0);
+  check("no capacity option: no Capacity section in the summary", !noCap.summary.includes("### Capacity splits"));
+
+  // Determinism holds with capacity spreading.
+  const c1 = planBatch(fiveT2, { tierCapacity: allCap(2), goal: "harden the auth path" });
+  const c2 = planBatch(fiveT2, { tierCapacity: allCap(2), goal: "harden the auth path" });
+  check("capacity plan is byte-identical across runs", c1.summary === c2.summary);
+  check("capacity plan deep-equal across runs", deep(c1, c2));
+}
+
+// ── (m) determinism (same-file serialisation input) ──────────
+console.log("(m) determinism:");
+{
+  const A = "alpha bravo charlie delta echo";
+  const B = "alpha bravo charlie delta echo foxtrot";
+  const C = "alpha bravo charlie delta echo foxtrot golf";
   const detInput: PlanTaskInput[] = [
     { task: A, writes: ["./src/A.ts"] },
     { task: B },
