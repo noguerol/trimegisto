@@ -1190,13 +1190,28 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
           needs: needs.length > 0 ? needs : undefined,
           why: typeof t.why === "string" ? t.why : undefined,
           writes: Array.isArray(t.writes) ? t.writes.map(String) : undefined,
+          tier: typeof t.tier === "string" ? t.tier : undefined,
           lane: t.lane,
           cwd: t.cwd,
         } as PlanTaskInput;
       });
 
+      // The planner must know each tier's REAL concurrency cap: planning a wave
+      // wider than the config allows made the launcher refuse the whole batch.
+      // `tierCapacity` is the same effective capacity the launch path enforces.
+      const planCapacity: Record<string, number> = {
+        active: tierCapacity("active"),
+        t1: tierCapacity("t1"),
+        t2: tierCapacity("t2"),
+        t3: tierCapacity("t3"),
+      };
+
       const planGoal = typeof params.goal === "string" && params.goal.trim() ? params.goal.trim() : undefined;
-      const plan = planBatch(planInputs, planGoal ? { goal: planGoal, maxTasks: 8 } : { maxTasks: 8 });
+      const plan = planBatch(planInputs, {
+        maxTasks: 8,
+        tierCapacity: planCapacity,
+        ...(planGoal ? { goal: planGoal } : {}),
+      });
       const planDetails = {
         accept: plan.accept,
         counts: plan.counts,
@@ -1210,6 +1225,7 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
       const planNotes: string[] = [];
       if (plan.counts.duplicates > 0) planNotes.push(`⏭ Merged ${plan.counts.duplicates} in-batch duplicate(s).`);
       if (plan.counts.serialized > 0) planNotes.push(`🔗 Serialised ${plan.counts.serialized} same-file racer(s).`);
+      if (plan.counts.capacityDeferred > 0) planNotes.push(`📐 Deferred ${plan.counts.capacityDeferred} node(s) to a later wave to respect the per-tier parallel cap.`);
       for (const w of droppedNeeds) planNotes.push(`⚠️ ${w}`);
       if (skippedTasks.length > 0) {
         planNotes.push(`⏭ Skipped ${skippedTasks.length} near-duplicate task(s) of already-spawned work:\n` +
@@ -1228,9 +1244,12 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
         };
       }
 
-      // Per-wave feasibility: a wave larger than the tier capacity could never
-      // start (the scheduler would defer it until the deadline), so refuse it
-      // with an actionable message instead of hanging silently.
+      // Per-wave feasibility: defense-in-depth. The planner is capacity-aware
+      // now and spreads an oversized wave across waves, so this should not fire
+      // — it catches only a config change between planning and this point.
+      // A wave larger than the tier capacity could never start (the scheduler
+      // would defer it until the deadline), so refuse it with an actionable
+      // message instead of hanging silently.
       for (let w = 0; w < plan.waves.length; w++) {
         const perTier: Record<string, number> = { active: 0, t1: 0, t2: 0, t3: 0 };
         for (const idx of plan.waves[w]) {
