@@ -27,6 +27,7 @@ import {
   launchAgent,
   haltAll,
   isHalted,
+  killAgent,
   getAgent,
   getAgentCounts,
   getActiveAgents,
@@ -40,7 +41,7 @@ import {
   setInstanceDir,
   setAgentLogCallback,
   processSpawnRequests,
-  sendToAgent,
+  compactAgent,
   setLoopSupervisor,
   setWatchdogTimeouts,
   setModelHealth,
@@ -52,6 +53,7 @@ import { saveConfig as persistConfig, loadConfig } from "./persistence.ts";
 import { cleanupOldNotifications } from "./context-broker.ts";
 import { reconcileBatch, decideBatchSettle, distillConclusion } from "./reconcile.ts";
 import { planBatch, type PlanNode, type PlanTaskInput } from "./plan-graph.ts";
+import { parseAgentCommand, writeAgentControl, type AgentCommand } from "./agent-control.ts";
 import { advanceWaves } from "./wave-scheduler.ts";
 import { LoopSupervisor, type LoopAlert } from "./loop-supervisor.ts";
 import { ModelHealth, sanitizeModelHealthConfig, MODEL_HEALTH_DEFAULTS } from "./model-health.ts";
@@ -845,138 +847,102 @@ export default function (pi: ExtensionAPI) {
     return launchAgent(tier, task, tierConfig, cwd, parentId, modelOverride, config.redundantAgents);
   }
 
-  // ── /t1 /t2 /t3 slash-command interception ────────────
-  // Intercept "/t2 task" (spawn) or "/t2b instruction" (steer) before the main LLM sees them.
+  // ── @tier[letter] / /tier[letter] interception ─────────
+  // ONE handler for both prefixes, parsed by the pure `parseAgentCommand`:
+  //   @t2 <task>          -> spawn a new T2 agent (a bare tier has no target)
+  //   @t2b <instruction>  -> STEER the running t2b (never kill/respawn it)
+  //   @t2b halt           -> kill ONLY t2b
+  //   @t2b compact        -> free t2b's context (restart with a progress digest)
+  // The old code killed the target and launched a new agent for a steer, which
+  // is the reported "it spawned a new agent instead of sending my instruction".
+  function dispatchAgentTarget(cmd: AgentCommand, ctx: any): void {
+    const targetId = cmd.agentId as string;
+
+    if (cmd.verb === "halt") {
+      const killed = killAgent(targetId);
+      ctx.ui.notify(
+        killed ? `Halted ${targetId}.` : `Agent ${targetId} not found or already stopped.`,
+        killed ? "info" : "warning",
+      );
+      return;
+    }
+
+    const existing = getAgent(targetId);
+    if (!existing) {
+      ctx.ui.notify(`Agent ${targetId} not found. Spawn one with @${targetId.slice(0, 2)} <task>.`, "error");
+      return;
+    }
+
+    if (existing.status !== "running" && existing.status !== "waiting") {
+      ctx.ui.notify(
+        `Agent ${targetId} is ${existing.status} — ${cmd.verb} only works while it runs. ` +
+        `Launch a new one with @${targetId.slice(0, 2)} <task>.`,
+        "warning",
+      );
+      return;
+    }
+
+    if (cmd.verb === "compact") {
+      // pi's manual compaction aborts the one-shot process before it finishes,
+      // so Trimegisto compacts by restarting the agent with a bounded digest of
+      // its progress. See compactAgent() in agent-manager.ts.
+      const replacement = compactAgent(
+        targetId,
+        { active: config.active, t1: config.t1, t2: config.t2, t3: config.t3 },
+        ctx.cwd,
+        config.spawnOnlyOnActive,
+        config.redundantAgents,
+      );
+      ctx.ui.notify(
+        replacement
+          ? `Compacted ${targetId} → relaunched as ${replacement.id} with a condensed context.`
+          : `Could not compact ${targetId}.`,
+        replacement ? "info" : "error",
+      );
+      return;
+    }
+
+    // steer
+    if (!instanceId) {
+      ctx.ui.notify("Trimegisto: control channel unavailable (no instance directory).", "error");
+      return;
+    }
+    const ok = writeAgentControl(getInstanceDir(), targetId, "steer", { text: cmd.text });
+    ctx.ui.notify(
+      ok ? `Steering ${targetId}: ${cmd.text.slice(0, 60)}` : `Could not reach ${targetId}.`,
+      ok ? "info" : "error",
+    );
+  }
+
   pi.on("input", async (event, ctx) => {
     if (!config.enabled) return { action: "continue" as const };
+    const cmd = parseAgentCommand(event.text);
+    if (!cmd) return { action: "continue" as const };
 
-    const text = event.text.trim();
-    const slashMatch = text.match(/^\/(t[123])([a-z])?\s+(.+)/);
-    if (!slashMatch) return { action: "continue" as const };
+    // Echo the command to chat so it stays visible.
+    safeSendMessage({ customType: "trimegisto-command", content: cmd.raw, display: true });
 
-    const tier = slashMatch[1] as AgentTier;
-    const letter = slashMatch[2] || "";
-    const task = slashMatch[3].trim();
-
-    if (!config[tier].model) {
-      ctx.ui.notify(`No model configured for ${formatTierLabel(tier)}. Use /tmg config.`, "error");
+    // Explicit agent id -> control an EXISTING agent (halt/compact/steer).
+    if (cmd.agentId) {
+      dispatchAgentTarget(cmd, ctx);
       return { action: "handled" as const };
     }
 
-    // Echo the user's command to chat so it's visible
-    safeSendMessage({
-      customType: "trimegisto-command",
-      content: `/${tier}${letter} ${task}`,
-      display: true,
-    });
-
-    if (letter) {
-      const targetId = `${tier}${letter}`;
-      const existing = getAgent(targetId);
-      if (existing && (existing.status === "running" || existing.status === "waiting")) {
-        ctx.ui.notify(`Steering ${targetId} with new instruction...`, "info");
-        const agent = sendToAgent(targetId, task, { active: config.active, t1: config.t1, t2: config.t2, t3: config.t3 }, ctx.cwd, undefined, config.spawnOnlyOnActive, config.redundantAgents);
-        if (agent) {
-          ctx.ui.notify(`${targetId} stopped → ${agent.id} launched with new instruction`, "info");
-        } else {
-          ctx.ui.notify(`Error steering ${targetId}`, "error");
-        }
-        return { action: "handled" as const };
-      }
-      // Letter specified but agent doesn't exist → spawn with that specific ID
-      ctx.ui.notify(`Agent ${targetId} not found. Spawning new ${formatTierLabel(tier)} as ${targetId}...`, "info");
-      const agent = doLaunch(tier, task, ctx.cwd, targetId);
-      if ("status" in agent && agent.status === "error") {
-        ctx.ui.notify(`${(agent as any).agentId} failed: ${agent.stderr.slice(0, 100)}`, "error");
-      } else {
-        const a = agent as AgentInstance;
-        ctx.ui.notify(`${a.id} [${formatTierLabel(tier)}] launched`, "info");
-      }
+    // Bare tier -> spawn a new agent.
+    if (cmd.tier !== "active" && !config[cmd.tier].model) {
+      ctx.ui.notify(`No model configured for ${formatTierLabel(cmd.tier)}. Use /tmg config.`, "error");
       return { action: "handled" as const };
     }
-
-    // No letter → spawn new agent
-    ctx.ui.notify(`Launching ${formatTierLabel(tier)} agent...`, "info");
-    const agent = doLaunch(tier, task, ctx.cwd);
+    ctx.ui.notify(`Launching ${formatTierLabel(cmd.tier)} agent...`, "info");
+    const agent = doLaunch(cmd.tier, cmd.text, ctx.cwd);
     if ("status" in agent && agent.status === "error") {
       ctx.ui.notify(`${(agent as any).agentId} failed: ${agent.stderr.slice(0, 100)}`, "error");
     } else {
       const a = agent as AgentInstance;
-      ctx.ui.notify(`${a.id} [${formatTierLabel(tier)}] launched`, "info");
+      ctx.ui.notify(`${a.id} [${formatTierLabel(cmd.tier)}] launched`, "info");
     }
-
     return { action: "handled" as const };
   });
-
-  // ── @agent input interception ──────────────────────────
-  // Intercept "@t2 task" or "@t3b instruction" before the main LLM sees them.
-  pi.on("input", async (event, ctx) => {
-    if (!config.enabled) return { action: "continue" as const };
-
-    const text = event.text.trim();
-    const match = text.match(/^@(t[123])([a-z])?\s+(.+)/);
-    if (!match) return { action: "continue" as const };
-
-    const tier = match[1] as AgentTier;
-    const letter = match[2] || "";
-    const task = match[3].trim();
-
-    if (!task) {
-      ctx.ui.notify("Usage: @t2 <task> (new) or @t2b <instruction> (existing)", "error");
-      return { action: "handled" as const };
-    }
-
-    if (!config[tier].model) {
-      ctx.ui.notify(`No model configured for ${formatTierLabel(tier)}. Use /tmg config.`, "error");
-      return { action: "handled" as const };
-    }
-
-    // Echo the user's command to chat so it's visible
-    safeSendMessage({
-      customType: "trimegisto-command",
-      content: `@${tier}${letter} ${task}`,
-      display: true,
-    });
-
-    if (letter) {
-      const targetId = `${tier}${letter}`;
-      const existing = getAgent(targetId);
-      if (existing && (existing.status === "running" || existing.status === "waiting")) {
-        ctx.ui.notify(`Sending to ${targetId}...`, "info");
-        // Kill old agent and launch a new one with the combined instruction
-        const agent = sendToAgent(targetId, task, { active: config.active, t1: config.t1, t2: config.t2, t3: config.t3 }, ctx.cwd, undefined, config.spawnOnlyOnActive, config.redundantAgents);
-        if (agent) {
-          ctx.ui.notify(`${targetId} stopped → ${agent.id} launched with new instruction`, "info");
-        } else {
-          ctx.ui.notify(`Error sending to ${targetId}`, "error");
-        }
-        return { action: "handled" as const };
-      }
-      // Letter specified but agent doesn't exist → spawn with that specific ID
-      ctx.ui.notify(`Agent ${targetId} not found. Spawning new ${formatTierLabel(tier)} as ${targetId}...`, "info");
-      const agent = doLaunch(tier, task, ctx.cwd, targetId);
-      if ("status" in agent && agent.status === "error") {
-        ctx.ui.notify(`${(agent as any).agentId} failed: ${agent.stderr.slice(0, 100)}`, "error");
-      } else {
-        const a = agent as AgentInstance;
-        ctx.ui.notify(`${a.id} [${formatTierLabel(tier)}] launched`, "info");
-      }
-      return { action: "handled" as const };
-    }
-
-    ctx.ui.notify(`Launching ${formatTierLabel(tier)} agent...`, "info");
-    // Fire-and-forget: spawns agent, returns immediately
-    const agent = doLaunch(tier, task, ctx.cwd);
-    if ("status" in agent && agent.status === "error") {
-      ctx.ui.notify(`${(agent as any).agentId} failed: ${agent.stderr.slice(0, 100)}`, "error");
-    } else {
-      const a = agent as AgentInstance;
-      ctx.ui.notify(`${a.id} [${formatTierLabel(tier)}] launched`, "info");
-    }
-
-    return { action: "handled" as const };
-  });
-
   // ── Auto-spawning logic ────────────────────────────────
   const spawnPollInterval = setInterval(() => {
     if (disposed || !config.enabled) return;
@@ -1629,12 +1595,15 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
       saveConfig();
     },
     haltAll,
-    sendToAgent: (agentId: string, instruction: string) => sendToAgent(
+    haltAgent: (agentId: string) => killAgent(agentId),
+    steerAgent: (agentId: string, text: string) => {
+      if (!instanceId) return false;
+      return writeAgentControl(getInstanceDir(), agentId, "steer", { text });
+    },
+    compactAgent: (agentId: string) => compactAgent(
       agentId,
-      instruction,
       { active: config.active, t1: config.t1, t2: config.t2, t3: config.t3 },
       ctxRef?.cwd || process.cwd(),
-      spawnModelOverride("active"),
       config.spawnOnlyOnActive,
       config.redundantAgents,
     ),

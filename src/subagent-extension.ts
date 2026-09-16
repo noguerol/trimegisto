@@ -26,6 +26,7 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { publishNote } from "./shared-context.ts";
+import { drainAgentControls } from "./agent-control.ts";
 
 /** Per-instance IPC directory, set by the main extension via env var */
 const INSTANCE_DIR = process.env.TRIMEGISTO_INSTANCE_DIR || path.join(
@@ -356,6 +357,31 @@ export default function (pi: ExtensionAPI) {
   // Parse agent ID from env if available
   myAgentId = process.env.TRIMEGISTO_AGENT_ID || "subagent";
 
+  // ── Control channel (parent -> this agent) ──────────────
+  // The parent drops a steer instruction in the mailbox; we poll it and inject
+  // it into the LIVE run, so a running agent can be redirected without being
+  // killed and respawned (which threw away everything it had already done).
+  //
+  // Compaction is NOT handled here on purpose: sub-agents are one-shot `pi -p`
+  // processes with an ephemeral session, so pi's `ctx.compact()` aborts the run
+  // and the process exits before the summarization finishes. The parent instead
+  // implements `@<id> compact` as a restart carrying a bounded progress digest.
+  const applySteer = (text: string): void => {
+    try {
+      pi.sendUserMessage(text, { deliverAs: "followUp" });
+    } catch {
+      try { pi.sendMessage({ customType: "trimegisto-steer", content: text, display: true }, { deliverAs: "followUp", triggerTurn: true }); } catch { /* no session */ }
+    }
+  };
+
+  /** Consume the parent's control requests. */
+  const processControls = (): void => {
+    if (!fs.existsSync(INSTANCE_DIR)) return;
+    for (const req of drainAgentControls(INSTANCE_DIR, myAgentId)) {
+      if (req.kind === "steer" && req.text) applySteer(req.text);
+    }
+  };
+
   // ── Tool: trimegisto_spawn ──────────────────────────────
 
   pi.registerTool({
@@ -648,6 +674,9 @@ export default function (pi: ExtensionAPI) {
         });
       }
     } catch { /* silent */ }
+    // Parent -> agent control messages (steer). Runs while the agent is mid-run
+    // so an instruction can land without killing it.
+    try { processControls(); } catch { /* silent */ }
   }, 5000);
   // Critical for `pi -p --mode json`: this helper timer must not keep the
   // sub-agent process alive after the print-mode turn has finished. Otherwise
