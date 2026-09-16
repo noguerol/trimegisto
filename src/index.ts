@@ -10,7 +10,7 @@ import * as path from "node:path";
 import { formatTierStatusLine, formatDirectiveContent, formatUnavailableTiersMessage } from "./tier-status.ts";
 import { fileURLToPath } from "node:url";
 
-import type { AgentTier, TrimegistoConfig, AgentLogEntry, AgentInstance } from "./types.ts";
+import type { AgentTier, TrimegistoConfig, AgentLogEntry, AgentInstance, ReaperConfig } from "./types.ts";
 import {
   buildTierConfig,
   getDefaultConfig,
@@ -44,12 +44,16 @@ import {
   compactAgent,
   setLoopSupervisor,
   setWatchdogTimeouts,
+  setReaperConfig,
+  reapFinishedAgents,
+  touchAgent,
   setModelHealth,
   getTierModelBlock,
   formatModelBlockMessage,
 } from "./agent-manager.ts";
 import { isDuplicateTask, registerTask, forgetTask } from "./task-dedup.ts";
 import { saveConfig as persistConfig, loadConfig } from "./persistence.ts";
+import { REAPER_DEFAULTS } from "./types.ts";
 import { cleanupOldNotifications } from "./context-broker.ts";
 import { reconcileBatch, decideBatchSettle, distillConclusion } from "./reconcile.ts";
 import { planBatch, type PlanNode, type PlanTaskInput } from "./plan-graph.ts";
@@ -57,6 +61,7 @@ import { parseAgentCommand, writeAgentControl, type AgentCommand } from "./agent
 import { advanceWaves } from "./wave-scheduler.ts";
 import { LoopSupervisor, type LoopAlert } from "./loop-supervisor.ts";
 import { ModelHealth, sanitizeModelHealthConfig, MODEL_HEALTH_DEFAULTS } from "./model-health.ts";
+import { sanitizeReaperConfig } from "./config.ts";
 import { speed, MAIN_TARGET } from "./speed.ts";
 import { formatTmgStatus } from "./branding.ts";
 import { ProgressLogBuffer } from "./progress-log.ts";
@@ -154,6 +159,16 @@ export default function (pi: ExtensionAPI) {
     });
   }
   applyWatchdogConfig();
+
+  /** Push reaper settings (seconds → ms) into the agent manager. */
+  function applyReaperConfig(): void {
+    const rp = config.reaper;
+    setReaperConfig({
+      enabled: rp?.enabled ?? REAPER_DEFAULTS.enabled,
+      terminalIdleMs: clampWatchdogSeconds(rp?.terminalIdleSeconds ?? REAPER_DEFAULTS.terminalIdleSeconds, REAPER_DEFAULTS.terminalIdleSeconds) * 1000,
+    });
+  }
+  applyReaperConfig();
 
   /**
    * Timers and child-process callbacks can fire after /reload has replaced the
@@ -289,7 +304,7 @@ export default function (pi: ExtensionAPI) {
       const captured = batch.results.get(id);
       if (captured) return toRecon(captured);
       const live = getAgent(id);
-      if (live) return toRecon(live);
+      if (live) { touchAgent(id); return toRecon(live); }
       return {
         agentId: id,
         tier: "?",
@@ -400,6 +415,7 @@ export default function (pi: ExtensionAPI) {
       // live agent, which is already terminal and holds its finalOutput — without
       // this the edge would inject "(no result reported)" in the common path.
       const source = batch.results.get(agentId) ?? getAgent(agentId);
+      if (source) touchAgent(agentId); // a live read keeps the reaper off it
       const verdict = source ? distillConclusion(toRecon(source), UPSTREAM_VERDICT_CHARS) : "(no result reported)";
       parts.push(`- upstream #${dep} ${agentId} [${source?.status ?? "unknown"}]: ${verdict}`);
     }
@@ -602,11 +618,31 @@ export default function (pi: ExtensionAPI) {
 
   // Safety net for agents killed without a close event (killAgent/haltAll) and
   // for batches whose watchdog is disabled: never leave a batch unsettled.
+  // Also auto-reaps finished agents: once a terminal agent is no longer
+  // referenced by any batch or watcher and has been idle long enough, its
+  // memory/locks/context/telemetry are freed and it drops off the lists.
   const batchSweepInterval = setInterval(() => {
     if (disposed) return;
     try { sweepBatches(); } catch { /* never crash the session on a sweep */ }
+    try {
+      const reaped = reapFinishedAgents((a) => batchReferencesAgent(a.id));
+      if (reaped.length > 0) {
+        appendProgress(`🧹 [Trimegisto reaper] freed ${reaped.length} finished agent(s): ${reaped.join(", ")}`);
+      }
+    } catch { /* never crash the session on a sweep */ }
   }, 2000);
   (batchSweepInterval as any).unref?.();
+
+  /**
+   * True while a batch still needs the agent's identity or output: an
+   * unsettled batch lists it among its agentIds. Settled batches already
+   * captured every result (or an explicit placeholder), so they keep no
+   * reference. Reaped agents must not lose their results out from under a
+   * pending batch.
+   */
+  function batchReferencesAgent(agentId: string): boolean {
+    return pendingBatches.some((b) => !b.settled && b.agentIds.includes(agentId));
+  }
 
   // ── Model health (circuit breaker) ─────────────────────
   // Pauses spawns on a model that keeps failing at the provider level, so a
@@ -1635,6 +1671,7 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
           applyGuardConfig(loopSupervisor, foldDedupeFlagIntoGuard(config) ?? config.loopSupervisor);
         },
         syncWatchdog: applyWatchdogConfig,
+        syncReaper: applyReaperConfig,
         syncModelHealth: applyModelHealthConfig,
         clearModelHealth: (model?: string) => { modelHealth.clear(model); registerMainTool(); },
       });
@@ -1733,6 +1770,8 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
         loopSupervisor: sanitizeLoopSupervisorConfig(savedConfig.loopSupervisor as any, config.loopSupervisor),
         // Sanitize: clamp thresholds/cooldowns and fall back to defaults.
         modelHealth: sanitizeModelHealthConfig(savedConfig.modelHealth as any, config.modelHealth ?? MODEL_HEALTH_DEFAULTS),
+        // Sanitize: clamp seconds and fall back to defaults (0 = instant reap).
+        reaper: sanitizeReaperConfig(savedConfig.reaper as any, config.reaper),
       };
 
       // Apply watchdog timeouts (seconds → ms) to the agent manager
@@ -2149,6 +2188,7 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
         watchdog: config.watchdog,
         loopSupervisor: config.loopSupervisor,
         modelHealth: config.modelHealth,
+        reaper: config.reaper,
       });
     } catch {
       // Stale pi context after /reload/session replacement; file persistence above is enough.

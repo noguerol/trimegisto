@@ -1,7 +1,7 @@
 import { Container, getKeybindings, Spacer, Text } from "@earendil-works/pi-tui";
-import { formatTierLabel, clampWatchdogSeconds, MAX_WATCHDOG_SECONDS, WATCHDOG_DEFAULTS } from "./config.ts";
+import { formatTierLabel, clampWatchdogSeconds, MAX_WATCHDOG_SECONDS, WATCHDOG_DEFAULTS, sanitizeReaperConfig } from "./config.ts";
 import { MODEL_HEALTH_DEFAULTS, sanitizeModelHealthConfig } from "./model-health.ts";
-import type { AgentTier, TrimegistoConfig } from "./types.ts";
+import { REAPER_DEFAULTS, type AgentTier, type TrimegistoConfig } from "./types.ts";
 import { formatTmgStatus } from "./branding.ts";
 
 export interface ConfigUIRuntime {
@@ -16,6 +16,7 @@ export interface ConfigUIRuntime {
   registerMainTool: () => void;
   syncLoopSupervisor?: () => void;
   syncWatchdog?: () => void;
+  syncReaper?: () => void;
   syncModelHealth?: () => void;
   clearModelHealth?: (model?: string) => void;
 }
@@ -27,6 +28,9 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
   // Sanitize rather than merely defaulting: a partial modelHealth block (e.g.
   // hand-edited config) must not leave undefined thresholds in the UI.
   config.modelHealth = sanitizeModelHealthConfig(config.modelHealth as any, MODEL_HEALTH_DEFAULTS);
+  // Same for the reaper block: a partial/hand-edited config must not leak
+  // undefined seconds into the UI.
+  config.reaper = sanitizeReaperConfig(config.reaper as any, config.reaper ?? REAPER_DEFAULTS);
   let modelList: string[] | null = null;
 
   const pickModel = async (title: string): Promise<string | undefined> => {
@@ -104,6 +108,11 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
         const wd = config.watchdog;
         const fmt = (s: number) => (s > 0 ? `${s}s` : "off");
         return `first ${fmt(wd.firstResponseSeconds)} | idle ${fmt(wd.idleSeconds)} | max ${fmt(wd.maxRuntimeSeconds)}`;
+      })(),
+      "Reaper: " + (() => {
+        const rp = config.reaper;
+        if (!rp || rp.enabled !== true) return "OFF";
+        return `on | terminal idle ${rp.terminalIdleSeconds > 0 ? `${rp.terminalIdleSeconds}s` : "instant"}`;
       })(),
       "Model health: " + (() => {
         const mh = config.modelHealth;
@@ -222,6 +231,41 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
           await editSeconds("Idle timeout", wd.idleSeconds, n => { wd.idleSeconds = n; });
         } else if (wdChoice.startsWith("Max runtime")) {
           await editSeconds("Max runtime", wd.maxRuntimeSeconds, n => { wd.maxRuntimeSeconds = n; });
+        }
+      }
+      continue;
+    }
+
+    // Reaper submenu: stays open after each edit.
+    if (choice.startsWith("Reaper")) {
+      const rp = config.reaper;
+      const fmt = (s: number) => (s > 0 ? `${s}s` : "instant");
+      const editSeconds = async (label: string, current: number, apply: (n: number) => void): Promise<void> => {
+        const raw = await ctx.ui.input(`${label} — seconds (0 = reap on first sweep)`, String(current));
+        if (raw === undefined) return;
+        const n = parseInt(raw.trim(), 10);
+        if (isNaN(n) || n < 0) { ctx.ui.notify("Enter a non-negative number of seconds", "error"); return; }
+        const clamped = clampWatchdogSeconds(n, 0);
+        apply(clamped);
+        rt.syncReaper?.();
+        if (clamped !== n) ctx.ui.notify(`Value capped at ${MAX_WATCHDOG_SECONDS}s (max)`, "warning");
+        ctx.ui.notify(`${label}: ${fmt(clamped)}`, "info");
+        rt.saveConfig();
+      };
+      while (true) {
+        const rpChoice = await ctx.ui.select("Reaper (auto-free finished agents):", [
+          `Enabled: ${rp.enabled ? "ON" : "OFF"}`,
+          `Terminal idle timeout: ${fmt(rp.terminalIdleSeconds)}`,
+          "Back",
+        ]);
+        if (!rpChoice || rpChoice === "Back") break;
+        if (rpChoice.startsWith("Enabled")) {
+          config.reaper.enabled = !config.reaper.enabled;
+          rt.syncReaper?.();
+          ctx.ui.notify(`Reaper: ${config.reaper.enabled ? "ON" : "OFF"}`, config.reaper.enabled ? "info" : "warning");
+          rt.saveConfig();
+        } else if (rpChoice.startsWith("Terminal idle timeout")) {
+          await editSeconds("Terminal idle timeout", rp.terminalIdleSeconds, n => { rp.terminalIdleSeconds = n; });
         }
       }
       continue;

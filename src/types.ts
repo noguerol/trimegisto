@@ -178,6 +178,33 @@ export interface ModelHealthConfig {
   maxCooldownSeconds: number;
 }
 
+/**
+ * Reaping settings for finished agents, in seconds. A value of 0 disables the
+ * corresponding rule; `enabled: false` disables the whole reaper.
+ */
+export interface ReaperConfig {
+  /**
+   * Master switch for auto-reaping of finished agents. ON by default: agents
+   * that are done/error/killed and are no longer referenced by any batch or
+   * watcher are reaped (memory, locks, context and telemetry freed, and the
+   * line drops off the dashboard list and /tmg list) after
+   * `terminalIdleSeconds`.
+   */
+  enabled: boolean;
+  /**
+   * Seconds a terminal agent must have been sitting unused before it is
+   * reaped. 0 = reap immediately on the first sweep after the agent settles.
+   * Default: 300.
+   */
+  terminalIdleSeconds: number;
+}
+
+/** Default reaper settings (seconds). */
+export const REAPER_DEFAULTS: ReaperConfig = {
+  enabled: true,
+  terminalIdleSeconds: 300,
+} as const;
+
 export interface TrimegistoConfig {
   /** Active model tier (default for mass parallel spawn; uses the pi active model) */
   active: TierConfig;
@@ -221,6 +248,8 @@ export interface TrimegistoConfig {
   dashboardVisible: boolean;
   /** Watchdog timeouts (seconds; 0 disables that watchdog) */
   watchdog: WatchdogConfig;
+  /** Auto-reaping of finished (terminal) agents (seconds; 0 disables the idle rule) */
+  reaper: ReaperConfig;
   /** Loop supervisor settings */
   loopSupervisor: Partial<LoopSupervisorConfig>;
   /** Model-level circuit breaker (pauses spawns on a failing model) */
