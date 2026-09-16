@@ -9,8 +9,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { TrimegistoConfig, TierConfig, AgentTier, LoopSupervisorConfig } from "./types.ts";
+import type { TrimegistoConfig, TierConfig, AgentTier, LoopSupervisorConfig, ReaperConfig } from "./types.ts";
 import { MODEL_HEALTH_DEFAULTS } from "./model-health.ts";
+import { REAPER_DEFAULTS } from "./types.ts";
 
 const CONFIG_ENTRY_TYPE = "trimegisto-config";
 
@@ -267,7 +268,32 @@ export function getDefaultConfig(): TrimegistoConfig {
       dedupeCrossAgent: false,
     },
     modelHealth: { ...MODEL_HEALTH_DEFAULTS },
+    reaper: {
+      enabled: REAPER_DEFAULTS.enabled,
+      terminalIdleSeconds: envWatchdogSeconds("TRIMEGISTO_REAPER_TERMINAL_IDLE_MS", REAPER_DEFAULTS.terminalIdleSeconds),
+    },
   };
+}
+
+/**
+ * Coerce a reaper block (possibly from a corrupt/legacy config file) into a
+ * safe `ReaperConfig`. Missing keys fall back to the defaults; bad values are
+ * clamped so a hostile file can never disable `setTimeout` overflow or flip
+ * the feature flag on accident.
+ */
+export function sanitizeReaperConfig(partial: unknown, base: ReaperConfig): ReaperConfig {
+  const out: ReaperConfig = {
+    enabled: base.enabled,
+    terminalIdleSeconds: base.terminalIdleSeconds,
+  };
+  if (partial && typeof partial === "object" && !Array.isArray(partial)) {
+    const p = partial as Record<string, unknown>;
+    if (typeof p.enabled === "boolean") out.enabled = p.enabled;
+    if (typeof p.terminalIdleSeconds === "number" && Number.isFinite(p.terminalIdleSeconds) && p.terminalIdleSeconds >= 0) {
+      out.terminalIdleSeconds = Math.min(Math.floor(p.terminalIdleSeconds), MAX_WATCHDOG_SECONDS);
+    }
+  }
+  return out;
 }
 
 export const DEFAULT_PROMPTS_MAP = DEFAULT_PROMPTS;

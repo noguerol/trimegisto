@@ -75,6 +75,7 @@ export function saveConfig(config: TrimegistoConfig): void {
       watchdog: config.watchdog,
       loopSupervisor: config.loopSupervisor,
       modelHealth: config.modelHealth,
+      reaper: config.reaper,
       // Schema version for future migrations
       _schemaVersion: SCHEMA_VERSION,
       _savedAt: new Date().toISOString(),
@@ -114,6 +115,7 @@ export function loadConfig(): {
   _schemaVersion?: number;
   loopSupervisor?: Partial<{ enabled: boolean; maxSpawnDepth: number; turnLimitEnabled: boolean; maxAgentTurns: number; turnLimitGrace: number; dedupeCrossAgent: boolean }>;
   modelHealth?: Partial<{ enabled: boolean; failureThreshold: number; cooldownSeconds: number; maxCooldownSeconds: number }>;
+  reaper?: Partial<{ enabled: boolean; terminalIdleSeconds: number }>;
 } | null {
   try {
     const configPath = getConfigPath();
@@ -143,6 +145,7 @@ export function loadConfig(): {
       _schemaVersion: typeof data._schemaVersion === "number" ? data._schemaVersion : undefined,
       loopSupervisor: data.loopSupervisor && typeof data.loopSupervisor === "object" ? data.loopSupervisor : undefined,
       modelHealth: data.modelHealth && typeof data.modelHealth === "object" ? data.modelHealth : undefined,
+      reaper: data.reaper && typeof data.reaper === "object" ? data.reaper : undefined,
     };
   } catch (err) {
     console.error("[trimegisto] Failed to load config:", err);

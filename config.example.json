@@ -65,5 +65,10 @@
     "failureThreshold": 2,
     "cooldownSeconds": 60,
     "maxCooldownSeconds": 600
+  },
+  "reaper": {
+    "_note": "Auto-purge: finished agents (done/error/killed) that are no longer referenced by any live batch are reaped after terminalIdleSeconds of inactivity. 0 = reap on the first sweep. On by default.",
+    "enabled": true,
+    "terminalIdleSeconds": 300
   }
 }

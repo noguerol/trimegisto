@@ -66,6 +66,8 @@ Results land in the chat as agents finish, with per-agent logs, tokens and cost,
 
 **Limits** — spawn-depth cap (default 5, so agents can't chain forever); turn limit **off by default** (when you enable it: warn at 50 turns, kill at 65 — an agent never dies on turn count because of someone else's default); watchdogs for first response, idle and max runtime, all configurable, runtime kill off so a productive agent runs as long as it needs.
 
+**Auto-purge (reaper)** — finished agents don't pile up forever. When an agent is terminal (`done`/`error`/`killed`), no longer referenced by any live batch, and has been idle for `terminalIdleSeconds` (default 300 s), the reaper frees it: memory, file locks, context tracking, speed telemetry, and its line drops off the dashboard and `/tmg list`. **On by default**; disable or tune the timeout in `/tmg config` → Reaper.
+
 **Failure** — a per-model circuit breaker: two model-level failures in a row pause that model (60 s, doubling to 600 s) so a dead provider can't trigger a spawn storm; it clears on a success, a model change, or `/tmg reset-models`. And when a provider answers `400`, a post-mortem window captures the next requests for 10 minutes — secrets always redacted — so you can finally see what killed the coordinator.
 
 **UI** — dashboard in three modes (compact / full / off): live prefill and decode speeds per agent measured from the token stream, model used per worker, timers that freeze honestly when an agent dies.

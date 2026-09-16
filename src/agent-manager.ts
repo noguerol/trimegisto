@@ -37,6 +37,7 @@ import {
   modelKey,
   type ModelBlockInfo,
 } from "./model-health.ts";
+import { REAPER_DEFAULTS, type ReaperConfig } from "./types.ts";
 
 /**
  * Model-level circuit breaker shared by every spawn path. Set by the extension
@@ -166,6 +167,113 @@ export function setWatchdogTimeouts(t: Partial<WatchdogTimeouts>): void {
 
 export function getWatchdogTimeouts(): WatchdogTimeouts {
   return { ...watchdogTimeouts };
+}
+
+/**
+ * Auto-reaper settings (ms). 0 for terminalIdleMs = reap on the first sweep.
+ * 0 for maxTerminalAgeMs = no absolute cap (only the idle rule applies).
+ * Called by the extension after loading /tmg config and from the config UI.
+ */
+let reaperConfig: ReaperConfig & { maxTerminalAgeMs: number } = {
+  enabled: REAPER_DEFAULTS.enabled,
+  terminalIdleMs: REAPER_DEFAULTS.terminalIdleSeconds * 1000,
+  maxTerminalAgeMs: 0,
+};
+
+export function setReaperConfig(r: Partial<ReaperConfig>): void {
+  if (typeof r.enabled === "boolean") reaperConfig.enabled = r.enabled;
+  if (typeof r.terminalIdleMs === "number") reaperConfig.terminalIdleMs = normalizeWatchdogMs(r.terminalIdleMs, REAPER_DEFAULTS.terminalIdleSeconds * 1000);
+  if (typeof r.maxTerminalAgeMs === "number") reaperConfig.maxTerminalAgeMs = normalizeWatchdogMs(r.maxTerminalAgeMs, 0);
+}
+
+export function getReaperConfig(): { enabled: boolean; terminalIdleMs: number; maxTerminalAgeMs: number } {
+  return { enabled: reaperConfig.enabled, terminalIdleMs: reaperConfig.terminalIdleMs, maxTerminalAgeMs: reaperConfig.maxTerminalAgeMs };
+}
+
+/**
+ * Per-agent "last useful activity" clock used by the reaper. Updated when an
+ * agent is (re)referenced by a batch or resolves its waiting watcher; the
+ * reaper never touches an agent that was touched recently.
+ */
+const lastUse = new Map<string, number>();
+
+export function touchAgent(id: string): void {
+  lastUse.set(id, Date.now());
+}
+
+export function lastAgentUse(id: string): number {
+  return lastUse.get(id) ?? 0;
+}
+
+/**
+ * Drop a finished agent from every runtime structure (map, locks, context,
+ * controls, telemetry, guard state, dedup registry). Safe to call only on
+ * agents in a terminal status (done/error/killed) that no batch/watcher still
+ * references — enforced by `reapFinishedAgents`.
+ */
+export function removeAgent(id: string): boolean {
+  const agent = agents.get(id);
+  if (!agent) return false;
+  if (!isTerminalStatus(agent.status)) return false;
+  agents.delete(id);
+  lastUse.delete(id);
+  try { releaseAllAgentLocks(id); } catch { /* already released */ }
+  try { clearAgentContext(id); } catch { /* already cleared */ }
+  if (instanceDir) {
+    try { clearAgentControls(instanceDir, id); } catch { /* ignore */ }
+  }
+  try { speed.forget(id); } catch { /* ignore */ }
+  if (loopSupervisor) {
+    try { loopSupervisor.processResult(buildMinimalResult(agent)); } catch { /* ignore */ }
+  }
+  try { forgetTask(agent.task); } catch { /* ignore */ }
+  notifyStateChange();
+  return true;
+}
+
+function buildMinimalResult(agent: AgentInstance): AgentResult {
+  return {
+    agentId: agent.id,
+    tier: agent.tier,
+    task: agent.task,
+    status: agent.status,
+    output: agent.output,
+    finalOutput: agent.finalOutput,
+    stderr: agent.stderr,
+    usage: agent.usage,
+    model: agent.model,
+    stopReason: agent.stopReason,
+    log: agent.log,
+  };
+}
+
+/**
+ * Sweep every terminal agent and reap the ones that are safe to drop:
+ * finished (done/error/killed), not owned by a live batch (or watcher), and
+ * idle for at least `terminalIdleMs` since the last reference (or older than
+ * `maxTerminalAgeMs` in absolute terms). Returns the reaped agent IDs.
+ */
+export function reapFinishedAgents(isReferenced: (agentId: string) => boolean): string[] {
+  const cfg = getReaperConfig();
+  if (!cfg.enabled) return [];
+  const now = Date.now();
+  const reaped: string[] = [];
+  for (const [id, agent] of agents) {
+    if (!isTerminalStatus(agent.status)) continue;
+    if (isReferenced(id)) continue;
+    // The idle clock starts when the agent became terminal (or when it was
+    // last referenced by a batch/watcher, whichever is later). We do NOT use
+    // startedAt as a floor: an agent that finished 10 s ago but was launched
+    // 10 min ago must still wait the full terminalIdleMs before being reaped.
+    const terminalSince = agent.finishedAt || lastAgentUse(id) || agent.startedAt;
+    const lastTouched = Math.max(terminalSince, lastAgentUse(id));
+    const idleFor = now - lastTouched;
+    const idleRule = cfg.terminalIdleMs > 0 && idleFor >= cfg.terminalIdleMs;
+    const ageRule = cfg.maxTerminalAgeMs > 0 && (agent.finishedAt || 0) > 0 && (now - (agent.finishedAt || 0)) >= cfg.maxTerminalAgeMs;
+    if (!idleRule && !ageRule) continue;
+    if (removeAgent(id)) reaped.push(id);
+  }
+  return reaped;
 }
 
 /**
