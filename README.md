@@ -47,7 +47,9 @@ You need a working pi with at least one usable model. Sub-agents inherit your pr
 ```
 /tmg config                # pick a model per tier, tune the knobs
 /t2 fix the failing test in src/parser.ts
-@t2b now also cover the empty-input case      # steer a running agent
+@t2b now also cover the empty-input case      # steer a running agent in place
+@t2b halt                                     # stop only that agent
+@t2b compact                                  # free its context now
 "Review the diff, run the tests, summarize risks."   # or just ask — if
                                                  # auto-spawn is on, the main
                                                  # model delegates first
@@ -88,8 +90,9 @@ Inside a batch, sub-agents can spawn their own workers (`trimegisto_spawn`, batc
 | | |
 |---|---|
 | `/t0 … /t3 <task>` | spawn an agent in that tier |
-| `/t2b <ins>` or `@t2b <ins>` | steer a running agent: kill + relaunch same id/tier with old task + your new instruction combined |
-| `/tmg launch · tell · kill · halt · list · switch · locks` | direct control; **Ctrl+Alt+H** halts everything |
+| `/t2b <ins>` or `@t2b <ins>` | steer a running agent **in place** (the instruction is injected into the live run; nothing is killed or respawned) |
+| `@t2b halt` · `@t2b compact` | stop only that agent · free that agent's context (since a sub-agent is a one-shot process, this restarts it with a bounded progress digest) |
+| `/tmg launch · tell · kill · halt · list · switch · locks` | direct control; **Ctrl+Alt+H** halts everything; `/tmg kill <id>` and `@<id> halt` stop one agent |
 | `/tmg dashboard` | cycle compact → full → off |
 | `/tmg guard` `/tmg models` | live state of limits and circuit breakers; `reset-guard` / `reset-models` clear them |
 | `/tmg enable · disable` | master switch |

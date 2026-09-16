@@ -3,7 +3,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getAgents, killAgent, haltAll as haltAllAgents, getAgent, getLoopSupervisor, getModelHealth } from "./agent-manager.ts";
 import { getActiveLocks } from "./file-lock.ts";
-import { formatTierLabel, parseAgentId } from "./config.ts";
+import { parseAgentCommand } from "./agent-control.ts";
+import { formatTierLabel } from "./config.ts";
 import type { AgentTier, TierConfig } from "./types.ts";
 
 export interface CommandRuntime {
@@ -13,7 +14,12 @@ export interface CommandRuntime {
   isEnabled?: () => boolean;
   setEnabled?: (v: boolean) => void;
   haltAll?: () => number;
-  sendToAgent?: (agentId: string, instruction: string) => any | Promise<any>;
+  /** Kill ONE agent (per-agent halt), distinct from haltAll. */
+  haltAgent?: (agentId: string) => boolean;
+  /** Steer a running agent in place (no kill/respawn). */
+  steerAgent?: (agentId: string, text: string) => boolean;
+  /** Compact a running agent's context (restarts it with a bounded digest). */
+  compactAgent?: (agentId: string) => any | null;
   toggleDashboard?: () => void;
   openConfig?: (ctx: any) => void | Promise<void>;
   /** Persisted guard config (what the UI edits) — used to spot a live/disk divergence. */
@@ -94,9 +100,10 @@ export async function handleTmgCommand(pi: ExtensionAPI, args: string | undefine
       const targetId = parts[1];
       const instruction = parts.slice(2).join(" ");
       if (!getAgent(targetId)) return ctx.ui.notify(`Agent ${targetId} not found.`, "error");
-      ctx.ui.notify(`Sending to ${targetId}...`, "info");
-      const newAgent = await rt.sendToAgent?.(targetId, instruction);
-      ctx.ui.notify(newAgent ? `${targetId} → ${newAgent.id}` : `Failed to send to ${targetId}.`, newAgent ? "info" : "error");
+      // Steer IN PLACE. The old path killed the agent and respawned it, which
+      // threw away everything the target had already done.
+      const steered = rt.steerAgent?.(targetId, instruction) ?? false;
+      ctx.ui.notify(steered ? `Steering ${targetId}...` : `Failed to send to ${targetId}.`, steered ? "info" : "error");
       return;
     }
 
@@ -248,7 +255,7 @@ export async function handleTmgCommand(pi: ExtensionAPI, args: string | undefine
         "  /tmg dashboard | locks | guard | reset-guard [tier]\n" +
         "  /tmg models | reset-models [model]\n" +
         "  /tmg enable | disable\n" +
-        "  @t2b <instruction>",
+        "  @t2b <instruction> | @t2b halt | @t2b compact | @t2 <task>",
         "info",
       );
   }
@@ -265,22 +272,47 @@ export async function handleTierCommand(tier: AgentTier, cmd: string, args: stri
 
 export async function handleMentionCommand(args: string | undefined, ctx: any, rt: CommandRuntime): Promise<void> {
   if (!enabled(rt, ctx)) return;
-  const parts = (args || "").trim().split(/\s+/).filter(Boolean);
-  if (parts.length < 2) return ctx.ui.notify("Usage: @<agent-id> <instruction>\nExample: @t2b parse logs", "error");
-  const targetId = parts[0].toLowerCase();
-  const instruction = parts.slice(1).join(" ");
-  const parsed = parseAgentId(targetId);
-  if (!parsed) return ctx.ui.notify(`Invalid agent ID: ${targetId}. Use t1a, t2b, t3c...`, "error");
-  const agent = getAgent(targetId);
-  if (!agent) {
-    ctx.ui.notify(`Agent ${targetId} not found. Launching ${formatTierLabel(parsed.tier)}...`, "info");
-    const newAgent = await rt.launchFn(parsed.tier, instruction, rt.cwd, targetId);
-    ctx.ui.notify(`${agentName(newAgent)} launched: ${instruction.slice(0, 60)}`, newAgent?.status === "error" ? "error" : "info");
+  const cmd = parseAgentCommand(`@${(args || "").trim()}`);
+  if (!cmd) {
+    return ctx.ui.notify("Usage: @<agent-id> <instruction>\nExamples: @t2b parse logs | @t2b halt | @t2b compact | @t2 <task>", "error");
+  }
+
+  // Bare tier: no target to steer, so spawn a new agent.
+  if (!cmd.agentId) {
+    ctx.ui.notify(`Launching ${formatTierLabel(cmd.tier)}...`, "info");
+    const newAgent = await rt.launchFn(cmd.tier, cmd.text, rt.cwd);
+    ctx.ui.notify(`${agentName(newAgent)} launched: ${cmd.text.slice(0, 60)}`, newAgent?.status === "error" ? "error" : "info");
     return;
   }
-  ctx.ui.notify(`Sending to ${targetId}: ${instruction.slice(0, 60)}`, "info");
-  const newAgent = await rt.sendToAgent?.(targetId, instruction);
-  ctx.ui.notify(newAgent ? `${targetId} → ${newAgent.id}: ${instruction.slice(0, 50)}` : `Failed to send to ${targetId}.`, newAgent ? "info" : "error");
+
+  const targetId = cmd.agentId;
+
+  if (cmd.verb === "halt") {
+    const killed = rt.haltAgent ? rt.haltAgent(targetId) : killAgent(targetId);
+    ctx.ui.notify(killed ? `Halted ${targetId}.` : `Agent ${targetId} not found or already stopped.`, killed ? "info" : "warning");
+    return;
+  }
+
+  const agent = getAgent(targetId);
+  if (!agent) return ctx.ui.notify(`Agent ${targetId} not found. Spawn one with @${targetId.slice(0, 2)} <task>.`, "error");
+
+  if (cmd.verb === "compact") {
+    if (agent.status !== "running" && agent.status !== "waiting") {
+      return ctx.ui.notify(`Agent ${targetId} is ${agent.status} — compact only applies while it runs.`, "warning");
+    }
+    const replacement = rt.compactAgent?.(targetId) ?? null;
+    ctx.ui.notify(
+      replacement ? `Compacted ${targetId} → relaunched as ${agentName(replacement)} with a condensed context.` : `Could not compact ${targetId}.`,
+      replacement ? "info" : "error",
+    );
+    return;
+  }
+
+  if (agent.status !== "running" && agent.status !== "waiting") {
+    return ctx.ui.notify(`Agent ${targetId} is ${agent.status} — steer only works while it runs. Launch a new one with @${targetId.slice(0, 2)} <task>.`, "warning");
+  }
+  const steered = rt.steerAgent?.(targetId, cmd.text) ?? false;
+  ctx.ui.notify(steered ? `Steering ${targetId}: ${cmd.text.slice(0, 60)}` : `Could not reach ${targetId}.`, steered ? "info" : "error");
 }
 
 export async function handleHaltShortcut(ctx: any, rt: CommandRuntime): Promise<void> {

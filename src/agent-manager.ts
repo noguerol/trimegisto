@@ -24,6 +24,7 @@ import type { AgentInstance, AgentResult, AgentStatus, AgentTier, TierConfig, Ag
 import { formatTierLabel } from "./config.ts";
 import { scanSpawnRequests, writeSpawnResponse, cleanupStaleFiles, setInstanceDir as setIpcInstanceDir } from "./ipc.ts";
 import { releaseAllAgentLocks, setInstanceDir as setLockInstanceDir } from "./file-lock.ts";
+import { clearAgentControls, condenseForCompaction } from "./agent-control.ts";
 import { broadcastFileChange, clearAgentContext, setInstanceDir as setContextInstanceDir } from "./context-broker.ts";
 import { type LoopSupervisor, type LoopAlert } from "./loop-supervisor.ts";
 import { speed } from "./speed.ts";
@@ -165,6 +166,47 @@ export function setWatchdogTimeouts(t: Partial<WatchdogTimeouts>): void {
 
 export function getWatchdogTimeouts(): WatchdogTimeouts {
   return { ...watchdogTimeouts };
+}
+
+/**
+ * Extra grace granted while a compaction is running. A compaction is a one-off
+ * summarization call with NO incremental output: on a big local model it can
+ * stay silent for minutes. Without this the idle watchdog killed the agent
+ * mid-compaction — the reported "the agents ran out of context and could not
+ * compact".
+ */
+export const DEFAULT_COMPACTION_GRACE_MS = 30 * 60_000;
+
+export interface IdleWatchdogInput {
+  now: number;
+  lastProgressAt: number;
+  idleMs: number;
+  /** When the current compaction started, or null/undefined when not compacting. */
+  compactingSince?: number | null;
+  /** Grace granted while compacting; defaults to DEFAULT_COMPACTION_GRACE_MS. */
+  compactionGraceMs?: number;
+}
+
+/**
+ * Pure idle-watchdog decision, extracted so the compaction exemption is proven
+ * by execution instead of by reading.
+ *
+ * Disabled (idleMs <= 0) never kills. While a compaction is in progress the
+ * agent is silent BY DESIGN, so the idle clock is suspended for up to the grace;
+ * only a compaction that itself makes no progress past the grace falls through
+ * to the normal idle check.
+ */
+export function shouldIdleKill(input: IdleWatchdogInput): boolean {
+  const { now, lastProgressAt, idleMs } = input;
+  if (!Number.isFinite(idleMs) || idleMs <= 0) return false;
+  const compactingSince = input.compactingSince ?? null;
+  if (compactingSince !== null && Number.isFinite(compactingSince)) {
+    const grace = Number.isFinite(input.compactionGraceMs)
+      ? (input.compactionGraceMs as number)
+      : DEFAULT_COMPACTION_GRACE_MS;
+    if (now - compactingSince <= grace) return false;
+  }
+  return now - lastProgressAt >= idleMs;
 }
 
 /**
@@ -437,6 +479,8 @@ export function launchAgent(
   let runtimeTimer: ReturnType<typeof setTimeout> | null = null;
   let gotFirstResponse = false;
   let lastProgressAt = Date.now();
+  /** Start timestamp of the in-flight compaction, or null when not compacting. */
+  let compactingSince: number | null = null;
 
   function clearAttemptWatchdogs(): void {
     if (responseTimer) { clearTimeout(responseTimer); responseTimer = null; }
@@ -630,6 +674,7 @@ export function launchAgent(
       // instead of leaving the main session waiting forever.
       gotFirstResponse = false;
       lastProgressAt = Date.now();
+      compactingSince = null;
       const { firstResponseMs, idleMs, maxRuntimeMs } = watchdogTimeouts;
       if (firstResponseMs > 0) {
         responseTimer = setTimeout(() => {
@@ -645,13 +690,13 @@ export function launchAgent(
       if (idleMs > 0) {
         idleTimer = setInterval(() => {
           if (instance.status !== "running") return;
-          const idleMs2 = Date.now() - lastProgressAt;
-          if (idleMs2 >= idleMs) {
-            terminateForWatchdog(
-              "idle_timeout",
-              `⏱ No agent progress for ${Math.round(idleMs2 / 1000)}s (idle timeout ${Math.round(idleMs / 1000)}s)`,
-            );
-          }
+          const now = Date.now();
+          if (!shouldIdleKill({ now, lastProgressAt, idleMs, compactingSince })) return;
+          terminateForWatchdog(
+            "idle_timeout",
+            `⏱ No agent progress for ${Math.round((now - lastProgressAt) / 1000)}s (idle timeout ${Math.round(idleMs / 1000)}s)` +
+              (compactingSince !== null ? " — compaction was still running" : ""),
+          );
         }, Math.min(15_000, Math.max(1_000, Math.floor(idleMs / 3))));
       }
 
@@ -679,6 +724,35 @@ export function launchAgent(
           return;
         }
         markProgress();
+
+        // ── Compaction events ──────────────────────────────
+        // A compaction is silent while the summarizer runs. Track it so the
+        // idle watchdog does not kill the agent mid-compaction, and surface it
+        // in the log/dashboard instead of leaving the user guessing.
+        if (event.type === "compaction_start") {
+          compactingSince = Date.now();
+          const entry: AgentLogEntry = {
+            ts: Date.now(),
+            level: "info",
+            text: `🗜 Compacting context (${event.reason || "auto"})…`,
+          };
+          instance.log.push(entry);
+          notifyAgentLog(id, entry);
+          return;
+        }
+        if (event.type === "compaction_end") {
+          compactingSince = null;
+          const failed = !!event.errorMessage;
+          const text = event.aborted
+            ? "🗜 Compaction aborted"
+            : failed
+              ? `🗜 Compaction failed: ${String(event.errorMessage).slice(0, 200)}`
+              : "🗜 Compaction done — context freed";
+          const entry: AgentLogEntry = { ts: Date.now(), level: failed ? "error" : "info", text };
+          instance.log.push(entry);
+          notifyAgentLog(id, entry);
+          return;
+        }
 
         // Track output from assistant messages
         if (event.type === "message_end" && event.message?.role === "assistant") {
@@ -1031,6 +1105,7 @@ export function killAgent(id: string): boolean {
     // Release all file locks held by this agent before killing
     releaseAllAgentLocks(id);
     clearAgentContext(id);
+    if (instanceDir) clearAgentControls(instanceDir, id);
 
     agent.controller.abort();
     setAgentStatus(agent, "killed");
@@ -1069,6 +1144,7 @@ export function haltAll(): number {
       }
       releaseAllAgentLocks(id);
       clearAgentContext(id);
+      if (instanceDir) clearAgentControls(instanceDir, id);
       killed++;
     }
   }
@@ -1475,6 +1551,36 @@ New instruction: ${instruction}`;
 
   const tierModelOverride = tier === "active" ? modelOverride : undefined;
   return launchAgent(tier, task, configs[tier], cwd, agentId, tierModelOverride, redundantAgents);
+}
+
+/**
+ * Manually "compact" an agent's context.
+ *
+ * Sub-agents are one-shot `pi -p` processes with an EPHEMERAL session, so pi's
+ * manual compaction (`ctx.compact()`) cannot be used: it aborts the run, the
+ * process exits before the summarization finishes, and the ephemeral session is
+ * discarded with it. The honest equivalent is a restart that carries a BOUNDED
+ * digest of what the agent had produced. Returns the replacement agent, or null
+ * when the target does not exist or is not running.
+ */
+export function compactAgent(
+  agentId: string,
+  configs: Record<AgentTier, TierConfig>,
+  cwd: string,
+  spawnOnlyOnActive: boolean = false,
+  redundantAgents: boolean = false,
+): AgentInstance | null {
+  const existing = agents.get(agentId);
+  if (!existing) return null;
+  if (existing.status !== "running" && existing.status !== "waiting") return null;
+
+  const digest = condenseForCompaction(existing.output || existing.finalOutput || "");
+  const instruction =
+    `Context compacted by the coordinator. Continue the ORIGINAL task; do not redo finished work.\n` +
+    `Original task: ${existing.task}\n\n` +
+    (digest ? `Progress so far (compacted):\n${digest}` : `(no output captured yet — start from the original task)`);
+
+  return sendToAgent(agentId, instruction, configs, cwd, undefined, spawnOnlyOnActive, redundantAgents);
 }
 
 /**
