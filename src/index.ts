@@ -56,6 +56,12 @@ import { saveConfig as persistConfig, loadConfig } from "./persistence.ts";
 import { REAPER_DEFAULTS } from "./types.ts";
 import { cleanupOldNotifications } from "./context-broker.ts";
 import { reconcileBatch, decideBatchSettle, distillConclusion } from "./reconcile.ts";
+import { runVerification, normalizeVerify, waveHasPendingVerification } from "./verify.ts";
+import {
+  initLedger, writeLedger, updateLedgerTask, setLedgerTaskAgent, writeLedgerNotes,
+  pruneLedgers, DEFAULT_LEDGER_MAX_AGE_MS, type LedgerState,
+} from "./ledger.ts";
+import { readNotesSnapshot } from "./shared-context.ts";
 import { planBatch, type PlanNode, type PlanTaskInput } from "./plan-graph.ts";
 import { parseAgentCommand, writeAgentControl, type AgentCommand } from "./agent-control.ts";
 import { advanceWaves } from "./wave-scheduler.ts";
@@ -136,6 +142,15 @@ const TrimegistoTaskItem = Type.Object({
     description: "Files this task writes. Same-file writers are serialised, not raced.",
   })),
   lane: Type.Optional(LaneEnum),
+  verify: Type.Optional(Type.String({
+    description: "Shell command that must exit 0 for this task to count as verified. Run by Trimegisto AFTER the worker finishes (not by the worker, so it cannot fake the verdict). A failure is reported as VERIFY FAILED and the agent's 'done' is not trusted. Opt-in, per task.",
+  })),
+  context: Type.Optional(StringEnum(["ledger", "fresh"] as const, {
+    description: "Ambient context the worker starts with. 'ledger' (default) injects other agents' notes/read files; 'fresh' suppresses it so the worker gets an independent attempt. Explicit `needs` edges are injected either way.",
+  })),
+  diversity: Type.Optional(Type.Boolean({
+    description: "Mark a deliberate parallel attempt (same question, different angle). Exempt from duplicate merging so a fresh twin runs alongside its ledger-aware counterpart. Cap: 3 per batch.",
+  })),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -265,6 +280,19 @@ export default function (pi: ExtensionAPI) {
     taskDetails: any[];
     /** Deterministic plan-gate summary, echoed to the coordinator. */
     planSummary: string;
+    /**
+     * agentId -> verify command for a task whose verification is still in
+     * flight. The wave scheduler must treat such a wave as NOT terminal, or the
+     * batch would settle (and inject an unverified verdict downstream) before
+     * the command finishes. Entries are removed once the result is recorded.
+     */
+    verifyByAgent: Map<string, string>;
+    /**
+     * Per-batch on-disk ledger (plan.md / tasks.json / notes.md). A RECORD, not
+     * a source of truth: null when it could not be created. Writes never throw.
+     */
+    ledger: LedgerState | null;
+    ledgerDir: string | null;
   }
   const pendingBatches: PendingBatch[] = [];
   let batchSeq = 0;
@@ -287,7 +315,23 @@ export default function (pi: ExtensionAPI) {
       stderr: a.stderr ?? "",
       stopReason: a.stopReason,
       usage: a.usage,
+      verification: a.verification,
     };
+  }
+
+  /**
+   * Best-effort ledger update. The ledger is a RECORD, never a source of truth:
+   * a filesystem failure must not affect the batch, so this never throws.
+   */
+  function ledgerMark(
+    batch: PendingBatch,
+    match: { agentId?: string; index?: number },
+    patch: { status?: string; verdict?: string; verification?: any },
+  ): void {
+    if (!batch.ledger || !batch.ledgerDir) return;
+    try {
+      if (updateLedgerTask(batch.ledger, match, patch)) writeLedger(batch.ledgerDir, batch.ledger);
+    } catch { /* the ledger must never break a batch */ }
   }
 
   /**
@@ -366,6 +410,17 @@ export default function (pi: ExtensionAPI) {
       markdown = lines.join("\n");
     }
 
+    // ── Ledger finalization (best-effort): snapshot the published notes and
+    // point the coordinator at the recorded plan/tasks. The ledger is a RECORD;
+    // a filesystem failure must never block the conclusion. ──
+    if (batch.ledger && batch.ledgerDir) {
+      try {
+        writeLedgerNotes(batch.ledgerDir, instanceId ? readNotesSnapshot(getInstanceDir()) : []);
+        writeLedger(batch.ledgerDir, batch.ledger);
+        markdown += `\n_Ledger: \`${batch.ledgerDir}\` (plan.md, tasks.json, notes.md)._\n`;
+      } catch { /* never block the conclusion */ }
+    }
+
     // The message is rendered the instant it is sent, so the user always gets
     // the conclusion even if the main model's next request fails. followUp +
     // triggerTurn asks for exactly ONE reconciling turn without interrupting
@@ -426,6 +481,11 @@ export default function (pi: ExtensionAPI) {
   /** Every agent of the CURRENT wave reached a terminal state. */
   function waveFinished(batch: PendingBatch): boolean {
     if (batch.waveAgentIds.length === 0) return true;
+    // A wave with a verification still in flight is NOT terminal: the verdict
+    // must carry the verify outcome before the next wave (or the conclusion)
+    // can see it. `notifyStateChange` fires before `resolve`, so without this
+    // gate the batch would settle on the worker's own unverified `done`.
+    if (waveHasPendingVerification(batch.waveAgentIds, batch.verifyByAgent)) return false;
     const statuses: Record<string, string | undefined> = {};
     for (const id of batch.waveAgentIds) statuses[id] = getAgent(id)?.status;
     // Single source of truth for "terminal": the tested pure decision helper.
@@ -485,6 +545,7 @@ export default function (pi: ExtensionAPI) {
         batch.agentIds.push(agentId);
         batch.waveAgentIds.push(agentId);
         batch.launched.add(node.index);
+        ledgerMark(batch, { index: node.index }, { status: "error", verdict: `no model configured for ${tier}` });
         batch.results.set(agentId, {
           agentId,
           tier,
@@ -514,11 +575,13 @@ export default function (pi: ExtensionAPI) {
         // Register the ORIGINAL task text (not the upstream preamble) so the
         // cross-call dedup registry keeps comparing like with like.
         if (config.dedupeTasks) registerTask(tier, taskText);
-        const agent = launchAgent(tier, launchTaskText, config[tier], spec?.cwd || batch.cwd, undefined, taskModelOverride, config.redundantAgents);
+        const agent = launchAgent(tier, launchTaskText, config[tier], spec?.cwd || batch.cwd, undefined, taskModelOverride, config.redundantAgents, spec?.context === "fresh");
         batch.agentIds.push(agent.id);
         batch.waveAgentIds.push(agent.id);
         batch.nodeAgent.set(node.index, agent.id);
         batch.launched.add(node.index);
+        setLedgerTaskAgent(batch.ledger, node.index, agent.id);
+        ledgerMark(batch, { index: node.index }, { status: "running" });
         batch.taskDetails.push({
           agentId: agent.id,
           tier: agent.tier,
@@ -533,7 +596,33 @@ export default function (pi: ExtensionAPI) {
         // `registerTask` stored (so a legitimate retry is blocked as a duplicate
         // for the whole 5-minute window), and the reconciliation would print the
         // injected preamble in the task column.
-        agent.resolve = (result) => recordResult(batch, { ...result, task: taskText });
+        // ── Per-task verification (opt-in) ──────────────────────────────
+        // The EXTENSION, not the worker, runs the caller-supplied command, so a
+        // confidently-wrong worker cannot report `done` and be believed. The id
+        // is registered as verify-pending BEFORE resolve: `notifyStateChange`
+        // fires synchronously before `resolve`, and `waveFinished` refuses to
+        // settle a wave while this map holds one of its agents.
+        const verifyCommand = normalizeVerify(spec?.verify)?.command;
+        if (verifyCommand) batch.verifyByAgent.set(agent.id, verifyCommand);
+        agent.resolve = (result) => {
+          if (!verifyCommand) { recordResult(batch, { ...result, task: taskText }); return; }
+          const settle = (verification: any): void => {
+            batch.verifyByAgent.delete(result.agentId);
+            recordResult(batch, { ...result, task: taskText, verification });
+          };
+          // Only a worker that itself succeeded is worth verifying. A failed or
+          // killed worker keeps its own verdict; the gate is cleared so the wave
+          // can settle.
+          if (result.status !== "done") { settle(undefined); return; }
+          // `runVerification` never rejects; the second handler is belt-and-braces
+          // so a bug in it can never leave the wave gate stuck forever.
+          void runVerification({ command: verifyCommand }, spec?.cwd || batch.cwd).then(settle, (err: any) =>
+            settle({
+              command: verifyCommand, ran: false, passed: false, exitCode: null, signal: null,
+              timedOut: false, durationMs: 0, output: "", error: String(err?.message ?? err),
+            }),
+          );
+        };
       } catch (err: any) {
         const agentId = syntheticId;
         // The task was registered just before launchAgent; a launch failure must
@@ -542,6 +631,7 @@ export default function (pi: ExtensionAPI) {
         batch.agentIds.push(agentId);
         batch.waveAgentIds.push(agentId);
         batch.launched.add(node.index);
+        ledgerMark(batch, { index: node.index }, { status: "error", verdict: `launch failed: ${err?.message || String(err)}` });
         batch.results.set(agentId, {
           agentId,
           tier,
@@ -564,6 +654,13 @@ export default function (pi: ExtensionAPI) {
     // Allow a legitimate retry if the accepted spawn failed outright
     if (result.status === "error" || result.status === "killed") forgetTask(result.task);
     batch.results.set(result.agentId, result);
+    // Mirror the settled task into the on-disk ledger (status, verify verdict,
+    // bounded conclusion). Best-effort by construction.
+    ledgerMark(batch, { agentId: result.agentId }, {
+      status: result.status,
+      verification: result.verification,
+      verdict: distillConclusion(toRecon(result), 240),
+    });
     // This runs inside agent-manager's child-process close callback
     // (`instance.resolve?.(buildResult())`), which has NO handler of its own: an
     // exception here would propagate into pi's process exit path and can take the
@@ -997,6 +1094,9 @@ export default function (pi: ExtensionAPI) {
     }
     // Clean up old context notifications periodically
     try { cleanupOldNotifications(); } catch { /* ignore */ }
+    // Bound ledger growth in a long-lived session (ledger dirs are also removed
+    // with the instance on dispose; this only covers a session that runs for days).
+    try { if (instanceId) pruneLedgers(getInstanceDir(), DEFAULT_LEDGER_MAX_AGE_MS); } catch { /* ignore */ }
   }, 500);
 
   // ── Tool availability (so the coordinator knows what it can spawn) ──
@@ -1053,6 +1153,8 @@ export default function (pi: ExtensionAPI) {
  */
 const RULE_DISJOINT = "Subtasks must be DISJOINT: never two agents on the same file or question.";
 const RULE_SCOUTS = "Redundant scouts (same task, different angle) only when you need verification/consensus.";
+const RULE_VERIFY = "Attach `verify` (a shell command that must exit 0) to any task whose success is checkable: Trimegisto runs it AFTER the worker, so a wrong `done` is reported as VERIFY FAILED. The worker never runs it.";
+const RULE_FRESH = "For a risky/anchored plan, spawn a `diversity:true` twin with `context:\"fresh\"` (no shared notes) to get an independent attempt to compare against.";
 const RULE_GRAPH = "Pass `goal`; per task: `why` (need it serves), `needs:[i]` ONLY for real data deps (those run in waves), `writes` for known files (same-file writers are serialised).";
 const RULE_ONENEED = "A task that cannot name the need it serves, or that duplicates another task's inputs and answer, should not be spawned.";
 const RULE_SERIAL = "Mechanical steps (parse, count, rename, format, diff) go in bash, not a model. Irreversible work (delete, deploy, publish, migrate, production data, credentials) is refused: ask the user.";
@@ -1068,6 +1170,8 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
       "PROACTIVE POLICY: when enabled, decompose and call this FIRST for any request with 2+ independent subtasks/files/areas/checks; skip only for single indivisible/trivial work or an explicit opt-out.",
       "Assign DISJOINT subtasks so no two agents redo the same work; scouts only for verification.",
       RULE_GRAPH,
+      RULE_VERIFY,
+      RULE_FRESH,
       RULE_SETTLE,
       "Tiers now:",
       tierStatusLine("active"),
@@ -1147,7 +1251,10 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
       const origToKept = new Map<number, number>();
       params.tasks.forEach((t: any, i: number) => {
         const origIndex = i + 1;
-        if (config.dedupeTasks) {
+        // A `diversity` task is an intentional parallel attempt: it must not be
+        // rejected as an already-spawned duplicate. (In-batch twins are kept by
+        // the plan gate's diversity exemption.)
+        if (config.dedupeTasks && t.diversity !== true) {
           const dup = isDuplicateTask(t.task);
           if (dup.duplicate) {
             skippedTasks.push({ task: t.task, tier: t.tier, matchedTask: dup.matchedTask ?? "", matchedTier: dup.matchedTier });
@@ -1195,6 +1302,9 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
           tier: typeof t.tier === "string" ? t.tier : undefined,
           lane: t.lane,
           cwd: t.cwd,
+          verify: normalizeVerify(t.verify)?.command,
+          context: t.context === "fresh" ? "fresh" : t.context === "ledger" ? "ledger" : undefined,
+          diversity: t.diversity === true,
         } as PlanTaskInput;
       });
 
@@ -1334,8 +1444,31 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
         .map((w) => w.map((i) => nodeByIndex.get(i)).filter((n): n is PlanNode => !!n))
         .filter((w) => w.length > 0);
 
+      // ── Per-batch on-disk ledger (a record; never a source of truth) ──
+      const batchId = `batch-${++batchSeq}`;
+      const ledgerState: LedgerState | null = instanceId ? {
+        version: 1,
+        batchId,
+        goal: planGoal,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        tasks: plan.launch.map((n) => {
+          const spec = taskByIndex.get(n.index);
+          return {
+            index: n.index,
+            tier: (spec?.tier as string) || "active",
+            task: String(spec?.task ?? n.task ?? ""),
+            wave: n.wave,
+            needs: Array.isArray(n.needs) && n.needs.length > 0 ? n.needs.slice() : undefined,
+            verify: normalizeVerify(spec?.verify)?.command,
+            status: "pending",
+          };
+        }),
+      } : null;
+      const batchLedgerDir = ledgerState ? initLedger(getInstanceDir(), ledgerState) : null;
+
       const batch: PendingBatch = {
-        id: `batch-${++batchSeq}`,
+        id: batchId,
         startedAt: Date.now(),
         deadlineAt: Date.now() + BATCH_DEADLINE_MS,
         agentIds: [],
@@ -1352,6 +1485,9 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
         launched: new Set(),
         taskDetails: [],
         planSummary: plan.summary,
+        verifyByAgent: new Map(),
+        ledger: ledgerState,
+        ledgerDir: batchLedgerDir,
       };
       pendingBatches.push(batch);
       advanceBatch(batch);
@@ -2038,6 +2174,8 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
           RULE_DISJOINT,
           RULE_SCOUTS,
           RULE_GRAPH,
+          RULE_VERIFY,
+          RULE_FRESH,
           RULE_ONENEED,
           RULE_SERIAL,
           RULE_NOWAIT,

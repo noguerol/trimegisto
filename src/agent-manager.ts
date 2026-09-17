@@ -550,6 +550,9 @@ export function launchAgent(
   parentId?: string,
   modelOverride?: string,
   redundantAgents: boolean = false,
+  /** When true, do NOT inject the ambient shared-context preamble (other
+   *  agents' notes / read files): the worker gets an independent attempt. */
+  freshContext: boolean = false,
 ): AgentInstance {
   // An explicit launch means the user is starting work again.
   halted = false;
@@ -1169,7 +1172,11 @@ export function launchAgent(
 
       // Shared-context preamble: files already read and facts already
       // established by OTHER agents, so this agent avoids re-reading/re-deriving.
-      const sharedPreamble = instanceDir ? buildSharedContextPreamble(instanceDir, id) : "";
+      // Fresh-perspective worker (opt-in): no ambient context from other
+      // agents, so this is an independent attempt to compare against. Explicit
+      // `needs` edges are still carried by the orchestrator; only the shared
+      // preamble is suppressed.
+      const sharedPreamble = !freshContext && instanceDir ? buildSharedContextPreamble(instanceDir, id) : "";
       const fullPrompt = (sharedPreamble ? sharedPreamble + "\n\n" : "") + config.systemPrompt;
       await fs.promises.writeFile(promptFilePath, fullPrompt, { encoding: "utf-8", mode: 0o600 });
 

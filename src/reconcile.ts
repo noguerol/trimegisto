@@ -30,6 +30,21 @@ export interface ReconResult {
   stderr?: string;
   stopReason?: string;
   usage?: { turns?: number; input?: number; output?: number; cost?: number };
+  /**
+   * Outcome of the per-task verify command run by the EXTENSION after the
+   * worker finished (src/verify.ts). A `done` verdict with `passed: false` must
+   * never be read as success.
+   */
+  verification?: {
+    command?: string;
+    ran?: boolean;
+    passed?: boolean;
+    exitCode?: number | null;
+    timedOut?: boolean;
+    durationMs?: number;
+    output?: string;
+    error?: string;
+  };
 }
 
 export interface ReconcileOptions {
@@ -46,7 +61,7 @@ export interface ReconcileDuplicate { a: string; b: string; similarity: number }
 export interface ReconcileOutput {
   markdown: string;
   headline: string;
-  counts: { total: number; done: number; failed: number; other: number };
+  counts: { total: number; done: number; failed: number; other: number; verified?: number; verifyFailed?: number };
   duplicates: ReconcileDuplicate[];
 }
 
@@ -229,6 +244,22 @@ function positiveInt(v: unknown, fallback: number): number {
 
 // ── Distillation ─────────────────────────────────────────
 
+/** True when the workspace verification ran and failed. */
+export function isVerifyFailed(r: ReconResult | undefined): boolean {
+  const v = r?.verification;
+  return !!(v && v.ran === true && v.passed !== true);
+}
+
+/** One `verify ✅/❌ <cmd>` line for a result that carried a verify command. */
+function verificationLine(r: ReconResult): string {
+  const v = r?.verification;
+  if (!v || v.ran !== true) return "";
+  const cmd = oneLine(String(v.command ?? ""), 80);
+  if (v.passed === true) return `\`verify ✅ ${cmd}\``;
+  const why = v.timedOut ? `timeout after ${v.durationMs ?? "?"}ms` : `exit ${v.exitCode ?? "?"}`;
+  return `\`verify ❌ ${cmd} — ${why}\``;
+}
+
 /**
  * Distil one agent result into the agent's own conclusion.
  *
@@ -264,6 +295,15 @@ export function distillConclusion(r: ReconResult, maxChars: number = DEFAULT_VER
 
   const clean = cleanText(text);
   if (!clean.trim()) return "(no output)";
+  // A `done` worker whose caller-supplied verify command failed is NOT an
+  // answer: prefix the verdict so neither the conclusion nor a downstream
+  // `needs` edge can read it as success (the paper's §4.4 regression).
+  if (status === "done" && isVerifyFailed(r)) {
+    const v = r.verification as NonNullable<ReconResult["verification"]>;
+    const why = v.timedOut ? `timeout after ${v.durationMs ?? "?"}ms` : `exit ${v.exitCode ?? "?"}`;
+    const firstFail = firstLine(String(v.output ?? "")) || String(v.error ?? "") || "no output";
+    return truncateHead(`🚫 VERIFY FAILED (${why}): ${firstFail}\n${clean}`, limit);
+  }
   // A "successful" agent whose only text is a raw provider error did not really
   // answer. Flag it so the reconciliation never presents it as a verdict.
   if (status === "done" && looksLikeRawProviderError(clean)) {
@@ -379,6 +419,17 @@ export function reconcileBatch(results: ReconResult[], options: ReconcileOptions
     else other++;
   }
 
+  // Verification outcomes (only present when the coordinator supplied a
+  // `verify` command). A `done` agent whose command failed is NOT a success.
+  const verifyFailed: number[] = [];
+  let verified = 0;
+  for (let i = 0; i < list.length; i++) {
+    const v = list[i]!.verification;
+    if (!v || v.ran !== true) continue;
+    if (v.passed === true) verified++;
+    else if (isDoneStatus(list[i]!.status)) verifyFailed.push(i);
+  }
+
   const verdicts = list.map((r) => distillConclusion(r, verdictChars));
   const duplicates = detectDuplicates(verdicts, list, threshold);
 
@@ -388,6 +439,7 @@ export function reconcileBatch(results: ReconResult[], options: ReconcileOptions
   const unverified: number[] = [];
   for (let i = 0; i < list.length; i++) {
     if (!isDoneStatus(list[i]!.status)) continue;
+    if (verifyFailed.includes(i)) continue;
     const v = verdicts[i]!;
     if (v === "(no output)" || v.startsWith("⚠️ UNVERIFIED")) unverified.push(i);
   }
@@ -429,6 +481,8 @@ export function reconcileBatch(results: ReconResult[], options: ReconcileOptions
   out.push("");
 
   const summaryBits = [`${total} agents`, `${done} done`, `${failed} failed`, `${other} pending`];
+  if (verified > 0) summaryBits.push(`${verified} verified`);
+  if (verifyFailed.length > 0) summaryBits.push(`${verifyFailed.length} verify-failed`);
   if (unverified.length > 0) summaryBits.push(`${unverified.length} unverified`);
   let summary = `**${summaryBits.join(" · ")}**`;
   const usageBits: string[] = [];
@@ -446,12 +500,16 @@ export function reconcileBatch(results: ReconResult[], options: ReconcileOptions
   out.push("");
   for (let i = 0; i < list.length; i++) {
     const r = list[i]!;
-    const icon = unverified.includes(i)
+    const icon = verifyFailed.includes(i)
+      ? "🚫"
+      : unverified.includes(i)
       ? "⚠️"
       : isDoneStatus(r.status) ? "✅" : isFailedStatus(r.status) ? "❌" : "⏳";
     out.push(`#### ${icon} ${oneLine(r.agentId, 80) || "?"} [${oneLine(r.tier, 24) || "?"}] — ${shortTask(r.task)}`);
     const verdict = verdicts[i]!;
     for (const line of verdict.split("\n")) out.push(`> ${line}`.replace(/\s+$/, ""));
+    const vline = verificationLine(r);
+    if (vline) out.push("", vline);
     const meta = usageMetaLine(r.usage);
     if (meta) out.push("", meta);
     out.push("");
@@ -462,6 +520,20 @@ export function reconcileBatch(results: ReconResult[], options: ReconcileOptions
     out.push("");
     for (const i of unverified) {
       out.push(`- ${oneLine(list[i]!.agentId, 80)} — status=${oneLine(list[i]!.status, 24)}, no usable conclusion; verify before relying on it`);
+    }
+    out.push("");
+  }
+
+  if (verifyFailed.length > 0) {
+    out.push("### 🚫 Verification failed (reported done, command failed)");
+    out.push("");
+    for (const i of verifyFailed) {
+      const r = list[i]!;
+      const v = r.verification as NonNullable<ReconResult["verification"]>;
+      const why = v.timedOut ? `timed out after ${v.durationMs ?? "?"}ms` : `exit ${v.exitCode ?? "?"}`;
+      out.push(`- ${oneLine(r.agentId, 80)} — \`${oneLine(String(v.command ?? ""), 100)}\` ${why}`);
+      const fail = oneLine(String(v.output ?? ""), 220) || String(v.error ?? "");
+      if (fail) out.push(`  - \`${fail}\``);
     }
     out.push("");
   }
@@ -507,16 +579,19 @@ export function reconcileBatch(results: ReconResult[], options: ReconcileOptions
   const unverifiedNote = unverified.length > 0
     ? ` ${unverified.length} reported success without a usable verdict (unverified).`
     : "";
+  const verifyNote = verifyFailed.length > 0
+    ? ` ${verifyFailed.length} reported done but FAILED verification — do not trust those results.`
+    : "";
   out.push(
-    `**Trimegisto conclusion:** ${done}/${total} agents completed.${unverifiedNote} Read the verdicts above and write the unified final answer; do not re-spawn the same work.`,
+    `**Trimegisto conclusion:** ${done}/${total} agents completed.${unverifiedNote}${verifyNote} Read the verdicts above and write the unified final answer; do not re-spawn the same work.`,
   );
 
-  const headline = `${done}/${total} done, ${failed} failed${other > 0 ? `, ${other} pending` : ""}${unverified.length > 0 ? `, ${unverified.length} unverified` : ""}`;
+  const headline = `${done}/${total} done, ${failed} failed${other > 0 ? `, ${other} pending` : ""}${verified > 0 ? `, ${verified} verified` : ""}${verifyFailed.length > 0 ? `, ${verifyFailed.length} verify-failed` : ""}${unverified.length > 0 ? `, ${unverified.length} unverified` : ""}`;
 
   return {
     markdown: `${out.join("\n")}\n`,
     headline,
-    counts: { total, done, failed, other },
+    counts: { total, done, failed, other, verified, verifyFailed: verifyFailed.length },
     duplicates,
   };
 }
