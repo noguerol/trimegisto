@@ -64,61 +64,28 @@ console.log("Test 2 (migrateSavedCompaction):");
 }
 
 // ── Config UI harness ────────────────────────────────────
-/** Script entry: a token resolved against the offered options, or a literal answer. */
-type Step = string | undefined;
+//
+// Drives the REAL SettingsList-based menu: ctx.ui.custom's factory is invoked
+// with a stub tui/theme and the returned component is driven with the same key
+// sequences a terminal sends. Navigation is by row label, so the tests never
+// depend on item order, and the rendered text is asserted for the description
+// hint shown under the selected row.
+const KEY = {
+  up: "\x1b[A", down: "\x1b[B", enter: "\r", space: " ", esc: "\x1b",
+  backspace: "\x7f", clear: "\x15",
+} as const;
 
-function makeHarness(script: Step[], inputAnswer: string | undefined = undefined) {
-  const calls: Array<{ title: string; options: string[] }> = [];
+function makeHarness() {
   const config = getDefaultConfig();
   let saved = 0;
-
-  // Tokens map to an option prefix; unknown strings are returned verbatim.
-  const TOKENS: Record<string, (opts: string[]) => string | undefined> = {
-    "__MAIN_DONE__": (o) => o.find(x => x === "Done"),
-    "__AUTO__": (o) => o.find(x => x.startsWith("Auto-spawn")),
-    "__DEDUPE__": (o) => o.find(x => x.startsWith("Dedupe tasks")),
-    "__REDUNDANT__": (o) => o.find(x => x.startsWith("Redundant models")),
-    "__ADD__": (o) => o.find(x => x === "＋ Add model..."),
-    "__WD__": (o) => o.find(x => x.startsWith("Watchdogs")),
-    "__FIRST__": (o) => o.find(x => x.startsWith("First response")),
-    "__T1__": (o) => o.find(x => x.startsWith("T1")),
-    "__T2__": (o) => o.find(x => x.startsWith("T2")),
-    "__COMPACT__": (o) => o.find(x => x.startsWith("Compaction Threshold")),
-    "__COMPACT_OFF__": (o) => o.find(x => x === "Off (pi default)"),
-    "__BACK__": (o) => o.find(x => x === "Back"),
-  };
-
-  const ctx = {
-    hasUI: true,
-    modelRegistry: { getAvailable: async () => [] },
-    ui: {
-      select: async (title: string, options: string[]) => {
-        calls.push({ title, options });
-        const step = script.shift();
-        if (step === undefined) return undefined;
-        return TOKENS[step] ? TOKENS[step](options) : step;
-      },
-      notify: () => {},
-      input: async () => inputAnswer,
-      custom: async () => undefined,
-    },
-  };
-  // ── Dashboard: live getter + setter that mirrors production EXACTLY.
-  //    Production's setDashboardMode only mutates the closure var; it does NOT
-  //    touch config. The menu handler in config-ui.ts and the toggle in
-  //    index.ts each persist the mode themselves. If the harness set the
-  //    closure AND the config here, dropping the production menu-side write
-  //    would go uncaught. Keep this strictly closure-only.
-  let liveDashboardMode = (config.dashboardMode ?? (config.dashboardVisible === false ? "off" : "compact")) as "compact" | "widget" | "off";
   let dashboardRenders = 0;
-  const setDashboardMode = (mode: "compact" | "widget" | "off") => {
-    liveDashboardMode = mode;
-  };
+  let component: any = null;
+
+  // Mirrors production EXACTLY: setDashboardMode only mutates the closure var;
+  // the menu handler persists the mode itself. Keep this closure-only.
+  let liveDashboardMode = (config.dashboardMode ?? (config.dashboardVisible === false ? "off" : "compact")) as "compact" | "widget" | "off";
+  const setDashboardMode = (mode: "compact" | "widget" | "off") => { liveDashboardMode = mode; };
   const cycleDashboard = () => {
-    // Mirrors the production toggle (cycle closure var, persist to config,
-    // call saveConfig / bump the saved counter). The saved-counter increment
-    // is the harness stand-in for saveConfig() so the test can catch the
-    // menu-cycle and toggle-cycle by the same persistence test.
     const modes: Array<"compact" | "widget" | "off"> = ["compact", "widget", "off"];
     liveDashboardMode = modes[(modes.indexOf(liveDashboardMode) + 1) % modes.length];
     config.dashboardMode = liveDashboardMode;
@@ -140,75 +107,121 @@ function makeHarness(script: Step[], inputAnswer: string | undefined = undefined
     syncLoopSupervisor: () => {},
     syncWatchdog: () => {},
   };
+  const ctx = {
+    hasUI: true,
+    modelRegistry: { getAvailable: async () => [] },
+    ui: {
+      notify: () => {},
+      custom: (factory: any) => new Promise((resolve) => {
+        const tui = { requestRender: () => {} };
+        const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+        component = factory(tui, theme, null, (result: any) => resolve(result));
+      }),
+    },
+  };
+
+  const tick = async (): Promise<void> => { await new Promise((r) => setTimeout(r, 0)); };
+  const start = (): Promise<void> => runConfigUI(ctx, rt as any);
+  const ready = async (): Promise<void> => {
+    for (let i = 0; i < 200 && !component; i++) await tick();
+    if (!component) throw new Error("config UI component was never created");
+  };
+  const render = (): string[] => (component ? component.render(100) : []);
+  const text = (): string => render().join("\n");
+  const selected = (): string => {
+    const line = render().find((l: string) => l.startsWith("→ "));
+    return line ? line.slice(2) : "";
+  };
+  const go = (label: string): void => {
+    for (let i = 0; i < 40; i++) {
+      if (selected().includes(label)) return;
+      component.handleInput(KEY.down);
+    }
+    throw new Error(`could not reach "${label}"; selected="${selected()}"`);
+  };
+  const press = (key: keyof typeof KEY): void => { component.handleInput(KEY[key]); };
+  const type = (s: string): void => { for (const ch of s) component.handleInput(ch); };
+
   return {
-    ctx, rt, calls, config,
+    ctx, rt, config, start, ready, render, text, selected, go, press, type, tick, cycleDashboard,
     savedCount: () => saved,
     dashboardMode: () => liveDashboardMode,
     dashboardRenders: () => dashboardRenders,
-    cycleDashboard,
   };
 }
 
 console.log("Test 3 (tier submenu stays open after toggling):");
 {
-  const h = makeHarness(["__T2__", "Enabled: ON", "__BACK__", "Done"]);
-  await runConfigUI(h.ctx, h.rt as any);
-  const titles = h.calls.map(c => c.title);
-  check("sequence: main -> tier -> tier -> main",
-    titles[0] === "Configure Trimegisto:" && titles[1]!.startsWith("Configure T2:") && titles[2]!.startsWith("Configure T2:") && titles[3] === "Configure Trimegisto:",
-    titles);
-  check("change was saved", h.savedCount() >= 1, h.savedCount());
+  const h = makeHarness();
+  const p = h.start(); await h.ready();
+  h.go("T2"); h.press("enter");
+  check("tier submenu opened", h.text().includes("Configure T2"), h.text().slice(0, 160));
+  h.go("Enabled"); h.press("space");
   check("t2 toggled once (enabled -> OFF)", h.config.t2.enabled === false, h.config.t2.enabled);
+  check("tier submenu stayed open after the change", h.text().includes("Configure T2"));
+  check("change was saved", h.savedCount() >= 1, h.savedCount());
+  h.press("esc");
+  check("Esc returned to the main menu", h.text().includes("Configure Trimegisto"));
+  h.press("esc"); await p;
 }
 
 console.log("Test 4 (main menu toggle stays open):");
 {
-  const h = makeHarness(["__AUTO__", "Done"]);
-  await runConfigUI(h.ctx, h.rt as any);
+  const h = makeHarness();
+  const p = h.start(); await h.ready();
+  h.go("Auto-spawn"); h.press("space");
   check("auto-spawn toggled", h.config.autoSpawn === false, h.config.autoSpawn);
-  check("main menu re-rendered (2 calls)",
-    h.calls.length === 2 && h.calls[1].title === "Configure Trimegisto:",
-    h.calls.map(c => c.title));
+  check("main menu stayed open", h.text().includes("Configure Trimegisto"));
+  check("change was saved", h.savedCount() >= 1, h.savedCount());
+  h.press("esc"); await p;
 }
 
-console.log("Test 5 (watchdogs submenu stays open after editing):");
+console.log("Test 5 (watchdogs submenu edits a number):");
 {
-  const h = makeHarness(["__WD__", "__FIRST__", "__BACK__", "Done"], "30");
-  await runConfigUI(h.ctx, h.rt as any);
-  const titles = h.calls.map(c => c.title);
+  const h = makeHarness();
+  const p = h.start(); await h.ready();
+  h.go("Watchdogs"); h.press("enter");
+  check("watchdogs submenu opened", h.text().includes("Watchdogs"), h.text().slice(0, 160));
+  h.go("First response"); h.press("enter");
+  check("number editor opened with its own hint", h.text().includes("First response (seconds)"), h.text().slice(0, 160));
+  h.press("clear");          // ctrl+u clears the prefilled value
+  h.type("30");
+  h.press("enter");
   check("watchdog updated to 30s", h.config.watchdog.firstResponseSeconds === 30, h.config.watchdog.firstResponseSeconds);
-  check("sequence: main -> wd -> wd -> main",
-    titles[0] === "Configure Trimegisto:" && titles[1] === "Watchdogs (0 = off):" && titles[2] === "Watchdogs (0 = off):" && titles[3] === "Configure Trimegisto:",
-    titles);
+  check("returned to the watchdogs submenu", h.text().includes("Idle timeout"), h.text().slice(0, 200));
+  h.press("esc"); h.press("esc"); await p;
 }
 
 console.log("Test 6 (compaction can be turned off from the tier submenu):");
 {
-  const h = makeHarness(["__T1__", "__COMPACT__", "__COMPACT_OFF__", "__BACK__", "Done"]);
-  h.config.t1.compactionThreshold = 65; // simulate a user who had it on
-  await runConfigUI(h.ctx, h.rt as any);
+  const h = makeHarness();
+  h.config.t1.compactionThreshold = 95; // one cycle lands on 'off'
+  const p = h.start(); await h.ready();
+  h.go("T1"); h.press("enter");
+  h.go("Compaction Threshold"); h.press("space");
   check("t1 compaction turned off", h.config.t1.compactionThreshold === 0, h.config.t1.compactionThreshold);
-  check("compaction menu offered Off option",
-    h.calls.some(c => c.options.includes("Off (pi default)")), h.calls.map(c => c.options.slice(0, 2)));
-  const titles = h.calls.map(c => c.title);
-  check("returned to tier submenu after change", titles[3]!.startsWith("Configure T1:"), titles);
+  check("tier submenu stayed open after the change", h.text().includes("Configure T1"));
+  h.press("esc"); h.press("esc"); await p;
 }
 
 console.log("Test 7 (Esc backs out one level, main Esc closes):");
 {
-  const h = makeHarness(["__T2__", undefined, "Done"]);
-  await runConfigUI(h.ctx, h.rt as any);
-  const titles = h.calls.map(c => c.title);
-  check("Esc from tier submenu returns to main",
-    titles.length === 3 && titles[1]!.startsWith("Configure T2:") && titles[2] === "Configure Trimegisto:",
-    titles);
+  const h = makeHarness();
+  const p = h.start(); await h.ready();
+  h.go("T2"); h.press("enter");
+  check("in the tier submenu", h.text().includes("Configure T2"));
+  h.press("esc");
+  check("Esc from tier submenu returns to main", h.text().includes("Configure Trimegisto"));
+  h.press("esc"); await p;
 }
 
 console.log("Test 8 (main menu Esc closes immediately):");
 {
-  const h = makeHarness([undefined]);
-  await runConfigUI(h.ctx, h.rt as any);
-  check("only one select call then return", h.calls.length === 1, h.calls.map(c => c.title));
+  const h = makeHarness();
+  const p = h.start(); await h.ready();
+  h.press("esc");
+  await p; // resolves: no hang, no extra prompts
+  check("closing without changes persists nothing", h.savedCount() === 0, h.savedCount());
 }
 
 console.log("Test 9 (load + migrate real persisted v2 config):");
@@ -278,39 +291,61 @@ console.log("Test 11 (migration extra edges):");
 
 console.log("Test 12 (several changes in one session stay in main menu):");
 {
-  const h = makeHarness(["__AUTO__", "__DEDUPE__", "Done"]);
-  await runConfigUI(h.ctx, h.rt as any);
+  const h = makeHarness();
+  const p = h.start(); await h.ready();
+  h.go("Auto-spawn"); h.press("space");
+  h.go("Dedupe tasks"); h.press("space");
   check("both toggles applied", h.config.autoSpawn === false && h.config.dedupeTasks === false,
     { autoSpawn: h.config.autoSpawn, dedupeTasks: h.config.dedupeTasks });
-  check("main re-rendered each time (3 calls)", h.calls.length === 3 && h.calls.every(c => c.title === "Configure Trimegisto:"), h.calls.map(c => c.title));
+  check("main menu still open after both", h.text().includes("Configure Trimegisto"));
+  h.press("esc"); await p;
 }
 
-console.log("Test 13 (empty selection from main closes):");
+console.log("Test 13 (every row shows its description hint below the list):");
 {
-  const h = makeHarness([""]);
-  await runConfigUI(h.ctx, h.rt as any);
-  check("empty string treated as cancel", h.calls.length === 1, h.calls.map(c => c.title));
+  const h = makeHarness();
+  const p = h.start(); await h.ready();
+  h.go("Enabled");
+  check("Enabled hint shown", h.text().includes("Master switch"), h.text().slice(0, 200));
+  h.go("Watchdogs");
+  check("Watchdogs hint shown", h.text().includes("Timeouts that kill an agent"));
+  h.go("Model health");
+  check("Model health hint shown", h.text().includes("circuit breaker"));
+  h.go("Auto-spawn");
+  check("Auto-spawn hint shown", h.text().includes("delegate decomposable work"));
+  h.go("Dashboard");
+  check("Dashboard hint shown", h.text().includes("dashboard the TUI shows"));
+  h.press("esc"); await p;
 }
 
-console.log("Test 14 (Esc in compaction picker returns to tier submenu):");
+console.log("Test 14 (Esc in a numeric editor leaves the value untouched):");
 {
-  const h = makeHarness(["__T1__", "__COMPACT__", undefined, "__BACK__", "Done"]);
-  await runConfigUI(h.ctx, h.rt as any);
-  const titles = h.calls.map(c => c.title);
-  check("t1 threshold untouched", h.config.t1.compactionThreshold === 0, h.config.t1.compactionThreshold);
-  check("sequence main -> tier -> compact -> tier -> main",
-    titles[0] === "Configure Trimegisto:" && titles[1]!.startsWith("Configure T1:") && titles[2]!.startsWith("Compaction for") && titles[3]!.startsWith("Configure T1:") && titles[4] === "Configure Trimegisto:",
-    titles);
+  const h = makeHarness();
+  const before = h.config.watchdog.idleSeconds;
+  const p = h.start(); await h.ready();
+  h.go("Watchdogs"); h.press("enter");
+  h.go("Idle timeout"); h.press("enter");
+  h.press("clear"); h.type("9999"); // beyond the cap: would clamp on submit
+  h.press("esc");                    // cancel instead
+  check("idle timeout untouched", h.config.watchdog.idleSeconds === before, h.config.watchdog.idleSeconds);
+  check("back in the watchdogs submenu", h.text().includes("First response"), h.text().slice(0, 200));
+  h.press("esc"); h.press("esc"); await p;
 }
 
-console.log("Test 15 (redundant-models submenu stays open after Add attempt):");
+console.log("Test 15 (redundant-models submenu stays open):");
 {
-  const h = makeHarness(["__T1__", "__REDUNDANT__", "__ADD__", "__BACK__", "__BACK__", "Done"]);
-  await runConfigUI(h.ctx, h.rt as any);
-  const titles = h.calls.map(c => c.title);
-  check("sequence main -> tier -> redundant -> redundant -> tier -> main",
-    titles[0] === "Configure Trimegisto:" && titles[1]!.startsWith("Configure T1:") && titles[2]!.startsWith("Redundant models for") && titles[3]!.startsWith("Redundant models for") && titles[4]!.startsWith("Configure T1:") && titles[5] === "Configure Trimegisto:",
-    titles);
+  const h = makeHarness();
+  const p = h.start(); await h.ready();
+  h.go("T1"); h.press("enter");
+  h.go("Redundant models"); h.press("enter");
+  check("redundant list opened", h.text().includes("Redundant models for T1"), h.text().slice(0, 200));
+  h.go("Add model"); h.press("enter");
+  check("picker opened (no models available)", h.text().includes("No models available"), h.text().slice(0, 200));
+  h.press("esc");
+  check("Esc returned to the redundant list", h.text().includes("Redundant models for T1"));
+  h.press("esc");
+  check("Esc returned to the tier submenu", h.text().includes("Configure T1"));
+  h.press("esc"); h.press("esc"); await p;
 }
 
 console.log("Test 16 (sanitizeLoopSupervisorConfig drops legacy loop keys):");
@@ -388,8 +423,11 @@ console.log("Test 18 (full dashboard shows the agent model):");
 
 console.log("Dashboard mode is persisted AND the menu label tracks each cycle:");
 {
-  const h = makeHarness(["Dashboard: compact", "Dashboard: widget", "Done"]);
-  await runConfigUI(h.ctx, h.rt as any);
+  const h = makeHarness();
+  const p = h.start(); await h.ready();
+  h.go("Dashboard");
+  h.press("space"); // compact -> widget
+  h.press("space"); // widget -> off
   // Two menu cycles: compact -> widget -> off. The persisted config must end
   // up at "off" (not the in-session snapshot) and saveConfig must be called
   // twice. The runtime getter must also reflect the current mode, otherwise
@@ -398,13 +436,15 @@ console.log("Dashboard mode is persisted AND the menu label tracks each cycle:")
   check("the legacy boolean is mirrored from the mode", h.config.dashboardVisible === false, h.config.dashboardVisible);
   check("save was called for each cycle", h.savedCount() >= 2, h.savedCount());
   check("the runtime getter tracks each cycle (no frozen snapshot)", h.dashboardMode() === "off", h.dashboardMode());
+  check("the row label tracks the new mode", h.selected().includes("off"), h.selected());
   check("the widget re-rendered through updateDashboard", h.dashboardRenders() >= 2, h.dashboardRenders());
+  h.press("esc"); await p;
 }
 
 console.log("/tmg dashboard persists AND saves like the menu (otherwise /reload loses it):");
 {
-  const h = makeHarness(["Done"]);
-  await runConfigUI(h.ctx, h.rt as any);
+  const h = makeHarness();
+  const p = h.start(); await h.ready(); h.press("esc"); await p;
   h.cycleDashboard(); // compact -> widget
   h.cycleDashboard(); // widget -> off
   check("two /tmg dashboard cycles reached 'off'", h.config.dashboardMode === "off", h.config.dashboardMode);
