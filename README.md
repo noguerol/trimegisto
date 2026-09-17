@@ -72,7 +72,7 @@ Results land in the chat as agents finish, with per-agent logs, tokens and cost,
 
 **UI** — dashboard in three modes (compact / full / off): live prefill and decode speeds per agent measured from the token stream, model used per worker, timers that freeze honestly when an agent dies.
 
-All of it is editable in `/tmg config` and persists in `~/.pi/agent/trimegisto/config.json` (template: [config.example.json](config.example.json)); it survives `/new`, `/resume`, `/fork`.
+All of it is editable in `/tmg config` and persists in `~/.pi/agent/trimegisto/config.json` (template: [config.example.json](config.example.json)); it survives `/new`, `/resume`, `/fork`. The menu works like pi's own `/settings`: move the cursor and a hint at the bottom explains what the selected setting does, Enter/Space changes it, and Esc goes back one level.
 
 ## What a batch guarantees
 
