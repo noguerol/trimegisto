@@ -33,6 +33,24 @@ export interface PlanTaskInput {
   /** Explicit lane override; when absent the lane is derived from the task text. */
   lane?: "open" | "gated" | "closed";
   cwd?: string;
+  /**
+   * Shell command the EXTENSION runs after the worker finishes; a non-zero exit
+   * marks the result VERIFY FAILED (see src/verify.ts). Opt-in, per task.
+   */
+  verify?: string;
+  /**
+   * Ambient context this worker starts with. "ledger" (default) injects the
+   * shared-context preamble from other agents; "fresh" suppresses it so the
+   * worker gets an independent attempt (the paper's fresh-perspective worker).
+   * Explicit `needs` edges are still injected either way.
+   */
+  context?: "ledger" | "fresh";
+  /**
+   * Marks a deliberate parallel attempt (same question, different angle). Such
+   * a node is exempt from duplicate merging, so a fresh twin can run alongside
+   * its ledger-aware counterpart instead of being deduped away.
+   */
+  diversity?: boolean;
 }
 
 export type PlanLane = "open" | "gated" | "closed";
@@ -48,6 +66,9 @@ export interface PlanNode {
   warnings: string[];
   codeNode: boolean;
   duplicateOf?: number;   // 1-based index of the node it duplicates
+  verify?: string;
+  context?: "ledger" | "fresh";
+  diversity?: boolean;
 }
 
 export interface PlanDecision {
@@ -402,6 +423,9 @@ interface InternalNode {
   duplicateOf?: number;
   duplicateNote?: string;
   wave: number;
+  verify?: string;
+  context?: "ledger" | "fresh";
+  diversity?: boolean;
 }
 
 interface Entry {
@@ -411,15 +435,18 @@ interface Entry {
   why: unknown;
   lane: unknown;
   tier: unknown;
+  verify: unknown;
+  context: unknown;
+  diversity: unknown;
 }
 
 function entryOf(raw: unknown): Entry | null {
   if (!raw) return null;
   if (typeof raw === "string") {
-    return { task: raw, needs: undefined, writes: undefined, why: undefined, lane: undefined, tier: undefined };
+    return { task: raw, needs: undefined, writes: undefined, why: undefined, lane: undefined, tier: undefined, verify: undefined, context: undefined, diversity: undefined };
   }
   if (typeof raw === "number" || typeof raw === "boolean") {
-    return { task: String(raw), needs: undefined, writes: undefined, why: undefined, lane: undefined, tier: undefined };
+    return { task: String(raw), needs: undefined, writes: undefined, why: undefined, lane: undefined, tier: undefined, verify: undefined, context: undefined, diversity: undefined };
   }
   if (typeof raw === "object") {
     const o = raw as Record<string, unknown>;
@@ -430,6 +457,9 @@ function entryOf(raw: unknown): Entry | null {
       why: o.why,
       lane: o.lane,
       tier: o.tier,
+      verify: o.verify,
+      context: o.context,
+      diversity: o.diversity,
     };
   }
   return null;
@@ -767,6 +797,9 @@ export function planBatch(tasks: PlanTaskInput[], options?: PlanOptions): PlanDe
       warnings,
       codeNode,
       wave: 0,
+      verify: typeof e.verify === "string" && e.verify.trim() ? e.verify.trim() : undefined,
+      context: e.context === "fresh" ? "fresh" : e.context === "ledger" ? "ledger" : undefined,
+      diversity: e.diversity === true ? true : undefined,
     });
   }
 
@@ -804,6 +837,21 @@ export function planBatch(tasks: PlanTaskInput[], options?: PlanOptions): PlanDe
     wordSetSimilarity(wordSets[a], wordSets[b]),
   );
 
+  // Diversity attempts are deliberately non-disjoint (the same question from an
+  // independent angle), so they are exempt from duplicate merging: a fresh twin
+  // must run alongside its ledger-aware counterpart instead of being deduped
+  // away. Capped, because "diversity" must never become a blanket dedup bypass.
+  const MAX_DIVERSITY = 3;
+  const diversityIdx = nodes.map((nd, i) => (nd.diversity ? i : -1)).filter(i => i >= 0);
+  if (diversityIdx.length > MAX_DIVERSITY) {
+    for (const k of diversityIdx.slice(MAX_DIVERSITY)) {
+      nodes[k].diversity = false;
+      nodes[k].warnings.push(`#${nodes[k].index} is marked diversity but the cap is ${MAX_DIVERSITY} per batch — treated as a normal task (it may be merged)`);
+      repaired = true;
+    }
+  }
+  const isDiversity = (i: number): boolean => nodes[i].diversity === true;
+
   // UNION-FIND over ALL similar pairs, not a greedy "similar to an already-kept
   // representative" pass. The greedy version leaked a real cluster: A~B >= t and
   // B~C >= t but A~C < t left A and C in different groups, so the same work ran
@@ -820,6 +868,8 @@ export function planBatch(tasks: PlanTaskInput[], options?: PlanOptions): PlanDe
   };
   for (let i = 0; i < nodes.length; i++) {
     for (let j = i + 1; j < nodes.length; j++) {
+      // A diversity attempt is never merged into a cluster (nor absorbs one).
+      if (isDiversity(i) || isDiversity(j)) continue;
       if (similarity(i, j) >= threshold) {
         const ri = find(i);
         const rj = find(j);
@@ -1011,6 +1061,9 @@ export function planBatch(tasks: PlanTaskInput[], options?: PlanOptions): PlanDe
       codeNode: nd.codeNode,
     };
     if (nd.duplicateOf !== undefined) pn.duplicateOf = nd.duplicateOf;
+    if (nd.verify !== undefined) pn.verify = nd.verify;
+    if (nd.context !== undefined) pn.context = nd.context;
+    if (nd.diversity !== undefined) pn.diversity = nd.diversity;
     return pn;
   });
   const launch = planNodes.filter(pn => pn.duplicateOf === undefined);

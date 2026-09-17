@@ -84,8 +84,19 @@ You delegate in one non-blocking call: a `goal`, and tasks with `tier`, `task`, 
 - **Irreversible never auto-spawns.** Deploys, drops, force-pushes, credential rotation classify as a `closed` lane and the whole call refuses — the human decides. Wide-but-reversible surfaces (shared utils, public APIs, config) classify as `gated`: flagged with a reason, still launched.
 - **One batch, one conclusion.** Every agent's final message is its verdict; when all are terminal — or the batch deadline expires, killed and stuck agents counting as settled — a single final reconciliation is emitted **deterministically, without asking the main model**. It survives the model dying on a provider error. The model then gets exactly one turn to synthesise the answer on top of it.
 - **Your context stays clean.** Agent progress and logs go to the TUI only — the main model never sees them, only the reconciliation. That keeps coordinator requests small and well-formed (unbounded injected messages are a classic source of provider `400`s).
+- **Verified, or flagged.** Give a task a `verify` command and Trimegisto runs it **after** the worker — itself, not through the worker — and marks a wrong `done` as `VERIFY FAILED`. A confidently-wrong agent can no longer be believed.
 
 Inside a batch, sub-agents can spawn their own workers (`trimegisto_spawn`, batch, non-blocking), coordinate with advisory file locks and stale-file alerts (if agent `t3a` rewrites a file `t2b` read, `t2b` is told to re-read before editing), and publish facts to a shared-context preamble so later agents don't re-derive them.
+
+## Verify, fresh perspectives & the batch ledger
+
+Three opt-in additions, all zero-shot and deterministic (no training, no hidden automation).
+
+**`verify` — verification instead of trust.** Any task may carry `verify: "npm test"` (or `pytest -q`, `go test ./...`, a `bash` one-liner…). When the worker finishes, **Trimegisto** runs the command in the task's `cwd` and records the exit code. Exit `0` → the task is verified; anything else → the reconciliation shows `🚫 VERIFY FAILED` with the command, the exit code and the failing output, the headline counts it as `verify-failed`, and **downstream `needs` edges see the failure instead of a fake success**. The command is chosen by the coordinator, never by the worker, so the worker cannot pick a command that makes it pass (it can still edit project test files — v1 reports, it does not sandbox). Only a worker that itself succeeded is verified; timeout defaults to 120 s (`TRIMEGISTO_VERIFY_TIMEOUT_MS` to change).
+
+**`context: "fresh"` + `diversity: true` — an independent second opinion.** A `fresh` worker is launched **without** the shared-context preamble (no other agents' notes or read-files), so it attacks the task from scratch. Marking it `diversity: true` exempts it from duplicate merging, so it runs **alongside** its ledger-aware twin instead of being deduped away — then the reconciliation lets the main model compare the two. Diversity is capped at 3 per batch, so it can never become a blanket dedup bypass. Use it when a plan may have anchored on a bad early approach.
+
+**The batch ledger.** Every batch writes an inspectable record on disk under the per-instance directory: `<instanceDir>/batches/<batchId>/{plan.md, tasks.json, notes.md}`. `plan.md` is the deterministic plan gate's output plus the goal; `tasks.json` carries each task's status, verify verdict and a bounded conclusion; `notes.md` snapshots the facts the batch's agents published. The reconciliation ends with the ledger path, so the main model (or you) can `read` it. It is a **record, never a source of truth** — every write is best-effort and a read-only disk never breaks a batch — and it is loop-ready: `tasks.json` is exactly the array a future manager-loop would curate. Ledgers are pruned after 24 h and removed with the instance.
 
 ## Commands
 

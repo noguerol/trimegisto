@@ -63,6 +63,25 @@ function readNotes(instanceDir: string, excludeAgentId: string): PublishedNote[]
 }
 
 /**
+ * Every published note, ascending by timestamp and WITHOUT the preamble cap.
+ * Used by the batch ledger's notes.md snapshot, which is a record, not a prompt.
+ */
+export function readNotesSnapshot(instanceDir: string): { agentId: string; text: string; ts: number }[] {
+  const out: { agentId: string; text: string; ts: number }[] = [];
+  const dir = path.join(instanceDir, "notes");
+  let entries: fs.Dirent[];
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    try {
+      const n = JSON.parse(fs.readFileSync(path.join(dir, entry.name), "utf-8")) as PublishedNote;
+      if (typeof n.text === "string" && n.text.trim()) out.push({ agentId: n.agentId, text: n.text, ts: n.ts });
+    } catch { /* ignore corrupt */ }
+  }
+  return out.sort((a, b) => a.ts - b.ts);
+}
+
+/**
  * Build the shared-context preamble for a new agent, or "" when there is
  * nothing worth sharing.
  */
