@@ -7,7 +7,7 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { formatTierStatusLine, formatDirectiveContent, formatUnavailableTiersMessage } from "./tier-status.ts";
+import { formatTierStatusLine, formatDirectiveContent, formatSystemPolicyContent, formatUnavailableTiersMessage } from "./tier-status.ts";
 import { fileURLToPath } from "node:url";
 
 import type { AgentTier, TrimegistoConfig, AgentLogEntry, AgentInstance, ReaperConfig } from "./types.ts";
@@ -1113,7 +1113,7 @@ export default function (pi: ExtensionAPI) {
     return tc.enabled && !!tc.model;
   }
 
-  function tierStatusLine(tier: AgentTier): string {
+  function tierStatusLine(tier: AgentTier, opts?: { includePaused?: boolean }): string {
     // The actual string assembly lives in src/tier-status.ts so the shape of
     // the message the model sees is unit-tested. This function is just the
     // adapter: resolve the live values, then hand them to the pure helper.
@@ -1130,7 +1130,11 @@ export default function (pi: ExtensionAPI) {
     // Surface an open circuit breaker so the coordinator does not try a model
     // that will be refused, and knows roughly when it comes back.
     const block = avail ? getTierModelBlock(tier, (config as any)[tier], config.redundantAgents, spawnModelOverride(tier)) : null;
-    const paused = block ? Math.max(1, Math.ceil(block.remainingMs / 1000)) : null;
+    // The breaker countdown ticks every second, so it is a cache-killer in any
+    // long-lived prompt. Callers that build stable text pass includePaused:false
+    // and surface the breaker through the per-turn status block instead.
+    const showPaused = opts?.includePaused !== false;
+    const paused = showPaused && block ? Math.max(1, Math.ceil(block.remainingMs / 1000)) : null;
     const parallel = (config as any)[tier]?.maxParallel;
     return formatTierStatusLine(formatTierLabel(tier), {
       enabled: avail,
@@ -1161,23 +1165,39 @@ const RULE_SERIAL = "Mechanical steps (parse, count, rename, format, diff) go in
 const RULE_SETTLE = "Trimegisto delivers ONE reconciliation when the batch settles: use it for the unified final answer; do not re-spawn or answer early.";
 const RULE_NOWAIT = "Never sleep/poll waiting for agents; `trimegisto_harvest` only for an explicit snapshot.";
 
+/**
+ * The rule set the coordinator is taught, in the order it should read it.
+ * Reused verbatim by the system-prompt policy so the rules exist once.
+ */
+const COORDINATOR_RULES: string[] = [
+  RULE_DISJOINT,
+  RULE_SCOUTS,
+  RULE_GRAPH,
+  RULE_VERIFY,
+  RULE_FRESH,
+  RULE_ONENEED,
+  RULE_SERIAL,
+  RULE_SETTLE,
+  RULE_NOWAIT,
+];
+
 let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = null;
   const loadContextPrune = () => (contextPruneImport ??= import("./context-prune.ts"));
 
   function buildToolDescription(): string {
     return [
       "Launch parallel Trimegisto sub-agents.",
-      "PROACTIVE POLICY: when enabled, decompose and call this FIRST for any request with 2+ independent subtasks/files/areas/checks; skip only for single indivisible/trivial work or an explicit opt-out.",
+      "Delegation preference: when a request decomposes into 2+ independent subtasks, prefer one batch call over serial work. Skip the batch for single indivisible work or an explicit opt-out — doing the work yourself is always acceptable.",
       "Assign DISJOINT subtasks so no two agents redo the same work; scouts only for verification.",
       RULE_GRAPH,
       RULE_VERIFY,
       RULE_FRESH,
       RULE_SETTLE,
       "Tiers now:",
-      tierStatusLine("active"),
-      tierStatusLine("t1"),
-      tierStatusLine("t2"),
-      tierStatusLine("t3"),
+      tierStatusLine("active", { includePaused: false }),
+      tierStatusLine("t1", { includePaused: false }),
+      tierStatusLine("t2", { includePaused: false }),
+      tierStatusLine("t3", { includePaused: false }),
       "Default active/t0 = main pi model; prefer several active agents for mass parallel work across DIFFERENT files/areas.",
       "Roles: active=t0 mass worker; t3 mechanical; t2 reasoning; t1 planning only.",
       "Only spawn ✓ ENABLED tiers; ✗ fails. IDs: t0a,t1a,t2b,t3c. Disabled tool returns error.",
@@ -2148,49 +2168,85 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
     if (pruned !== messages) return { messages: pruned };
   });
 
-  // ── Before agent start: inject trimegisto context ──────
-  pi.on("before_agent_start", async (_event, ctx) => {
+  // ── Before agent start: policy → system prompt, live status → user channel ──
+  //
+  // Split deliberately. pi turns a `before_agent_start` custom message into a
+  // plain role:"user" message with no origin marker (convertToLlm, messages.js),
+  // so whatever is injected there competes with the user's own words — and it
+  // lands AFTER them. Injecting the whole policy there produced a 31:1 ratio of
+  // boilerplate to user text and made cautious models refuse the real request.
+  // See the "directive framing" gotcha in pi.md.
+  //
+  // Now: stable policy is appended to the SYSTEM PROMPT (does not compete with
+  // the user, keeps the provider cache prefix because it carries no live
+  // counters), and the user channel carries only a short, explicitly framed
+  // status block — nothing at all when the orchestrator is idle.
+
+  /** Last status block injected, so an unchanged turn injects nothing. */
+  let lastTurnStatus = "";
+
+  /**
+   * The delegation nudge. Advisory on purpose: the previous wording
+   * ("your FIRST action MUST be a `trimegisto` batch call — do not solve it
+   * serially first") pattern-matched as a hijack of the model's own turn.
+   * Same intent, no imperative.
+   */
+  function proactivePolicyText(): string {
+    return config.autoSpawn
+      ? "When a request decomposes into 2+ independent, disjoint subtasks, prefer delegating them as one `trimegisto` batch over working through them serially. When it does not decompose, just do the work yourself — no batch is expected."
+      : "Auto-spawn is OFF: delegate only when the user asks for it or clearly benefits from it.";
+  }
+
+  pi.on("before_agent_start", async (event: any, ctx) => {
     // Check compaction proactively before the agent processes input
     maybeTriggerCompaction(ctx);
 
-    if (!config.enabled) return;
+    if (!config.enabled) {
+      // Forget the last injected block so re-enabling mid-session re-injects
+      // instead of being suppressed by a stale identity match.
+      lastTurnStatus = "";
+      return;
+    }
 
+    const ALL_TIERS = ["active", "t1", "t2", "t3"] as const;
+
+    // Stable policy → system prompt. Only moves when /tmg config changes.
+    // Listing ALL tiers — not just available ones — lets the coordinator see
+    // why a tier is unavailable (disabled vs no model) and its parallel cap.
+    const systemPrompt = `${event?.systemPrompt ?? ""}\n\n${formatSystemPolicyContent({
+      proactivePolicy: proactivePolicyText(),
+      rules: COORDINATOR_RULES,
+      tierLines: ALL_TIERS.map(t => tierStatusLine(t, { includePaused: false })),
+    })}`;
+
+    // Live status → user channel, framed, only when there is something to say.
     const activeAgents = getActiveAgents();
     const agentList = activeAgents.length > 0
       ? activeAgents
           .map(a => `- ${a.id} [${a.status}]: ${a.task.slice(0, 80)}`)
           .join("\n")
       : "- none";
+    const pausedTierLines = ALL_TIERS
+      .map(t => tierStatusLine(t, { includePaused: true }))
+      .filter(l => l.includes("⛔"));
 
-    // Mirror the tool description's tier list so the per-turn prompt and the
-    // tool's system-prompt description never disagree. Listing ALL tiers —
-    // not just available ones — lets the coordinator see why a tier is
-    // unavailable (disabled vs no model) and the per-tier parallel cap.
-    const tierLines = (["active", "t1", "t2", "t3"] as const).map(t => tierStatusLine(t)).join("\n");
+    const status = formatDirectiveContent({
+      activeAgentCount: activeAgents.length,
+      activeAgentsFormatted: agentList,
+      pausedTierLines,
+    });
 
-    const proactivePolicy = config.autoSpawn
-      ? [
-          "TRIMEGISTO ACTIVE (multi-agent mode). For every request, first check for 2+ independent subtasks/files/areas/checks; if decomposable, your FIRST action MUST be a `trimegisto` batch call — do not solve it serially first. Then orchestrate and integrate.",
-          RULE_DISJOINT,
-          RULE_SCOUTS,
-          RULE_GRAPH,
-          RULE_VERIFY,
-          RULE_FRESH,
-          RULE_ONENEED,
-          RULE_SERIAL,
-          RULE_NOWAIT,
-          "Skip spawning only for trivial/indivisible work or an explicit opt-out.",
-        ].join("\n")
-      : "Trimegisto is enabled but auto-spawn is OFF: delegate only when explicitly requested or clearly useful.";
+    // Idle, or identical to what we injected last turn: inject nothing. The
+    // previous block is still in the transcript, so the model keeps the
+    // information without paying for it again every turn.
+    if (!status || status === lastTurnStatus) return { systemPrompt };
+    lastTurnStatus = status;
+
     return {
+      systemPrompt,
       message: {
         customType: "trimegisto-context",
-        content: formatDirectiveContent({
-        proactivePolicy,
-        tierLines: tierLines.split("\n"),
-        activeAgentCount: activeAgents.length,
-        activeAgentsFormatted: agentList,
-      }),
+        content: status,
         display: false,
       },
     };
