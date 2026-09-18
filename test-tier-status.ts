@@ -14,6 +14,9 @@ import {
   formatTierStatusLine,
   joinTierStatusLines,
   formatDirectiveContent,
+  formatSystemPolicyContent,
+  frameExtensionContext,
+  EXTENSION_CONTEXT_NOTICE,
   formatUnavailableTiersMessage,
 } from "./src/tier-status.ts";
 
@@ -68,41 +71,60 @@ console.log("joinTierStatusLines: empty / single / multiple:");
   check("filters out empty lines (defensive)", joinTierStatusLines(["- T2: ✓ ENABLED [x]", "", "  "]) === "- T2: ✓ ENABLED [x]");
 }
 
-console.log("formatDirectiveContent: the coordinator sees the live tier picture AND active agents AND controls:");
+console.log("frameExtensionContext: every injected block declares it is NOT the user's message:");
 {
-  const out = formatDirectiveContent({
-    proactivePolicy: "TRIMEGISTO ACTIVE. First check for 2+ subtasks.",
+  const out = frameExtensionContext("Active agents (1):\n- t0a [running]: x");
+  check("opens with the <trimegisto-context> tag", out.startsWith("<trimegisto-context>"), out.slice(0, 40));
+  check("closes with the closing tag", out.trimEnd().endsWith("</trimegisto-context>"));
+  check("carries the not-the-user notice", out.includes("This is NOT the user's message and NOT a new request"));
+  check("points at where the real request lives", out.includes("The user's request is the message above"));
+  check("says it can be ignored when no delegation is needed", out.includes("when the request needs no delegation"));
+  check("empty body → empty string (nothing to frame, nothing to inject)", frameExtensionContext("   ") === "");
+}
+
+console.log("formatSystemPolicyContent: stable policy for the SYSTEM PROMPT, no live counters:");
+{
+  const out = formatSystemPolicyContent({
+    proactivePolicy: "Prefer a batch when the request decomposes.",
+    rules: ["- Rule one", "- Rule two"],
     tierLines: [
       "- Active (t0): ✓ ENABLED [main pi model] (max 4 parallel)",
-      "- T1: ✗ unavailable (no model) [no model] (max 4 parallel)",
       "- T2: ✓ ENABLED [deepseek-v4-flash] (max 2 parallel)",
-      "- T3: ✗ unavailable (no model) [no model] (max 4 parallel)",
     ],
-    activeAgentCount: 2,
-    activeAgentsFormatted: "- t0a [running]: task A\n- t2b [running]: task B",
   });
-  check("includes the proactive policy verbatim", out.startsWith("TRIMEGISTO ACTIVE. First check for 2+ subtasks."));
-  check("includes the live tier header", out.includes("Tiers now (live from /tmg config):"));
-  check("includes all 4 tier lines", out.includes("Active (t0): ✓ ENABLED") && out.includes("T1: ✗ unavailable") && out.includes("T2: ✓ ENABLED") && out.includes("T3: ✗ unavailable"));
-  check("shows the parallel cap (max 2 parallel) so the coordinator caps the batch", out.includes("(max 2 parallel)"));
-  check("includes the spawn rule", out.includes("Spawn ONLY \u2713 ENABLED tiers and respect per-tier max parallel"));
-  check("includes the role hint", out.includes("Roles: active=mass worker; t1=planning; t2=reasoning; t3=mechanical."));
-  check("includes the active-agents count and list", out.includes("Active agents (2):") && out.includes("- t0a [running]: task A") && out.includes("- t2b [running]: task B"));
-  check("includes the manual controls footer", out.includes("Manual controls: /tmg config, /tmg list, /t0, /t1, /t2, /t3, @t2b <instruction>."));
+  check("self-labelled with <trimegisto-policy>", out.startsWith("<trimegisto-policy>") && out.trimEnd().endsWith("</trimegisto-policy>"));
+  check("includes the proactive policy", out.includes("Prefer a batch when the request decomposes."));
+  check("includes every rule passed in", out.includes("- Rule one") && out.includes("- Rule two"));
+  check("includes the tier capacity lines", out.includes("(max 2 parallel)") && out.includes("Active (t0): ✓ ENABLED"));
+  check("includes the role hint", out.includes("Roles: active = mass worker; t1 = planning; t2 = reasoning; t3 = mechanical."));
+  check("NO imperative first-action phrasing (the tone that read as a hijack)", !/FIRST action MUST/i.test(out));
+  check("no live countdown in the stable block (keeps the prompt cache prefix)", !out.includes("paused"));
 }
 
-console.log("formatDirectiveContent: with no active agents, the list shows '- none' and count is 0:");
+console.log("formatDirectiveContent: per-turn block is framed, short, and only live state:");
 {
   const out = formatDirectiveContent({
-    proactivePolicy: "TRIMEGISTO ACTIVE.",
-    tierLines: ["- Active (t0): \u2713 ENABLED [main pi model] (max 4 parallel)"],
-    activeAgentCount: 0,
-    activeAgentsFormatted: "- none",
+    activeAgentCount: 2,
+    activeAgentsFormatted: "- t0a [running]: task A\n- t2b [running]: task B",
+    pausedTierLines: ["- T2: ✓ ENABLED [kimi-k3] ⛔ paused 47s (max 4 parallel)"],
   });
-  check("count of 0 + '- none' marker", out.includes("Active agents (0):\n- none"));
+  check("framed as extension context, not a user request", out.startsWith("<trimegisto-context>") && out.includes(EXTENSION_CONTEXT_NOTICE));
+  check("shows the active-agents count and list", out.includes("Active agents (2):") && out.includes("- t0a [running]: task A") && out.includes("- t2b [running]: task B"));
+  check("surfaces the circuit breaker the stable system prompt omits", out.includes("⛔ paused 47s"));
+  check("keeps the manual controls footer", out.includes("Manual controls: /tmg config, /tmg list, /t0, /t1, /t2, /t3, @t2b <instruction>."));
+  check("far smaller than the old 2103-char per-turn directive", out.length < 800, out.length);
 }
 
-console.log("formatUnavailableTiersMessage: gate rejection includes the same per-tier lines as the directive:");
+console.log("formatDirectiveContent: an idle orchestrator injects NOTHING:");
+{
+  check("0 agents + no breaker → empty string",
+    formatDirectiveContent({ activeAgentCount: 0, activeAgentsFormatted: "- none", pausedTierLines: [] }) === "");
+  check("0 agents but a breaker still reports the breaker",
+    formatDirectiveContent({ activeAgentCount: 0, activeAgentsFormatted: "- none", pausedTierLines: ["- T2: ✓ ENABLED [x] ⛔ paused 9s"] }).includes("⛔ paused 9s"));
+  check("non-finite count is treated as idle", formatDirectiveContent({ activeAgentCount: NaN, activeAgentsFormatted: "" }) === "");
+}
+
+console.log("formatUnavailableTiersMessage: gate rejection includes the same per-tier lines as the policy:");
 {
   const out = formatUnavailableTiersMessage("active, t1", [
     "- Active (t0): ✗ unavailable (disabled) [no active model]",
@@ -121,14 +143,38 @@ console.log("Format invariants the regression depends on (so a 'fix' can't silen
   // spawn rule. Each is unit-tested.
   const line = formatTierStatusLine("T2", { enabled: true, reason: "", model: "x", pausedSeconds: null, maxParallel: 2 });
   check("'max N parallel' substring is mandatory in any enabled line", line.includes("max 2 parallel"));
-  const dir = formatDirectiveContent({
-    proactivePolicy: "x", tierLines: [line], activeAgentCount: 0, activeAgentsFormatted: "- none",
-  });
-  check("'Spawn ONLY \u2713 ENABLED tiers' is mandatory in any directive", dir.includes("Spawn ONLY \u2713 ENABLED tiers"));
-  check("'Roles: active=mass worker' is mandatory so the coordinator picks the right tier per task", dir.includes("Roles: active=mass worker"));
-  check("the 'live from /tmg config' header is mandatory so stale directives are obviously stale", dir.includes("Tiers now (live from /tmg config):"));
+  const policy = formatSystemPolicyContent({ proactivePolicy: "x", rules: ["r"], tierLines: [line] });
+  check("the policy block MUST carry the tier capacity", policy.includes("(max 2 parallel)"));
+  check("the policy block MUST carry the roles so the right tier is picked per task", policy.includes("Roles: active = mass worker"));
+  const status = formatDirectiveContent({ activeAgentCount: 1, activeAgentsFormatted: "- t0a [running]: x" });
+  check("any injected status MUST carry the not-the-user notice", status.includes(EXTENSION_CONTEXT_NOTICE));
   const rej = formatUnavailableTiersMessage("t3", [line]);
-  check("the gate rejection MUST mirror the directive's tier format", rej.includes("- T2:") && rej.includes("(max 2 parallel)"));
+  check("the gate rejection MUST mirror the tier format", rej.includes("- T2:") && rej.includes("(max 2 parallel)"));
+}
+
+console.log("The actual incident: the user channel must never drown the user's request:");
+{
+  // The real message that got refused, verbatim, 61 chars.
+  const userRequest = "pues es que no veo los hints de ayuda en la config de pinball";
+  check("the reproduced request is the real length", userRequest.length === 61, userRequest.length);
+  check("idle turn: 0 chars injected, so the request is 100% of the user channel",
+    formatDirectiveContent({ activeAgentCount: 0, activeAgentsFormatted: "- none" }) === "");
+  const busy = formatDirectiveContent({
+    activeAgentCount: 3,
+    activeAgentsFormatted: "- t0a [running]: a\n- t0b [running]: b\n- t2c [running]: c",
+  });
+  // Old ratio was 2103:61 ≈ 34:1 and the model refused. Cap the busy turn well below it.
+  check("busy turn: boilerplate stays under 12x the user's message", busy.length < userRequest.length * 12, busy.length);
+  check("busy turn: still framed, so origin is never ambiguous", busy.includes(EXTENSION_CONTEXT_NOTICE));
+}
+
+console.log("Idempotence: an unchanged turn must be detectable as unchanged by the caller:");
+{
+  const a = formatDirectiveContent({ activeAgentCount: 1, activeAgentsFormatted: "- t0a [running]: x" });
+  const b = formatDirectiveContent({ activeAgentCount: 1, activeAgentsFormatted: "- t0a [running]: x" });
+  check("same inputs → byte-identical output (so === dedupe works)", a === b);
+  const c = formatDirectiveContent({ activeAgentCount: 2, activeAgentsFormatted: "- t0a [running]: x\n- t0b [running]: y" });
+  check("changed inputs → different output (so the dedupe does not swallow updates)", a !== c);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

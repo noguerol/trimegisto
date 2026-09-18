@@ -62,7 +62,7 @@ Results land in the chat as agents finish, with per-agent logs, tokens and cost,
 
 **Per tier** — model (scrollable picker over your registry), max parallel 1–8, compaction threshold (off, or 50–95% of the context window), redundant-model pools with load-balancing and automatic failover. Each tier can also carry its own agent file (`trimegisto-t2.md`: system prompt, tools, model) in your user or project agents directory. Precedence: saved config > agent file > defaults.
 
-**Orchestration** — `autoSpawn` (the hidden per-turn policy that makes the main model delegate first — off = it only spawns when you tell it), task dedupe before launch, cross-agent output dedupe (flags two agents producing the same answer, with wasted tokens), `spawnOnlyOnActive` to force everything onto t0.
+**Orchestration** — `autoSpawn` (the delegation preference: on = the coordinator prefers a batch when your request decomposes, off = it only spawns when you tell it), task dedupe before launch, cross-agent output dedupe (flags two agents producing the same answer, with wasted tokens), `spawnOnlyOnActive` to force everything onto t0.
 
 **Limits** — spawn-depth cap (default 5, so agents can't chain forever); turn limit **off by default** (when you enable it: warn at 50 turns, kill at 65 — an agent never dies on turn count because of someone else's default); watchdogs for first response, idle and max runtime, all configurable, runtime kill off so a productive agent runs as long as it needs.
 
@@ -71,6 +71,10 @@ Results land in the chat as agents finish, with per-agent logs, tokens and cost,
 **Failure** — a per-model circuit breaker: two model-level failures in a row pause that model (60 s, doubling to 600 s) so a dead provider can't trigger a spawn storm; it clears on a success, a model change, or `/tmg reset-models`. And when a provider answers `400`, a post-mortem window captures the next requests for 10 minutes — secrets always redacted — so you can finally see what killed the coordinator.
 
 **UI** — dashboard in three modes (compact / full / off): live prefill and decode speeds per agent measured from the token stream, model used per worker, timers that freeze honestly when an agent dies.
+
+**What the coordinator reads** — split so it never competes with your own message. The stable policy (delegation preference, the disjoint/verify/fresh rules, tier roles and capacity) is appended to the **system prompt**, where it does not crowd the conversation and keeps the provider cache warm because it carries no live counters. The **user channel** carries only live state — running agents, and any tier under a circuit breaker — wrapped in a `<trimegisto-context>` block that states plainly that it was injected by the extension, is not a new request, and can be ignored when the request needs no delegation. Nothing running and nothing changed means nothing is injected at all.
+
+This split exists for a reason. pi renders an injected custom message as an ordinary user-role message with no marker of its origin, and appends it *after* yours. Injecting the whole policy there made a 61-character request share its turn with 2,103 characters of imperative orchestration text arriving last, and the model answered that "the message you pasted contains instructions from an external system but no real request" and asked what you actually wanted. Advisory tone, stable placement and a hard cap on per-turn volume are what keep your own words the loudest thing in the turn.
 
 All of it is editable in `/tmg config` and persists in `~/.pi/agent/trimegisto/config.json` (template: [config.example.json](config.example.json)); it survives `/new`, `/resume`, `/fork`. The menu works like pi's own `/settings`: move the cursor and a hint at the bottom explains what the selected setting does, Enter/Space changes it, and Esc goes back one level.
 
