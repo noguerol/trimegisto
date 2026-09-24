@@ -974,6 +974,32 @@ export default function (pi: ExtensionAPI) {
       };
     }
 
+    // Zero-spawn tiers must refuse on EVERY path, including a manual @t0. With
+    // the principal-slot semantics active.maxParallel = 1 means "principal
+    // only": the main session already occupies the tier's only slot, so there
+    // is nothing to launch. A positive maxParallel stays a soft cap a manual
+    // spawn may exceed, exactly as before.
+    const spawnCap = effectiveSpawnCapacity(
+      tier,
+      tierConfig.maxParallel,
+      Math.max(1, getModelPool(tierConfig, config.redundantAgents).length),
+    );
+    if (spawnCap <= 0) {
+      const reason = tier === "active"
+        ? `maxParallel is ${tierConfig.maxParallel} and the main session occupies the only t0 slot`
+        : `maxParallel is ${tierConfig.maxParallel}`;
+      return {
+        agentId: `error-${Date.now()}`,
+        tier,
+        task,
+        status: "error" as const,
+        output: "",
+        stderr: `${formatTierLabel(tier)} cannot spawn: ${reason}. Raise it via /tmg config.`,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+        log: [] as AgentLogEntry[],
+      };
+    }
+
     // Pick the least-loaded model from the tier pool when redundant agents are ON
     let modelOverride = spawnModelOverride(tier);
     if (config.redundantAgents && tier !== "active") {
