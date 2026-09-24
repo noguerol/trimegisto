@@ -18,10 +18,12 @@ Here's the machine: pi becomes a multi-agent runtime. Every sub-agent is a real,
 
 | Tier | Role | Max parallel | Model |
 |------|------|--------------|-------|
-| **active** (t0) | Default worker, mass-parallel. Always available. | 4 | the same model as your main session, live — even when you switch mid-session with `/model` |
+| **active** (t0) | Default worker, mass-parallel. Always available. | 4 (incl. principal) | the same model as your main session, live — even when you switch mid-session with `/model` |
 | **t1** | Planning / deep thinking. Reserved for expensive models. | 1 | you assign it |
 | **t2** | Hard-problem solver. | 4 | you assign it |
 | **t3** | Fast, cheap mechanical work. | 4 | you assign it |
+
+On **t0 the cap includes the main session**: the coordinator itself is one t0 worker, so `4` means the principal plus three sub-agents, and `1` means *principal only — no sub-agents are spawned*. The other tiers have no principal, so `4` is four sub-agents.
 
 Agent ids are `t` + tier + instance: `t0a`, `t2b`, `t3c`… t1/t2/t3 become usable once you give them a model in `/tmg config`; the tool description always shows the LLM exactly which tiers are enabled right now, so it never tries to spawn what you haven't armed.
 
@@ -62,7 +64,7 @@ Results land in the chat as agents finish, with per-agent logs, tokens and cost,
 
 **Per tier** — model (scrollable picker over your registry), max parallel 1–8, compaction threshold (off, or 50–95% of the context window), redundant-model pools with load-balancing and automatic failover. Each tier can also carry its own agent file (`trimegisto-t2.md`: system prompt, tools, model) in your user or project agents directory. Precedence: saved config > agent file > defaults.
 
-**Orchestration** — `autoSpawn` (the delegation preference: on = the coordinator prefers a batch when your request decomposes, off = it only spawns when you tell it), task dedupe before launch, cross-agent output dedupe (flags two agents producing the same answer, with wasted tokens), `spawnOnlyOnActive` to force everything onto t0.
+**Orchestration** — `autoSpawn` (the delegation contract: on = delegating is the coordinator's **default** for any request that splits, filling every configured slot; off = it only spawns when you tell it), task dedupe before launch, cross-agent output dedupe (flags two agents producing the same answer, with wasted tokens), `spawnOnlyOnActive` to force everything onto t0.
 
 **Limits** — spawn-depth cap (default 5, so agents can't chain forever); turn limit **off by default** (when you enable it: warn at 50 turns, kill at 65 — an agent never dies on turn count because of someone else's default); watchdogs for first response, idle and max runtime, all configurable, runtime kill off so a productive agent runs as long as it needs.
 
@@ -77,6 +79,16 @@ Results land in the chat as agents finish, with per-agent logs, tokens and cost,
 This split exists for a reason. pi renders an injected custom message as an ordinary user-role message with no marker of its origin, and appends it *after* yours. Injecting the whole policy there made a 61-character request share its turn with 2,103 characters of imperative orchestration text arriving last, and the model answered that "the message you pasted contains instructions from an external system but no real request" and asked what you actually wanted. Advisory tone, stable placement and a hard cap on per-turn volume are what keep your own words the loudest thing in the turn.
 
 All of it is editable in `/tmg config` and persists in `~/.pi/agent/trimegisto/config.json` (template: [config.example.json](config.example.json)); it survives `/new`, `/resume`, `/fork`. The menu works like pi's own `/settings`: move the cursor and a hint at the bottom explains what the selected setting does, Enter/Space changes it, and Esc goes back one level.
+
+## Default delegation
+
+With Trimegisto enabled and **auto-spawn ON**, delegating is the coordinator's default, not an opt-in. Before its first edit it reads your request as a set of independent work units, and when it splits into two or more it launches **one** `trimegisto` batch carrying all of them — it does not do the split work serially and delegate the leftovers. Solo work is reserved for requests that are **provably atomic**: a single question or lookup, one small change in one file, or one command whose steps cannot run in parallel. "Doing it myself is faster" is not a reason to skip.
+
+It also **fills the capacity** it was given: a substantial request is split along file/module/check boundaries until the batch uses every configured slot — or the remaining units stop being independent — never padding the batch with redundant work. Units stay **disjoint**: never two agents on the same file, question, or output. And once a batch is launched, its reconciliation is the final answer: the coordinator integrates it and does not re-spawn the same work.
+
+Above that policy sits a **deterministic decomposability check**. The extension reads the raw user prompt and, when the wording itself names several units (two or more files, a list, several action verbs, coordinated clauses), appends one line to that run's system prompt so the batch is planned before the first edit. It is deliberately conservative: a one-liner or a pure question is never nagged.
+
+Turn it off with **auto-spawn OFF** in `/tmg config`; delegation becomes opt-in again and the coordinator only spawns when you explicitly ask.
 
 ## What a batch guarantees
 

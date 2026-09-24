@@ -160,6 +160,20 @@ async function main() {
       a?.systemPrompt?.length !== b?.systemPrompt?.length ? `${a?.systemPrompt?.length} vs ${b?.systemPrompt?.length}` : "equal");
   }
 
+  console.log("\nPer-run note: a decomposable prompt adds the note WITHOUT breaking the stable prefix:");
+  {
+    const atomic = await handler({ systemPrompt: "BASE", prompt: "fix the typo" }, ctxStub);
+    const multi = await handler({ systemPrompt: "BASE", prompt: "arregla src/a.ts y a\u00f1ade un test en test-a.ts" }, ctxStub);
+    const a = atomic?.systemPrompt ?? "";
+    const m = multi?.systemPrompt ?? "";
+    check("an atomic prompt adds no note", !a.includes("Decomposability check:"));
+    check("a decomposable prompt adds the note with its signals", m.includes("Decomposability check:") && m.includes("2 files"));
+    // The note is the ONLY difference: everything before it must be byte-identical.
+    const head = (s: string) => s.slice(0, s.includes("Decomposability check:") ? s.indexOf("Decomposability check:") : s.indexOf("</trimegisto-policy>"));
+    check("the stable prefix is byte-identical across prompts (provider cache survives)", head(a) === head(m), `${head(a).length} vs ${head(m).length}`);
+    check("still no user-channel message for either turn", atomic?.message === undefined && multi?.message === undefined);
+  }
+
   console.log("\nFraming: whatever IS injected must never be mistaken for the user's words:");
   {
     // Drive the busy path through the same formatter the handler uses, then

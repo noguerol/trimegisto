@@ -312,7 +312,7 @@ console.log("Test 13 (every row shows its description hint below the list):");
   h.go("Model health");
   check("Model health hint shown", h.text().includes("circuit breaker"));
   h.go("Auto-spawn");
-  check("Auto-spawn hint shown", h.text().includes("delegate decomposable work"));
+  check("Auto-spawn hint shown", h.text().includes("delegation the default"), h.text().slice(0, 200));
   h.go("Dashboard");
   check("Dashboard hint shown", h.text().includes("dashboard the TUI shows"));
   h.press("esc"); await p;

@@ -40,6 +40,19 @@ console.log("formatTierStatusLine: the basic shapes:");
       === "- Active (t0): ✓ ENABLED [main pi model] (max 4 parallel)");
 }
 
+console.log("formatTierStatusLine: the optional detail suffix (t0 principal-only note):");
+{
+  const line = formatTierStatusLine("Active", { enabled: true, reason: "", model: "main pi model", pausedSeconds: null, maxParallel: null, detail: "principal only — no spawn slots" });
+  check("detail renders parenthesised when the cap is absent",
+    line === "- Active: ✓ ENABLED [main pi model] (principal only — no spawn slots)", line);
+  const composed = formatTierStatusLine("T2", { enabled: true, reason: "", model: "x", pausedSeconds: null, maxParallel: 2, detail: "principal only" });
+  check("detail composes after the cap", composed === "- T2: ✓ ENABLED [x] (max 2 parallel) (principal only)", composed);
+  check("blank detail renders nothing (backward compatible)",
+    formatTierStatusLine("T2", { enabled: true, reason: "", model: "x", pausedSeconds: null, maxParallel: 2, detail: "   " }) === "- T2: ✓ ENABLED [x] (max 2 parallel)");
+  check("omitted detail renders nothing",
+    formatTierStatusLine("T2", { enabled: true, reason: "", model: "x", pausedSeconds: null, maxParallel: 2 }) === "- T2: ✓ ENABLED [x] (max 2 parallel)");
+}
+
 console.log("formatTierStatusLine: parallel cap is the only signal the coordinator has for slot count:");
 {
   // This is THE regression case from the user: t2 with maxParallel=2 must be
@@ -99,6 +112,33 @@ console.log("formatSystemPolicyContent: stable policy for the SYSTEM PROMPT, no 
   check("includes the role hint", out.includes("Roles: active = mass worker; t1 = planning; t2 = reasoning; t3 = mechanical."));
   check("NO imperative first-action phrasing (the tone that read as a hijack)", !/FIRST action MUST/i.test(out));
   check("no live countdown in the stable block (keeps the prompt cache prefix)", !out.includes("paused"));
+  check("without a per-run note the block is unchanged", !out.includes("Decomposability check:"));
+}
+
+console.log("formatSystemPolicyContent: the per-run decomposability note is optional and additive:");
+{
+  const out = formatSystemPolicyContent({
+    proactivePolicy: "contract",
+    rules: ["- Rule one"],
+    tierLines: ["- T2: ✓ ENABLED [x] (max 2 parallel)"],
+    decomposabilityNote: "Decomposability check: this request reads as multiple independent units (2 files).",
+  });
+  check("the note is rendered when provided", out.includes("Decomposability check: this request reads as multiple independent units"));
+  const without = formatSystemPolicyContent({
+    proactivePolicy: "contract",
+    rules: ["- Rule one"],
+    tierLines: ["- T2: ✓ ENABLED [x] (max 2 parallel)"],
+  });
+  const stablePrefix = without.replace("</trimegisto-policy>", "");
+  check("the note is appended at the TAIL, after every stable line (prompt cache prefix survives a per-run note)",
+    out.indexOf("Decomposability check") > out.indexOf("Roles: active") && out.slice(0, stablePrefix.length) === stablePrefix,
+    `len ${out.length} vs prefix ${stablePrefix.length}`);
+  check("empty note renders nothing", !formatSystemPolicyContent({
+    proactivePolicy: "contract",
+    rules: ["- Rule one"],
+    tierLines: ["- T2: ✓ ENABLED [x] (max 2 parallel)"],
+    decomposabilityNote: "   ",
+  }).includes("Decomposability check:"));
 }
 
 console.log("formatDirectiveContent: per-turn block is framed, short, and only live state:");

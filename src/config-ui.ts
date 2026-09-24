@@ -66,7 +66,7 @@ const DESC: Record<string, string> = {
   tierT2: "Hard-problem solver tier: debugging, code review, multi-step analysis. Enter to configure it.",
   tierT3: "Fast, cheap mechanical tier: parsing, formatting, counting, commands and file ops. Enter to configure it.",
   enabled: "Master switch. When OFF the trimegisto tool refuses to spawn and any running agents are halted.",
-  autoSpawn: "When ON, the per-turn prompt tells the main model to delegate decomposable work first. OFF: it only spawns when you explicitly ask.",
+  autoSpawn: "When ON, the system prompt makes delegation the default: the main model splits decomposable work and fills every configured slot. OFF: it only spawns when you explicitly ask.",
   useActiveModel: "Spawned agents reuse the live active model (sharing its speculative-decoding pool) instead of each tier's configured model.",
   spawnOnlyOnActive: "Force every spawn onto the active tier; t1/t2/t3 are never used. Useful when one local server backs the whole swarm.",
   redundantAgents: "Use each tier's redundant model pool: spawn on the least-loaded model and fail over on provider errors, quota or a first-response timeout.",
@@ -81,7 +81,7 @@ const DESC: Record<string, string> = {
   tierEnabled: "Whether this tier can be spawned. Disabled tiers are reported to the coordinator as unavailable.",
   tierModel: "Model this tier runs on. Required for t1/t2/t3 to become available.",
   tierRedundant: "Fallback models tried in order when the primary errors, is rate-limited or never responds. Enter to add or remove one.",
-  tierMaxParallel: "How many agents this tier runs at once. The wave planner defers work beyond this cap to a later wave.",
+  tierMaxParallel: "How many agents this tier runs at once (the wave planner defers work beyond this cap). On t0 the count INCLUDES the main session: 1 = principal only (no sub-agents), 2 = principal + 1 sub-agent.",
   tierCompaction: "Force context compaction at this % of the model's context window. 'off' lets pi use its native setting.",
   // turn limit submenu
   tlEnabled: "Enforce the turn limit. When ON an agent is warned at the soft limit and hard-killed after the grace.",

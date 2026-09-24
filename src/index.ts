@@ -8,6 +8,7 @@ import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { formatTierStatusLine, formatDirectiveContent, formatSystemPolicyContent, formatUnavailableTiersMessage } from "./tier-status.ts";
+import { formatDelegationContract, analyzeDecomposability, formatDecomposabilityNote, type CapacitySlot } from "./delegation.ts";
 import { fileURLToPath } from "node:url";
 
 import type { AgentTier, TrimegistoConfig, AgentLogEntry, AgentInstance, ReaperConfig } from "./types.ts";
@@ -33,6 +34,7 @@ import {
   getActiveAgents,
   getAgents,
   canSpawnPooled,
+  effectiveSpawnCapacity,
   getModelPool,
   selectAvailableModel,
   stopAutoSpawnPolling,
@@ -450,7 +452,10 @@ export default function (pi: ExtensionAPI) {
   // so a declared edge really carries data (the upstream verdict is prepended
   // to the dependent task) instead of being cosmetic.
   function tierCapacity(tier: AgentTier): number {
-    return config[tier].maxParallel * Math.max(1, getModelPool(config[tier], config.redundantAgents).length);
+    // effectiveSpawnCapacity already excludes the main session from the ACTIVE
+    // tier's budget (t0 = 1 is principal-only), so the planner and the tool's
+    // feasibility gate never plan a wave the launcher must refuse.
+    return effectiveSpawnCapacity(tier, config[tier].maxParallel, Math.max(1, getModelPool(config[tier], config.redundantAgents).length));
   }
 
   function zeroUsage() {
@@ -1135,13 +1140,21 @@ export default function (pi: ExtensionAPI) {
     // and surface the breaker through the per-turn status block instead.
     const showPaused = opts?.includePaused !== false;
     const paused = showPaused && block ? Math.max(1, Math.ceil(block.remainingMs / 1000)) : null;
-    const parallel = (config as any)[tier]?.maxParallel;
+    // The ACTIVE tier shares its budget with the main session, so the
+    // coordinator-facing cap is the SPAWNABLE count (t0 maxParallel - 1).
+    // When that is 0 (active.maxParallel = 1) say so explicitly instead of
+    // showing "max 1 parallel", which the coordinator would misread as one slot.
+    const configured = (config as any)[tier]?.maxParallel;
+    const spawnCap = tier === "active" ? tierCapacity("active") : configured;
+    const principalOnly = tier === "active" && spawnCap === 0;
+    const parallel = Number.isFinite(spawnCap) && spawnCap > 0 ? spawnCap : null;
     return formatTierStatusLine(formatTierLabel(tier), {
       enabled: avail,
       reason,
       model,
       pausedSeconds: paused,
-      maxParallel: Number.isFinite(parallel) && parallel > 0 ? parallel : null,
+      maxParallel: parallel,
+      detail: principalOnly ? "principal only — no spawn slots" : "",
     });
   }
 
@@ -1187,7 +1200,7 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
   function buildToolDescription(): string {
     return [
       "Launch parallel Trimegisto sub-agents.",
-      "Delegation preference: when a request decomposes into 2+ independent subtasks, prefer one batch call over serial work. Skip the batch for single indivisible work or an explicit opt-out — doing the work yourself is always acceptable.",
+      "Default to delegating: for any request that splits into 2+ independent, disjoint units, your first action is one batch carrying them all — do not work serially first. Work solo only for provably atomic requests (one question, one small single-file change, one non-parallel command).",
       "Assign DISJOINT subtasks so no two agents redo the same work; scouts only for verification.",
       RULE_GRAPH,
       RULE_VERIFY,
@@ -1209,7 +1222,7 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
     name: "trimegisto",
     label: "Trimegisto Multi-Agent",
     description: buildToolDescription(),
-    promptSnippet: "Spawn first for decomposable work; never poll to wait. Only ENABLED tiers; default active.",
+    promptSnippet: "Delegate by default: one batch for any request that splits; fill every ENABLED slot; never poll to wait.",
     parameters: Type.Object({
       tasks: Type.Array(TrimegistoTaskItem, {
         description: "Tasks (max 8). No `needs` edge = runs in parallel; declared deps run in waves.",
@@ -1389,13 +1402,22 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
           perTier[t] = (perTier[t] || 0) + 1;
         }
         for (const tier of ["active", "t1", "t2", "t3"] as const) {
-          if (perTier[tier] > tierCapacity(tier)) {
+          const cap = tierCapacity(tier);
+          if (perTier[tier] > cap) {
+            // A 0-capacity ACTIVE tier means maxParallel = 1: the principal IS
+            // the only t0 slot, so there is nothing to split — the fix is to
+            // raise the cap, not to add `needs`.
+            const principalOnly = tier === "active" && cap === 0;
+            const advice = principalOnly
+              ? `t0 is configured as principal-only (active.maxParallel = 1), so it cannot spawn. ` +
+                `Raise active maxParallel to 2 or more via /tmg config, or spawn these tasks on another tier.`
+              : `Split that wave with explicit \`needs\` so it runs in more waves, ` +
+                `reduce the batch, or raise maxParallel via /tmg config.`;
             return {
               content: [{
                 type: "text",
                 text: `${plan.summary}\n\n❌ **No agents launched.** Wave ${w + 1} needs ${perTier[tier]} ${formatTierLabel(tier)} agent(s) ` +
-                  `but the capacity is ${tierCapacity(tier)}. Split that wave with explicit \`needs\` so it runs in more waves, ` +
-                  `reduce the batch, or raise maxParallel via /tmg config.` +
+                  `but the capacity is ${cap}. ${advice}` +
                   (planNotes.length > 0 ? `\n\n${planNotes.join("\n")}` : ""),
               }],
               details: { plan: planDetails, tasks: [] },
@@ -2186,15 +2208,32 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
   let lastTurnStatus = "";
 
   /**
-   * The delegation nudge. Advisory on purpose: the previous wording
-   * ("your FIRST action MUST be a `trimegisto` batch call — do not solve it
-   * serially first") pattern-matched as a hijack of the model's own turn.
-   * Same intent, no imperative.
+   * The delegation contract. The old wording was opt-in ("prefer delegating
+   * them") and models read it as optional, leaving every configured slot
+   * idle. The contract now inverts the default — delegate unless provably
+   * atomic — and names the capacity to fill. It still avoids the hijack tone
+   * ("your FIRST action MUST be") that made cautious models refuse.
+   *
+   * `decomposabilityNote` is the deterministic per-run reinforcement: when the
+   * raw user prompt itself names several units, it is appended for that run.
+   * The shared helper lives in src/delegation.ts so the text is unit-tested.
    */
-  function proactivePolicyText(): string {
-    return config.autoSpawn
-      ? "When a request decomposes into 2+ independent, disjoint subtasks, prefer delegating them as one `trimegisto` batch over working through them serially. When it does not decompose, just do the work yourself — no batch is expected."
-      : "Auto-spawn is OFF: delegate only when the user asks for it or clearly benefits from it.";
+  function computeCapacitySlots(): CapacitySlot[] {
+    return (["active", "t1", "t2", "t3"] as const)
+      .filter(t => tierAvailable(t))
+      .map(t => ({ tier: formatTierLabel(t), slots: tierCapacity(t) }));
+  }
+
+  function buildSystemPolicy(event: any): string {
+    const decomposabilityNote = formatDecomposabilityNote(
+      analyzeDecomposability(typeof event?.prompt === "string" ? event.prompt : ""),
+    );
+    return formatSystemPolicyContent({
+      proactivePolicy: formatDelegationContract({ autoSpawn: config.autoSpawn, capacity: computeCapacitySlots() }),
+      rules: COORDINATOR_RULES,
+      tierLines: (["active", "t1", "t2", "t3"] as const).map(t => tierStatusLine(t, { includePaused: false })),
+      ...(decomposabilityNote ? { decomposabilityNote } : {}),
+    });
   }
 
   pi.on("before_agent_start", async (event: any, ctx) => {
@@ -2210,14 +2249,12 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
 
     const ALL_TIERS = ["active", "t1", "t2", "t3"] as const;
 
-    // Stable policy → system prompt. Only moves when /tmg config changes.
+    // Stable policy → system prompt. Only moves when /tmg config changes, or
+    // when the current prompt itself reads as decomposable (the note is the
+    // tail of the block, so the provider's cached prefix survives).
     // Listing ALL tiers — not just available ones — lets the coordinator see
     // why a tier is unavailable (disabled vs no model) and its parallel cap.
-    const systemPrompt = `${event?.systemPrompt ?? ""}\n\n${formatSystemPolicyContent({
-      proactivePolicy: proactivePolicyText(),
-      rules: COORDINATOR_RULES,
-      tierLines: ALL_TIERS.map(t => tierStatusLine(t, { includePaused: false })),
-    })}`;
+    const systemPrompt = `${event?.systemPrompt ?? ""}\n\n${buildSystemPolicy(event)}`;
 
     // Live status → user channel, framed, only when there is something to say.
     const activeAgents = getActiveAgents();

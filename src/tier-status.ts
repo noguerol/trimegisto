@@ -43,6 +43,11 @@ export interface TierStatusOpts {
   pausedSeconds: number | null;
   /** Per-tier parallel capacity, or null when unknown / not applicable. */
   maxParallel: number | null;
+  /**
+   * Optional parenthetical suffix appended after the cap, e.g. the ACTIVE
+   * tier's "principal only — no spawn slots" when maxParallel = 1.
+   */
+  detail?: string;
 }
 
 /**
@@ -56,7 +61,8 @@ export function formatTierStatusLine(label: string, opts: TierStatusOpts): strin
   const why = opts.enabled ? "" : opts.reason;
   const paused = opts.pausedSeconds ? ` ⛔ paused ${opts.pausedSeconds}s` : "";
   const parallel = opts.maxParallel ? ` (max ${opts.maxParallel} parallel)` : "";
-  return `- ${label}: ${mark}${why} [${opts.model}]${paused}${parallel}`;
+  const detail = opts.detail && opts.detail.trim() ? ` (${opts.detail.trim()})` : "";
+  return `- ${label}: ${mark}${why} [${opts.model}]${paused}${parallel}${detail}`;
 }
 
 /**
@@ -104,8 +110,16 @@ export function formatSystemPolicyContent(opts: {
   proactivePolicy: string;
   rules: string[];
   tierLines: string[];
+  /**
+   * Optional per-run reinforcement derived from the raw user prompt
+   * (`formatDecomposabilityNote`). Rendered LAST, after every stable line, so
+   * only the tail of the block changes between prompts and the provider's
+   * cached prefix survives. "" (or omitted) renders nothing.
+   */
+  decomposabilityNote?: string;
 }): string {
   const rules = (opts.rules ?? []).filter(r => r && r.trim().length > 0);
+  const note = (opts.decomposabilityNote ?? "").trim();
   return [
     "<trimegisto-policy>",
     "Injected by the Trimegisto extension. It gives this session a `trimegisto` tool that runs parallel sub-agents on other models. This block is stable reference; live agent status, if any, arrives separately in the user channel.",
@@ -119,6 +133,7 @@ export function formatSystemPolicyContent(opts: {
     joinTierStatusLines(opts.tierLines),
     "Spawn only tiers marked ✓ ENABLED, and respect each tier's max parallel.",
     "Roles: active = mass worker; t1 = planning; t2 = reasoning; t3 = mechanical.",
+    ...(note ? [note] : []),
     "</trimegisto-policy>",
   ].join("\n");
 }

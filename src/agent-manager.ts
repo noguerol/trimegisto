@@ -412,6 +412,27 @@ export function formatModelBlockMessage(block: ModelBlockInfo, tierLabel?: strin
 }
 
 /**
+ * How many agents a tier may SPAWN given its configured `maxParallel` and its
+ * model-pool size.
+ *
+ * The ACTIVE tier (t0) shares its budget with the main session: the coordinator
+ * itself is one t0 worker. Its `maxParallel` counts the principal as one of its
+ * slots, so the subtraction happens BEFORE scaling by the model pool:
+ * `t0 = 1` means "principal only, spawn nothing" on EVERY configuration,
+ * redundant pool included. Every other tier has no principal, so its spawnable
+ * count is the full `maxParallel * poolSize`.
+ *
+ * Pure and defensive: non-finite / non-positive inputs clamp to 0 (never
+ * returns NaN or a negative), so a corrupt config cannot open the gate.
+ */
+export function effectiveSpawnCapacity(tier: AgentTier, maxParallel: number, poolSize: number): number {
+  const pool = Number.isFinite(poolSize) && poolSize >= 1 ? Math.floor(poolSize) : 1;
+  const perModel = Number.isFinite(maxParallel) && maxParallel > 0 ? Math.floor(maxParallel) : 0;
+  const spawnablePerModel = tier === "active" ? Math.max(0, perModel - 1) : perModel;
+  return spawnablePerModel * pool;
+}
+
+/**
  * Pooled capacity check: the tier can spawn if ANY model in its pool has capacity.
  * Falls back to the classic per-tier count when redundancy is off or the pool has a single model.
  */
@@ -428,12 +449,17 @@ export function canSpawnPooled(tier: AgentTier, tierConfig: TierConfig, redundan
     const candidates = tierModelCandidates(tier, tierConfig, redundantAgents, activeOverride);
     if (candidates.length > 0 && candidates.every(m => modelHealth!.isBlocked(m))) return false;
   }
+  const poolSize = Math.max(1, pool.length);
+  const spawnCap = effectiveSpawnCapacity(tier, tierConfig.maxParallel, poolSize);
+  const running = Array.from(agents.values()).filter(
+    a => a.tier === tier && (a.status === "running" || a.status === "waiting")
+  ).length;
   if (pool.length <= 1) {
-    const running = Array.from(agents.values()).filter(
-      a => a.tier === tier && (a.status === "running" || a.status === "waiting")
-    ).length;
-    return running < tierConfig.maxParallel;
+    return running < spawnCap;
   }
+  // Multi-model pool: the total gate first (a principal-only active tier must
+  // never spawn even if a redundant model would have room), then per-model.
+  if (running >= spawnCap) return false;
   return selectAvailableModel(tier, pool, tierConfig.maxParallel) !== null;
 }
 
@@ -1332,7 +1358,7 @@ export function canSpawn(tier: AgentTier, maxParallel: number, parentId?: string
   const running = Array.from(agents.values()).filter(
     a => a.tier === tier && (a.status === "running" || a.status === "waiting")
   ).length;
-  return running < maxParallel;
+  return running < effectiveSpawnCapacity(tier, maxParallel, 1);
 }
 
 /**
