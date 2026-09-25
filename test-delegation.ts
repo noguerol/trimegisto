@@ -64,6 +64,7 @@ console.log("formatDelegationContract: auto-spawn ON inverts the default:");
   check("embeds the real capacity to fill", out.includes("11 parallel slots configured (Active 2, T1 1, T2 4, T3 4)."));
   check("requires disjoint units", /disjoint/i.test(out));
   check("requires one batch + integration", /one batch, then integrate/i.test(out));
+  check("announces the enforced tool-call gate", /ENFORCED/.test(out) && /blocked/i.test(out), out);
   check("never contains the hijack phrasing", !/FIRST action MUST/i.test(out));
 }
 
@@ -80,6 +81,7 @@ console.log("formatDelegationContract: auto-spawn OFF stays opt-in:");
   check("does NOT advertise capacity (no batch is expected)", !out.includes("parallel slots configured"));
   check("still asks for disjoint units when it DOES delegate", /disjoint/i.test(out));
   check("does not carry the aggressive default", !/default is to delegate/i.test(out));
+  check("does not announce any enforced block", !/ENFORCED/.test(out) && !/blocked/i.test(out), out);
 }
 
 console.log("analyzeDecomposability: genuine one-liners must NOT be flagged:");
@@ -142,6 +144,7 @@ console.log("formatDecomposabilityNote: speaks only when the prompt splits:");
   check("non-empty for a decomposable prompt", note.length > 0, note);
   check("names the signals", note.includes("files"), note);
   check("tells the coordinator to plan the batch BEFORE the first edit", /before your first edit/i.test(note));
+  check("mentions the gate blocks the first mutating call", /blocked/i.test(note), note);
   check("keeps the atomic escape hatch", /atomic/i.test(note));
   check("empty for an atomic prompt",
     formatDecomposabilityNote(analyzeDecomposability("fix the typo")) === "");

@@ -90,6 +90,16 @@ Above that policy sits a **deterministic decomposability check**. The extension 
 
 Turn it off with **auto-spawn OFF** in `/tmg config`; delegation becomes opt-in again and the coordinator only spawns when you explicitly ask.
 
+### Delegation is enforced, not suggested
+
+The contract used to be prose, and prose lost: a model's chain of thought would say "I'll delegate this", then the edits landed in the main session anyway. A prompt can ask; only the action boundary can enforce. With **auto-spawn ON** and at least one spawnable slot free, Trimegisto arms a `tool_call` gate: the coordinator's **first mutating action** on a non-atomic request — an `edit`, a `write`, or a mutating `bash` — is blocked until the main model calls `trimegisto` with a batch. Read-only tools (`read`, `grep`, `find`, `ls`) stay open, so investigation is never interrupted.
+
+- **Atomic escape hatch.** A provably atomic request is never gated: one question or lookup, one small change in one file, or one command whose steps cannot run in parallel.
+- **Fail-open after two blocks.** `MAX_GATE_BLOCKS=2` — a coordinator blocked twice in the same turn gets the rest of the turn ungated, so a gate bug can never wedge a session.
+- **Workers are exempt.** A spawned sub-agent carries `TRIMEGISTO_AGENT_ID`, so it never re-triggers the gate on its own work.
+- **It needs somewhere to delegate.** The gate only arms when auto-spawn is ON and at least one tier has a free spawnable slot; with no capacity the coordinator is left alone.
+- **A redirect, not a dead end.** The block names what was stopped and how to unblock it, and a model that instead tries to give up receives one bounded `agent_before_settle` reminder.
+
 ## What a batch guarantees
 
 You delegate in one non-blocking call: a `goal`, and tasks with `tier`, `task`, a `why` (a task that can't name what it serves shouldn't spawn), optional `needs` (data dependencies), `writes` (files it will touch) and `lane` (blast radius). Max 8 per call. Then, deterministically:

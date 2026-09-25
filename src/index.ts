@@ -8,7 +8,8 @@ import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { formatTierStatusLine, formatDirectiveContent, formatSystemPolicyContent, formatUnavailableTiersMessage } from "./tier-status.ts";
-import { formatDelegationContract, analyzeDecomposability, formatDecomposabilityNote, type CapacitySlot } from "./delegation.ts";
+import { formatDelegationContract, analyzeDecomposability, formatDecomposabilityNote, totalSlots, formatCapacitySummary, type CapacitySlot } from "./delegation.ts";
+import { shouldRequireDelegation, isMutatingToolCall, formatDelegationGateReason, MAX_GATE_BLOCKS } from "./enforcement.ts";
 import { fileURLToPath } from "node:url";
 
 import type { AgentTier, TrimegistoConfig, AgentLogEntry, AgentInstance, ReaperConfig } from "./types.ts";
@@ -2278,6 +2279,16 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
   /** Last status block injected, so an unchanged turn injects nothing. */
   let lastTurnStatus = "";
 
+  // ── Delegation gate state (see the tool_call / tool_result handlers below) ──
+  // `TRIMEGISTO_AGENT_ID` marks a spawned worker: workers edit files by design,
+  // so they must never be gated or they would recurse into spawning agents.
+  const IS_WORKER = !!process.env.TRIMEGISTO_AGENT_ID;
+  let lastDelegationPrompt = "";
+  let turnDelegationRequired = false;
+  let turnDelegationLaunched = false;
+  let turnDelegationBlocks = 0;
+  let turnDelegationNudged = false;
+
   /**
    * The delegation contract. The old wording was opt-in ("prefer delegating
    * them") and models read it as optional, leaving every configured slot
@@ -2310,6 +2321,23 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
   pi.on("before_agent_start", async (event: any, ctx) => {
     // Check compaction proactively before the agent processes input
     maybeTriggerCompaction(ctx);
+
+    // Arm the delegation gate for this USER turn. Reset only when the prompt
+    // changes, so an internal continuation (the settle nudge) cannot re-arm it
+    // and loop.
+    const gatePrompt = typeof event?.prompt === "string" ? event.prompt : "";
+    if (gatePrompt !== lastDelegationPrompt) {
+      lastDelegationPrompt = gatePrompt;
+      turnDelegationLaunched = false;
+      turnDelegationBlocks = 0;
+      turnDelegationNudged = false;
+    }
+    turnDelegationRequired = shouldRequireDelegation({
+      enabled: config.enabled && !IS_WORKER,
+      autoSpawn: config.autoSpawn,
+      parallelSlots: totalSlots(computeCapacitySlots()),
+      prompt: gatePrompt,
+    });
 
     if (!config.enabled) {
       // Forget the last injected block so re-enabling mid-session re-injects
@@ -2357,6 +2385,57 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
         content: status,
         display: false,
       },
+    };
+  });
+
+  // ── Hard delegation gate ────────────────────────────────
+  // The system-prompt contract alone is ignored at the action boundary: the
+  // model says it will delegate and then edits in the main session. This gate
+  // blocks the first `edit`/`write`/mutating `bash` of a non-atomic turn until
+  // a `trimegisto` batch has actually LAUNCHED. Read-only tools stay open so
+  // the model can plan the batch. After MAX_GATE_BLOCKS refusals it fails open
+  // so a stuck model can still finish (never brick the session).
+  pi.on("tool_call", async (event: any) => {
+    if (!config.enabled || IS_WORKER || !turnDelegationRequired || turnDelegationLaunched) return;
+    if (!isMutatingToolCall(String(event?.toolName ?? ""), (event?.input ?? {}) as Record<string, unknown>)) return;
+    if (turnDelegationBlocks >= MAX_GATE_BLOCKS) { turnDelegationLaunched = true; return; }
+    turnDelegationBlocks += 1;
+    return {
+      block: true,
+      reason: formatDelegationGateReason({
+        attempt: turnDelegationBlocks,
+        capacity: formatCapacitySummary(computeCapacitySlots()),
+        maxBlocks: MAX_GATE_BLOCKS,
+      }),
+    };
+  });
+
+  // A `trimegisto` call only clears the gate when a batch REALLY launched:
+  // refused batches (closed lane, no capacity, all duplicates) return
+  // `tasks: []` / `isError`, and clearing on invocation would let the model
+  // "call once, then edit" — the exact bypass the gate exists to stop. Tool
+  // results arrive after execution, so a sibling `edit` in the same assistant
+  // message stays blocked until the next message (parallel tool-call ordering
+  // is not guaranteed).
+  pi.on("tool_result", async (event: any) => {
+    if (IS_WORKER || !turnDelegationRequired) return;
+    if (event?.toolName !== "trimegisto" || event?.isError) return;
+    const tasks = (event?.details as any)?.tasks;
+    if (Array.isArray(tasks) && tasks.length > 0) turnDelegationLaunched = true;
+  });
+
+  // If the model gives up without launching, push it once — and only once.
+  pi.on("agent_before_settle", async () => {
+    if (!config.enabled || IS_WORKER || !turnDelegationRequired || turnDelegationLaunched || turnDelegationNudged) return;
+    turnDelegationNudged = true;
+    return {
+      entries: [{
+        type: "custom_message",
+        customType: "trimegisto-delegation-nudge",
+        content: "You have not launched a `trimegisto` batch for this non-atomic request. Launch it now (one batch, disjoint units filling every ENABLED slot) or state explicitly why the request is atomic.",
+        display: false,
+      }],
+      continue: true,
     };
   });
 

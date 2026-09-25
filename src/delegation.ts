@@ -192,7 +192,7 @@ export function formatDecomposabilityNote(a: DecomposabilityAnalysis): string {
   const why = a.signals.length > 0 ? ` (${a.signals.join(", ")})` : "";
   return (
     `Decomposability check: this request reads as multiple independent units${why}. ` +
-    `Plan the \`trimegisto\` batch before your first edit, and only fall back to solo work if it turns out to be atomic.`
+    `Plan the \`trimegisto\` batch before your first edit — the first mutating call is blocked until the batch launches — and only fall back to solo work if it turns out to be atomic.`
   );
 }
 
@@ -215,6 +215,7 @@ export function formatDelegationContract(opts: { autoSpawn: boolean; capacity: C
   const lines = [
     "DELEGATION CONTRACT — the default is to delegate.",
     "- Before your first edit, read the request as a set of independent work units. If it splits into two or more, your first action is one `trimegisto` batch carrying all of them; do not do the split work serially and delegate only the leftovers.",
+    "- ENFORCED: for a non-atomic request the first `edit`, `write` or mutating `bash` call is BLOCKED with an error until you have called `trimegisto` once. Read-only tools (read/grep/find/ls) stay open so you can plan the batch. There is no silent solo path; if you never launch, the run is nudged to launch before settling.",
     "- Work solo only when the request is provably atomic: a single question or lookup, one small change in one file, or one command whose steps cannot run in parallel. \"Doing it myself is faster\" is not a reason to skip.",
   ];
   if (capacity) {

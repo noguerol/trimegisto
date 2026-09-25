@@ -12,7 +12,7 @@
  * regression here would silently over- or under-spawn the whole swarm.
  */
 
-import { effectiveSpawnCapacity, canSpawnPooled, canSpawn } from "./src/agent-manager.ts";
+import { effectiveSpawnCapacity, canSpawnPooled, canSpawn, tierModelCandidates, formatSpawnCapacityRefusal } from "./src/agent-manager.ts";
 
 let passed = 0;
 let failed = 0;
@@ -80,6 +80,23 @@ console.log("canSpawnPooled: the live gate honours the principal slot (zero agen
   // The t0=1 rule must hold even when a redundant pool multiplies the tier.
   check("active maxParallel=1 + redundant pool of 2 -> NO spawn", canSpawnPooled("active", tierConfig({ maxParallel: 1, redundantModels: ["a/x", "b/y"] }), true) === false);
   check("active maxParallel=2 + redundant pool of 2 -> can spawn", canSpawnPooled("active", tierConfig({ maxParallel: 2, redundantModels: ["a/x", "b/y"] }), true) === true);
+}
+
+console.log("spawn refusal message: reports effective capacity and the real pool:");
+{
+  const active = tierConfig({ maxParallel: 7 });
+  // The active tier's model lives in the pi session, so the raw pool is empty;
+  // tierModelCandidates still yields one candidate (the session model).
+  const activePool = tierModelCandidates("active", active, false, "main/model").length;
+  check("active candidates fall back to the session model", activePool === 1, activePool);
+  const msg = formatSpawnCapacityRefusal({ tier: "active", running: 7, maxParallel: 7, poolSize: activePool });
+  check("active 7 running / 7 max reads 7/6", /7\/6 agents active/.test(msg), msg);
+  check("active message names a real model count", /across 1 model\(s\)/.test(msg), msg);
+  check("active message never reads x/0", !/\/0 agents/.test(msg), msg);
+  const t2 = formatSpawnCapacityRefusal({ tier: "t2", running: 2, maxParallel: 2, poolSize: 3 });
+  check("t2 2 running / 2 max / pool 3 reads 2/6", /2\/6 agents active across 3 model\(s\)/.test(t2), t2);
+  const zeroPool = formatSpawnCapacityRefusal({ tier: "t2", running: 0, maxParallel: 4, poolSize: 0 });
+  check("poolSize 0 is clamped to 1 in the message", /across 1 model\(s\)/.test(zeroPool), zeroPool);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -433,6 +433,26 @@ export function effectiveSpawnCapacity(tier: AgentTier, maxParallel: number, poo
 }
 
 /**
+ * Human-readable refusal when a spawn request cannot be admitted.
+ *
+ * It must report the EFFECTIVE capacity (the active tier spends one slot on the
+ * principal) and the REAL candidate pool (the active tier's model lives in the
+ * pi session, not in `tierConfig.model`). Computing `maxParallel * poolSize`
+ * from the raw pool read "7/0 agents active across 0 model(s)" and made callers
+ * retry a spawn that could never fit.
+ */
+export function formatSpawnCapacityRefusal(opts: {
+  tier: AgentTier;
+  running: number;
+  maxParallel: number;
+  poolSize: number;
+}): string {
+  const pool = Number.isFinite(opts.poolSize) && opts.poolSize >= 1 ? Math.floor(opts.poolSize) : 1;
+  const capacity = effectiveSpawnCapacity(opts.tier, opts.maxParallel, pool);
+  return `Cannot spawn ${formatTierLabel(opts.tier)}: max parallel limit reached (${opts.running}/${capacity} agents active across ${pool} model(s)). Wait for running agents to complete, or increase the limit via /tmg config.`;
+}
+
+/**
  * Pooled capacity check: the tier can spawn if ANY model in its pool has capacity.
  * Falls back to the classic per-tier count when redundancy is off or the pool has a single model.
  */
@@ -1470,8 +1490,7 @@ export function processSpawnRequests(
       const running = Array.from(agents.values()).filter(
         a => a.tier === tier && (a.status === "running" || a.status === "waiting")
       ).length;
-      const poolSize = getModelPool(tc, redundantAgents).length;
-      const capacity = tc.maxParallel * poolSize;
+      const poolSize = tierModelCandidates(tier, tc, redundantAgents, modelOverride).length;
       // Write error response
       writeSpawnResponse({
         requestId: request.requestId,
@@ -1482,7 +1501,7 @@ export function processSpawnRequests(
           status: "error",
           output: "",
           finalOutput: "",
-          stderr: `Cannot spawn ${formatTierLabel(tier)}: max parallel limit reached (${running}/${capacity} agents active across ${poolSize} model(s)). Wait for running agents to complete, or increase the limit via /tmg config.`,
+          stderr: formatSpawnCapacityRefusal({ tier, running, maxParallel: tc.maxParallel, poolSize }),
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
           log: [],
         },
