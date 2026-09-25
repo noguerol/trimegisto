@@ -440,6 +440,12 @@ export function effectiveSpawnCapacity(tier: AgentTier, maxParallel: number, poo
  * pi session, not in `tierConfig.model`). Computing `maxParallel * poolSize`
  * from the raw pool read "7/0 agents active across 0 model(s)" and made callers
  * retry a spawn that could never fit.
+ *
+ * The OLD text ("Wait for running agents to complete") invited exactly that
+ * retry: a worker that re-calls the same spawn gets the same failure, and
+ * antiloop's repeated-failing-outcome heuristic then HALTS the worker mid-task
+ * (observed: every agent of a 6-wide batch killed at ~138s). The guidance is
+ * therefore explicit: do not retry the spawn, do the work solo.
  */
 export function formatSpawnCapacityRefusal(opts: {
   tier: AgentTier;
@@ -449,7 +455,9 @@ export function formatSpawnCapacityRefusal(opts: {
 }): string {
   const pool = Number.isFinite(opts.poolSize) && opts.poolSize >= 1 ? Math.floor(opts.poolSize) : 1;
   const capacity = effectiveSpawnCapacity(opts.tier, opts.maxParallel, pool);
-  return `Cannot spawn ${formatTierLabel(opts.tier)}: max parallel limit reached (${opts.running}/${capacity} agents active across ${pool} model(s)). Wait for running agents to complete, or increase the limit via /tmg config.`;
+  return `Cannot spawn ${formatTierLabel(opts.tier)}: max parallel limit reached (${opts.running}/${capacity} agents active across ${pool} model(s)). ` +
+    `Do NOT retry this spawn: the pool is saturated and an identical retry repeats the same failing call. ` +
+    `Complete the task yourself now (solo), or split it into smaller steps you can run directly.`;
 }
 
 /**

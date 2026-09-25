@@ -93,6 +93,9 @@ console.log("spawn refusal message: reports effective capacity and the real pool
   check("active 7 running / 7 max reads 7/6", /7\/6 agents active/.test(msg), msg);
   check("active message names a real model count", /across 1 model\(s\)/.test(msg), msg);
   check("active message never reads x/0", !/\/0 agents/.test(msg), msg);
+  check("refusal forbids the retry loop", /do not retry/i.test(msg), msg);
+  check("refusal tells the worker to finish solo", /task yourself/i.test(msg), msg);
+  check("refusal does not invite waiting/retrying", !/wait for running agents/i.test(msg), msg);
   const t2 = formatSpawnCapacityRefusal({ tier: "t2", running: 2, maxParallel: 2, poolSize: 3 });
   check("t2 2 running / 2 max / pool 3 reads 2/6", /2\/6 agents active across 3 model\(s\)/.test(t2), t2);
   const zeroPool = formatSpawnCapacityRefusal({ tier: "t2", running: 0, maxParallel: 4, poolSize: 0 });
