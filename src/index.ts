@@ -153,6 +153,9 @@ const TrimegistoTaskItem = Type.Object({
   diversity: Type.Optional(Type.Boolean({
     description: "Mark a deliberate parallel attempt (same question, different angle). Exempt from duplicate merging so a fresh twin runs alongside its ledger-aware counterpart. Cap: 3 per batch.",
   })),
+  sequential: Type.Optional(Type.Boolean({
+    description: "Run this task alone, awaited, on the ACTIVE/main model, even if the active tier is disabled or has no free slot; the coordinator blocks until it returns so it never runs concurrently with the principal.",
+  })),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -514,6 +517,9 @@ export default function (pi: ExtensionAPI) {
     // Pre-check capacity for the WHOLE wave: never half-launch a wave.
     const projected: Record<string, number> = { active: 0, t1: 0, t2: 0, t3: 0 };
     for (const node of wave) {
+      // A sequential node is a single awaited spawn: the enabled/capacity
+      // gates do not apply to it (its own doLaunch path enforces its rules).
+      if (node.sequential === true) continue;
       const tier = (batch.taskByIndex.get(node.index)?.tier as AgentTier) || "active";
       if (tierHasModel(tier)) projected[tier] = (projected[tier] || 0) + 1;
     }
@@ -541,11 +547,12 @@ export default function (pi: ExtensionAPI) {
         continue;
       }
       const spec = batch.taskByIndex.get(node.index);
-      const tier: AgentTier = (spec?.tier as AgentTier) || "active";
+      const sequential = node.sequential === true;
+      const tier: AgentTier = sequential ? "active" : (spec?.tier as AgentTier) || "active";
       const taskText = spec?.task ?? node.task;
       const syntheticId = `#${node.index}-${node.task.slice(0, 24)}`;
 
-      if (!tierHasModel(tier)) {
+      if (!tierHasModel(tier) && !sequential) {
         const agentId = `err-${tier}-${batch.agentIds.length + 1}`;
         batch.agentIds.push(agentId);
         batch.waveAgentIds.push(agentId);
@@ -580,7 +587,19 @@ export default function (pi: ExtensionAPI) {
         // Register the ORIGINAL task text (not the upstream preamble) so the
         // cross-call dedup registry keeps comparing like with like.
         if (config.dedupeTasks) registerTask(tier, taskText);
-        const agent = launchAgent(tier, launchTaskText, config[tier], spec?.cwd || batch.cwd, undefined, taskModelOverride, config.redundantAgents, spec?.context === "fresh");
+        let agent: AgentInstance;
+        if (sequential) {
+          // Sequential active: doLaunch forces the active tier and bypasses
+          // the enabled/capacity gates for this single awaited spawn (the
+          // model-health breaker is still enforced inside it).
+          const launched = doLaunch("active", launchTaskText, spec?.cwd || batch.cwd, undefined, true, spec?.context === "fresh");
+          if ("status" in launched && launched.status === "error") {
+            throw new Error(launched.stderr);
+          }
+          agent = launched;
+        } else {
+          agent = launchAgent(tier, launchTaskText, config[tier], spec?.cwd || batch.cwd, undefined, taskModelOverride, config.redundantAgents, spec?.context === "fresh");
+        }
         batch.agentIds.push(agent.id);
         batch.waveAgentIds.push(agent.id);
         batch.nodeAgent.set(node.index, agent.id);
@@ -926,12 +945,17 @@ export default function (pi: ExtensionAPI) {
   }
 
   // ── Launch helper (for commands and tool) ──────────────
-  function doLaunch(tier: AgentTier, task: string, cwd: string, parentId?: string): AgentInstance | { agentId: string; tier: AgentTier; task: string; status: "error"; output: string; stderr: string; usage: any; log: AgentLogEntry[] } {
+  function doLaunch(tier: AgentTier, task: string, cwd: string, parentId?: string, sequential?: boolean, freshContext?: boolean): AgentInstance | { agentId: string; tier: AgentTier; task: string; status: "error"; output: string; stderr: string; usage: any; log: AgentLogEntry[] } {
     // Spawn-only-on-active: force all spawns onto the active tier (t0)
     if (config.spawnOnlyOnActive && tier !== "active") tier = "active";
+    // Sequential active: ONE awaited spawn on the main model. The coordinator
+    // blocks until it returns, so it never runs concurrently with the
+    // principal — the `enabled` gate and the principal-slot capacity math
+    // below do not apply to this path (the model-health breaker still does).
+    if (sequential === true) tier = "active";
     const tierConfig = config[tier];
 
-    if (!tierAvailable(tier)) {
+    if (!tierAvailable(tier) && sequential !== true) {
       return {
         agentId: `error-${Date.now()}`,
         tier,
@@ -984,7 +1008,7 @@ export default function (pi: ExtensionAPI) {
       tierConfig.maxParallel,
       Math.max(1, getModelPool(tierConfig, config.redundantAgents).length),
     );
-    if (spawnCap <= 0) {
+    if (spawnCap <= 0 && sequential !== true) {
       const reason = tier === "active"
         ? `maxParallel is ${tierConfig.maxParallel} and the main session occupies the only t0 slot`
         : `maxParallel is ${tierConfig.maxParallel}`;
@@ -1002,13 +1026,18 @@ export default function (pi: ExtensionAPI) {
 
     // Pick the least-loaded model from the tier pool when redundant agents are ON
     let modelOverride = spawnModelOverride(tier);
+    // A sequential spawn IS the active model by definition: force it even when
+    // `useActiveModel` is off (that switch keeps the PARALLEL tiers on their own
+    // models; it must not change what "the active model" means for an awaited
+    // same-model spawn).
+    if (sequential === true && tier === "active" && activeModel) modelOverride = activeModel;
     if (config.redundantAgents && tier !== "active") {
       const pool = getModelPool(tierConfig, true);
       const pick = selectAvailableModel(tier, pool, tierConfig.maxParallel);
       if (pick) modelOverride = pick;
     }
 
-    return launchAgent(tier, task, tierConfig, cwd, parentId, modelOverride, config.redundantAgents);
+    return launchAgent(tier, task, tierConfig, cwd, parentId, modelOverride, config.redundantAgents, sequential === true && freshContext === true);
   }
 
   // ── @tier[letter] / /tier[letter] interception ─────────
@@ -1293,6 +1322,13 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
         if (!t.tier) t.tier = "active" as any;
       }
 
+      // Sequential tasks run on the ACTIVE/main model by definition; force the
+      // tier here so every downstream gate (plan, feasibility, availability)
+      // sees the tier the launch will actually use. doLaunch re-forces it.
+      for (const t of params.tasks) {
+        if (t.sequential === true) t.tier = "active" as any;
+      }
+
       // Spawn-only-on-active: force every task onto the active tier (t0)
       if (config.spawnOnlyOnActive) {
         for (const t of params.tasks) {
@@ -1312,8 +1348,10 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
         const origIndex = i + 1;
         // A `diversity` task is an intentional parallel attempt: it must not be
         // rejected as an already-spawned duplicate. (In-batch twins are kept by
-        // the plan gate's diversity exemption.)
-        if (config.dedupeTasks && t.diversity !== true) {
+        // the plan gate's diversity exemption.) A `sequential` task is the
+        // awaited verdict (e.g. adversarial QA re-checking recently spawned
+        // work), so it must not be skipped as a near-duplicate of that work.
+        if (config.dedupeTasks && t.diversity !== true && t.sequential !== true) {
           const dup = isDuplicateTask(t.task);
           if (dup.duplicate) {
             skippedTasks.push({ task: t.task, tier: t.tier, matchedTask: dup.matchedTask ?? "", matchedTier: dup.matchedTier });
@@ -1364,6 +1402,7 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
           verify: normalizeVerify(t.verify)?.command,
           context: t.context === "fresh" ? "fresh" : t.context === "ledger" ? "ledger" : undefined,
           diversity: t.diversity === true,
+          sequential: t.sequential === true,
         } as PlanTaskInput;
       });
 
@@ -1424,8 +1463,12 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
       for (let w = 0; w < plan.waves.length; w++) {
         const perTier: Record<string, number> = { active: 0, t1: 0, t2: 0, t3: 0 };
         for (const idx of plan.waves[w]) {
-          const t = (dedupedTasks[idx - 1]?.tier as AgentTier) || "active";
-          perTier[t] = (perTier[t] || 0) + 1;
+          const t = dedupedTasks[idx - 1];
+          // A sequential node is a single awaited spawn that runs alone in its
+          // own wave: the tier capacity does not apply to it.
+          if (t?.sequential === true) continue;
+          const tier = (t?.tier as AgentTier) || "active";
+          perTier[tier] = (perTier[tier] || 0) + 1;
         }
         for (const tier of ["active", "t1", "t2", "t3"] as const) {
           const cap = tierCapacity(tier);
@@ -1455,7 +1498,9 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
 
       // Reject tiers that are disabled or have no model — the coordinator should
       // only spawn tiers listed as ENABLED in this tool's description.
-      const unavailable = dedupedTasks.filter((t: any) => !tierAvailable(t.tier));
+      // Sequential tasks are exempt: their whole point is to run on the active
+      // model even when the active tier is disabled or principal-only.
+      const unavailable = dedupedTasks.filter((t: any) => t.sequential !== true && !tierAvailable(t.tier));
       if (unavailable.length > 0) {
         const bad = [...new Set(unavailable.map((t: any) => t.tier))].join(", ");
         return {

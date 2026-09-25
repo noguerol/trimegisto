@@ -51,6 +51,15 @@ export interface PlanTaskInput {
    * its ledger-aware counterpart instead of being deduped away.
    */
   diversity?: boolean;
+  /**
+   * Run this task alone, awaited, on the ACTIVE/main model, even if the active
+   * tier is disabled or has no free slot. The coordinator blocks until it
+   * returns, so it never runs concurrently with the principal. A sequential
+   * node is placed in its OWN wave (never sharing one with other nodes) and,
+   * like a diversity attempt, is exempt from duplicate merging: it is the
+   * awaited verdict, not a redundant copy.
+   */
+  sequential?: boolean;
 }
 
 export type PlanLane = "open" | "gated" | "closed";
@@ -69,6 +78,7 @@ export interface PlanNode {
   verify?: string;
   context?: "ledger" | "fresh";
   diversity?: boolean;
+  sequential?: boolean;
 }
 
 export interface PlanDecision {
@@ -426,6 +436,7 @@ interface InternalNode {
   verify?: string;
   context?: "ledger" | "fresh";
   diversity?: boolean;
+  sequential?: boolean;
 }
 
 interface Entry {
@@ -438,15 +449,16 @@ interface Entry {
   verify: unknown;
   context: unknown;
   diversity: unknown;
+  sequential: unknown;
 }
 
 function entryOf(raw: unknown): Entry | null {
   if (!raw) return null;
   if (typeof raw === "string") {
-    return { task: raw, needs: undefined, writes: undefined, why: undefined, lane: undefined, tier: undefined, verify: undefined, context: undefined, diversity: undefined };
+    return { task: raw, needs: undefined, writes: undefined, why: undefined, lane: undefined, tier: undefined, verify: undefined, context: undefined, diversity: undefined, sequential: undefined };
   }
   if (typeof raw === "number" || typeof raw === "boolean") {
-    return { task: String(raw), needs: undefined, writes: undefined, why: undefined, lane: undefined, tier: undefined, verify: undefined, context: undefined, diversity: undefined };
+    return { task: String(raw), needs: undefined, writes: undefined, why: undefined, lane: undefined, tier: undefined, verify: undefined, context: undefined, diversity: undefined, sequential: undefined };
   }
   if (typeof raw === "object") {
     const o = raw as Record<string, unknown>;
@@ -460,6 +472,7 @@ function entryOf(raw: unknown): Entry | null {
       verify: o.verify,
       context: o.context,
       diversity: o.diversity,
+      sequential: o.sequential,
     };
   }
   return null;
@@ -800,6 +813,7 @@ export function planBatch(tasks: PlanTaskInput[], options?: PlanOptions): PlanDe
       verify: typeof e.verify === "string" && e.verify.trim() ? e.verify.trim() : undefined,
       context: e.context === "fresh" ? "fresh" : e.context === "ledger" ? "ledger" : undefined,
       diversity: e.diversity === true ? true : undefined,
+      sequential: e.sequential === true ? true : undefined,
     });
   }
 
@@ -851,6 +865,7 @@ export function planBatch(tasks: PlanTaskInput[], options?: PlanOptions): PlanDe
     }
   }
   const isDiversity = (i: number): boolean => nodes[i].diversity === true;
+  const isSequential = (i: number): boolean => nodes[i].sequential === true;
 
   // UNION-FIND over ALL similar pairs, not a greedy "similar to an already-kept
   // representative" pass. The greedy version leaked a real cluster: A~B >= t and
@@ -869,7 +884,10 @@ export function planBatch(tasks: PlanTaskInput[], options?: PlanOptions): PlanDe
   for (let i = 0; i < nodes.length; i++) {
     for (let j = i + 1; j < nodes.length; j++) {
       // A diversity attempt is never merged into a cluster (nor absorbs one).
-      if (isDiversity(i) || isDiversity(j)) continue;
+      // A sequential node is the awaited verdict itself (e.g. an adversarial
+      // QA re-checking the work it reviews) — merging it away would silently
+      // drop the only result the coordinator is blocking on.
+      if (isDiversity(i) || isDiversity(j) || isSequential(i) || isSequential(j)) continue;
       if (similarity(i, j) >= threshold) {
         const ri = find(i);
         const rj = find(j);
@@ -1022,6 +1040,57 @@ export function planBatch(tasks: PlanTaskInput[], options?: PlanOptions): PlanDe
   // edges) is left untouched, so no false upstream dependency is injected.
   const capacityResult = enforceTierCapacity(launchedInternals, launchFeeds, waveOf, opts.tierCapacity);
 
+  // 6c) Sequential nodes: each one runs ALONE in its own wave, after every
+  // non-sequential wave. The coordinator awaits it, so it never overlaps the
+  // principal — sharing a wave with another node would break that guarantee.
+  // This runs AFTER the capacity deferrals so a deferred node can never land
+  // on a sequential wave. Deterministic: sequential nodes are visited in
+  // ascending index order and every move only raises a wave number, so the
+  // fixpoint below terminates.
+  const sequentialInternals = launchedInternals
+    .filter(nd => nd.sequential === true)
+    .sort((a, b) => a.index - b.index);
+  if (sequentialInternals.length > 0) {
+    let maxWave = 1;
+    for (const nd of launchedInternals) {
+      if (nd.sequential === true) continue;
+      const w = waveOf.get(nd.index) || 1;
+      if (w > maxWave) maxWave = w;
+    }
+    sequentialInternals.forEach((nd, k) => waveOf.set(nd.index, maxWave + 1 + k));
+    for (let guard = 0; guard <= launchedInternals.length * 2 + 2; guard++) {
+      let moved = false;
+      // (1) A dependent must out-wave its dependency (a non-sequential node
+      // may depend on a sequential one and must run after it).
+      for (const u of launchedInternals) {
+        const wu = waveOf.get(u.index) || 1;
+        for (const v of launchFeeds.get(u.index) || []) {
+          if ((waveOf.get(v) || 1) <= wu) { waveOf.set(v, wu + 1); moved = true; }
+        }
+      }
+      // (2) A sequential node must be the only node in its wave: if a
+      // dependent was pushed onto it, move the sequential node to the end.
+      const byWave = new Map<number, InternalNode[]>();
+      for (const nd of launchedInternals) {
+        const w = waveOf.get(nd.index) || 1;
+        if (!byWave.has(w)) byWave.set(w, []);
+        (byWave.get(w) as InternalNode[]).push(nd);
+      }
+      let maxW = 0;
+      for (const w of byWave.keys()) if (w > maxW) maxW = w;
+      for (const group of byWave.values()) {
+        if (group.length <= 1) continue;
+        for (const s of group) {
+          if (s.sequential !== true) continue;
+          waveOf.set(s.index, maxW + 1);
+          maxW++;
+          moved = true;
+        }
+      }
+      if (!moved) break;
+    }
+  }
+
   const waveMap = new Map<number, number[]>();
   for (const nd of launchedInternals) {
     nd.wave = waveOf.get(nd.index) || 1;
@@ -1064,6 +1133,7 @@ export function planBatch(tasks: PlanTaskInput[], options?: PlanOptions): PlanDe
     if (nd.verify !== undefined) pn.verify = nd.verify;
     if (nd.context !== undefined) pn.context = nd.context;
     if (nd.diversity !== undefined) pn.diversity = nd.diversity;
+    if (nd.sequential !== undefined) pn.sequential = nd.sequential;
     return pn;
   });
   const launch = planNodes.filter(pn => pn.duplicateOf === undefined);
