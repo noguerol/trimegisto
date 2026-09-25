@@ -908,7 +908,7 @@ export default function (pi: ExtensionAPI) {
   async function updateDashboard(): Promise<void> {
     try {
       if (!ctxRef?.hasUI) return;
-      ctxRef.ui.setFooter(undefined);
+      // ponytail: removed setFooter(undefined) — stomps @narumitw/pi-statusline's footer on every 500ms render. Session-restore branches keep theirs (upstream intent); add back if dashboard needs native-footer reset.
       if (dashboardMode === "off") {
         ctxRef.ui.setWidget("trimegisto", undefined);
         ctxRef.ui.setWidget("trimegisto-compact", undefined);
