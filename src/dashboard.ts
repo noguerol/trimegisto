@@ -109,7 +109,8 @@ function computeSessionSpeed() {
 
 /**
  * "↑prefill ↓decode" suffix for one streaming target.
- *   ↑…2.1s   prompt still being processed (live wait)
+ *   ↑2.1s    prompt still being processed (live wait, no ellipsis: a
+ *            varying glyph made the whole metric line shift width)
  *   ↑1875t/s trusted prefill throughput (large prompt: compute dominates)
  *   ↑817ms   time-to-first-token only — the prompt was too small for the
  *            number to be throughput rather than network latency
@@ -119,7 +120,7 @@ function speedSuffix(s: SpeedSnapshot | null, fmt: (n: number) => string): strin
   if (!s) return "";
   const parts: string[] = [];
   if (s.phase === "prefill") {
-    parts.push(`↑…${formatElapsed(s.prefillElapsedMs)}`);
+    parts.push(`↑${formatElapsed(s.prefillElapsedMs)}`);
   } else if (s.prefillTokPerSec > 0) {
     parts.push(`↑${fmt(s.prefillTokPerSec)}t/s`);
   } else if (s.ttftMs > 0) {
@@ -200,7 +201,7 @@ export function createDashboardWidget(ctx: ExtensionContext) {
           return [
             theme.fg("muted", theme.bold(formatTmgStatus(true))),
             theme.fg("muted", `  ⌁ main${solo}`),
-          ].map((l) => truncateToWidth(l, width));
+          ].map((l) => truncateToWidth(l, width, "…", true));
         }
 
         for (const agent of agentList.slice(0, 10)) {
@@ -285,7 +286,7 @@ export function createDashboardWidget(ctx: ExtensionContext) {
           lines.push(`  ${theme.fg("dim", sessionParts.join(" "))}`);
         }
 
-        return lines.map(l => truncateToWidth(l, width));
+        return lines.map(l => truncateToWidth(l, width, "…", true));
       },
     };
   };
@@ -347,7 +348,7 @@ export function createCompactWidget(ctx: ExtensionContext) {
           const redun = redundancyBadge();
           if (redun) line += theme.fg("warning", ` ${redun}`);
           lines.push(line);
-          return lines.map(l => truncateToWidth(l, width));
+          return lines.map(l => truncateToWidth(l, width, "…", true));
         }
 
         // Active: aggregate metrics FIRST
@@ -402,7 +403,7 @@ export function createCompactWidget(ctx: ExtensionContext) {
         if (redun) line += theme.fg("warning", ` ${redun}`);
 
         lines.push(line);
-        return lines.map(l => truncateToWidth(l, width));
+        return lines.map(l => truncateToWidth(l, width, "…", true));
       },
     };
   };

@@ -13,6 +13,7 @@
  */
 
 import { shouldDriveDashboardRender } from "./src/tui-refresh.ts";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 let passed = 0;
 let failed = 0;
@@ -48,6 +49,21 @@ console.log("shouldDriveDashboardRender: negative paths never render:");
     shouldDriveDashboardRender({ ...base, liveAgents: -3, liveActivity: false }) === false);
   check("NaN liveAgents with activity -> render",
     shouldDriveDashboardRender({ ...base, liveAgents: NaN, liveActivity: true }) === true);
+}
+
+console.log("metric line: padded to a constant width so digits never shift the layout:");
+{
+  const width = 60;
+  // The premise: unpadded, a 3->4 digit change really does change the width.
+  check("unpadded metric lines differ in width",
+    visibleWidth(`  \u2301 main \u2191182ms \u2193114t/s`) !== visibleWidth(`  \u2301 main \u21911182ms \u2193114t/s`));
+  // The fix: every widget line is truncated AND padded to the terminal width.
+  for (const sample of ["  \u2301 main \u2191182ms \u2193114t/s", "  \u2301 main \u21911182ms \u2193114t/s", "  \u2301 main \u21911s \u2193114t/s", "  \u2301 main \u21911875t/s \u21939.9t/s"]) {
+    check(`padded to exactly ${width} cols: "${sample.trim()}"`,
+      visibleWidth(truncateToWidth(sample, width, "\u2026", true)) === width);
+  }
+  check("overlong lines still truncate to exactly the width",
+    visibleWidth(truncateToWidth("x".repeat(200), width, "\u2026", true)) === width);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
