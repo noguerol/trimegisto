@@ -99,6 +99,9 @@ console.log("through pi's real ToolExecutionComponent (end-to-end render):");
   collapsed.setExpanded(false);
   const cLines = collapsed.render(100);
   check("collapsed pi block does not leak the text", !cLines.join("\n").includes("secret prompt"), cLines);
+  // The regression: the default shell wrapped the empty result in a Box with a
+  // background color, painting invisible BLACK lines into the transcript.
+  check("collapsed pi block renders ZERO lines (no black line)", cLines.length === 0, cLines);
 
   const expanded = mk();
   expanded.markExecutionStarted();

@@ -1774,6 +1774,11 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
   pi.registerTool({
     name: "trimegisto_harvest",
     label: "Trimegisto Harvest",
+    // "self" shell: with content empty (collapsed) pi renders [] and the block
+    // disappears entirely. The default shell wraps it in a Box with
+    // `bg("toolPendingBg")`, so an empty line was painted as a black line and a
+    // frequently-called harvest left a trail of them in the transcript.
+    renderShell: "self",
     description: "Instant, non-blocking snapshot of Trimegisto agents. Use this instead of sleep/polling when you need to integrate available results. Never waits for running agents.",
     promptSnippet: "Instant agent snapshot; never poll waiting.",
     parameters: Type.Object({
