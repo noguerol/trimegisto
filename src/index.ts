@@ -74,6 +74,7 @@ import { sanitizeReaperConfig } from "./config.ts";
 import { speed, MAIN_TARGET } from "./speed.ts";
 import { formatTmgStatus } from "./branding.ts";
 import { ProgressLogBuffer } from "./progress-log.ts";
+import { shouldDriveDashboardRender } from "./tui-refresh.ts";
 
 // ── Configuration entry type ────────────────────────────
 const CONFIG_ENTRY = "trimegisto-config-v1";
@@ -2479,14 +2480,25 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
   const speedRefreshInterval = setInterval(() => {
     if (disposed || !config.enabled) return;
     try {
-      if (!ctxRef?.hasUI) return;
-      if (liveAgentCount() === 0 && !speed.hasLiveActivity()) return;
+      // Never double pi's own stream repaints, and never tick faster than the
+      // visible content needs. The widget's elapsed/speed text is the reason
+      // this ticker exists, but forcing an extra repaint on top of a streaming
+      // main session made the whole TUI blink: every tick changed the seconds /
+      // speed digits (even 3->4 digits changed the line width) on top of pi's
+      // own per-delta repaints. See src/tui-refresh.ts.
+      if (!shouldDriveDashboardRender({
+        enabled: config.enabled,
+        hasUI: !!ctxRef?.hasUI,
+        liveAgents: liveAgentCount(),
+        liveActivity: speed.hasLiveActivity(),
+        mainStreaming: progressLog.isStreaming(),
+      })) return;
       // dashboard.ts is lazy-loaded; Node caches it after the first import.
       import("./dashboard.ts")
         .then((m) => m.requestDashboardRender())
         .catch(() => { /* module or UI unavailable */ });
     } catch { /* ignore */ }
-  }, 500);
+  }, 1000);
 
   // ── Main session telemetry ─────────────────────────────
   // The main session talks to its provider just like the sub-agents do: the
