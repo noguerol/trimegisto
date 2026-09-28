@@ -1833,6 +1833,23 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
       lines.push(active > 0 ? `_${active} agent(s) still running; this harvest did not wait._` : "_All agents settled._");
       return { content: [{ type: "text", text: lines.join("\n") }], details: { agents: details } };
     },
+
+    // The harvest is MODEL-facing (agent tasks, output/prompt excerpts). Dumping
+    // the whole markdown into the transcript is noise the user should not read;
+    // collapse it to nothing and keep the full text behind Ctrl+O (expanded).
+    renderCall() {
+      return new Container();
+    },
+    renderResult(result, { expanded }, _theme, _context) {
+      if (!expanded) return new Container();
+      const textContent = Array.isArray(result?.content)
+        ? result.content.find((c: any) => c?.type === "text")?.text ?? ""
+        : "";
+      const mdTheme = getMarkdownTheme();
+      const container = new Container();
+      container.addChild(new Markdown(String(textContent), 0, 0, mdTheme));
+      return container;
+    },
   });
 
   // ── Suppress custom message headers via custom renderers ──
