@@ -159,7 +159,11 @@ export function buildTierConfig(
   // shared context (file_read_track / trimegisto_note) and file locking.
   // Union them in so existing saved configs and agent files that predate a
   // tool still get it, without clobbering user-configured extras.
-  const ESSENTIAL_TOOLS = ["trimegisto_spawn", "file_read_track", "trimegisto_note", "file_lock", "file_unlock"];
+  // `plan_manager` comes from the t-plan extension. It is unioned in so a
+  // spawned worker can read/advance the project plan of the session it belongs
+  // to (the plan file is cwd-scoped). Unknown tool names are ignored by pi, so
+  // this is harmless when t-plan is not installed.
+  const ESSENTIAL_TOOLS = ["trimegisto_spawn", "file_read_track", "trimegisto_note", "file_lock", "file_unlock", "plan_manager"];
   const resolvedTools = [...new Set([...(Array.isArray(tools) ? tools : []), ...ESSENTIAL_TOOLS])];
 
   const extraArgs = savedConfig?.extraArgs || defaults.extraArgs;
@@ -199,7 +203,7 @@ function getTierDefaults(tier: AgentTier): TierConfig {
         systemPrompt: DEFAULT_PROMPTS.active,
         maxParallel: 4,
         compactionThreshold: 0,
-        tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn", "file_read_track", "trimegisto_note"],
+        tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn", "file_read_track", "trimegisto_note", "plan_manager"],
         extraArgs: [],
         redundantModels: [],
       };
@@ -210,7 +214,7 @@ function getTierDefaults(tier: AgentTier): TierConfig {
         systemPrompt: DEFAULT_PROMPTS.t1,
         maxParallel: 1,
         compactionThreshold: 0,
-        tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn", "file_read_track", "trimegisto_note"],
+        tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn", "file_read_track", "trimegisto_note", "plan_manager"],
         extraArgs: [],
         redundantModels: [],
       };
@@ -221,7 +225,7 @@ function getTierDefaults(tier: AgentTier): TierConfig {
         systemPrompt: DEFAULT_PROMPTS.t2,
         maxParallel: 4,
         compactionThreshold: 0,
-        tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn", "file_read_track", "trimegisto_note"],
+        tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn", "file_read_track", "trimegisto_note", "plan_manager"],
         extraArgs: [],
         redundantModels: [],
       };
@@ -232,7 +236,7 @@ function getTierDefaults(tier: AgentTier): TierConfig {
         systemPrompt: DEFAULT_PROMPTS.t3,
         maxParallel: 4,
         compactionThreshold: 0,
-        tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn", "file_read_track", "trimegisto_note"],
+        tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "trimegisto_spawn", "file_read_track", "trimegisto_note", "plan_manager"],
         extraArgs: [],
         redundantModels: [],
       };
