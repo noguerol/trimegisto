@@ -4,6 +4,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getAgents, killAgent, haltAll as haltAllAgents, getAgent, getLoopSupervisor, getModelHealth } from "./agent-manager.ts";
 import { getActiveLocks } from "./file-lock.ts";
 import { parseAgentCommand } from "./agent-control.ts";
+import { displayTaskOf } from "./task-display.ts";
 import { formatTierLabel } from "./config.ts";
 import type { AgentTier, TierConfig } from "./types.ts";
 
@@ -134,7 +135,8 @@ export async function handleTmgCommand(pi: ExtensionAPI, args: string | undefine
       for (const [id, agent] of agents) {
         const elapsed = Date.now() - agent.startedAt;
         const age = elapsed < 60_000 ? `${Math.round(elapsed / 1000)}s` : `${Math.round(elapsed / 60_000)}m`;
-        const task = agent.task.length > 60 ? agent.task.slice(0, 60) + "..." : agent.task;
+        const shown = displayTaskOf(agent);
+        const task = shown.length > 60 ? shown.slice(0, 60) + "..." : shown;
         lines.push(`${statusIcon(agent.status)} ${formatTierLabel(agent.tier)} ${id} [${agent.status}] ${age} — ${task}`);
       }
       ctx.ui.notify(`◇ Trimegisto agents:\n${lines.join("\n")}`, "info");
@@ -149,7 +151,7 @@ export async function handleTmgCommand(pi: ExtensionAPI, args: string | undefine
       const agent = getAgents().get(id);
       if (!agent) return ctx.ui.notify(`Agent ${id} not found.`, "error");
       const output = agent.output || "(no output yet)";
-      ctx.ui.notify(`${agent.id} [${agent.status}]\n${agent.task}\n\nOutput:\n${output.length > 500 ? output.slice(0, 500) + "\n... (truncated)" : output}`, "info");
+      ctx.ui.notify(`${agent.id} [${agent.status}]\n${displayTaskOf(agent)}\n\nOutput:\n${output.length > 500 ? output.slice(0, 500) + "\n... (truncated)" : output}`, "info");
       return;
     }
 

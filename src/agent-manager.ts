@@ -24,6 +24,7 @@ import type { AgentInstance, AgentResult, AgentStatus, AgentTier, TierConfig, Ag
 import { formatTierLabel } from "./config.ts";
 import { scanSpawnRequests, writeSpawnResponse, cleanupStaleFiles, setInstanceDir as setIpcInstanceDir } from "./ipc.ts";
 import { releaseAllAgentLocks, setInstanceDir as setLockInstanceDir } from "./file-lock.ts";
+import { displayTaskOf } from "./task-display.ts";
 import { clearAgentControls, condenseForCompaction } from "./agent-control.ts";
 import { broadcastFileChange, clearAgentContext, setInstanceDir as setContextInstanceDir } from "./context-broker.ts";
 import { type LoopSupervisor, type LoopAlert } from "./loop-supervisor.ts";
@@ -1819,9 +1820,10 @@ export function formatAgentStatus(agent: AgentInstance): string {
   }
 
   const modelStr = agent.model ? ` [${agent.model.split("/").pop()}]` : "";
-  const taskPreview = agent.task.length > 40
-    ? agent.task.slice(0, 40) + "..."
-    : agent.task;
+  const shownTask = displayTaskOf(agent);
+  const taskPreview = shownTask.length > 40
+    ? shownTask.slice(0, 40) + "..."
+    : shownTask;
 
   return `${statusIcon} ${label} ${agent.id}${modelStr} ${duration} — ${taskPreview}`;
 }

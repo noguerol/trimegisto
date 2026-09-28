@@ -25,8 +25,15 @@ export interface AgentInstance {
   id: string;
   /** Agent tier */
   tier: AgentTier;
-  /** Task description */
+  /** Task description handed to the worker (may carry an internal preamble). */
   task: string;
+  /**
+   * Original, user-facing task. Set when the launched text carries internal
+   * scaffolding (e.g. the upstream-dependency preamble) so the UI/transcript
+   * never shows it. Render paths use `displayTaskOf(agent)`; the worker process
+   * and compaction keep using `task`.
+   */
+  displayTask?: string;
   /** Current status */
   status: AgentStatus;
   /** Spawn timestamp */

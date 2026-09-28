@@ -18,6 +18,8 @@ import {
 import { formatTierLabel, formatModelLabel } from "./config.ts";
 import { speed, MAIN_TARGET, type SpeedSnapshot } from "./speed.ts";
 import { TMG_SHORT, formatTmgStatus } from "./branding.ts";
+import { displayTaskOf } from "./task-display.ts";
+import { ValueLatch, METRICS_HOLD_MS } from "./metrics-latch.ts";
 
 /** Status dot colors (using theme color names) */
 type ThemeColor = "success" | "accent" | "warning" | "error" | "dim" | "muted";
@@ -31,6 +33,22 @@ type ThemeColor = "success" | "accent" | "warning" | "error" | "dim" | "muted";
 let tuiRef: any = null;
 export function requestDashboardRender(): void {
   try { tuiRef?.requestRender?.(); } catch { /* UI not available */ }
+}
+
+/**
+ * Holds momentarily-zero throughput/token metrics for a few seconds so agents
+ * entering/leaving do not make the numbers blink out of the widget or footer.
+ * See src/metrics-latch.ts; the update frequency is unchanged.
+ */
+const metricsLatch = new ValueLatch(METRICS_HOLD_MS);
+
+/** Latched view of the live throughput + active token sums for one render. */
+function freshMetrics(now: number) {
+  const speedNow = computeSessionSpeed();
+  return {
+    decodeSum: metricsLatch.update("decodeSum", speedNow.decodeSum, now),
+    avgPrefill: metricsLatch.update("avgPrefill", speedNow.avgPrefill, now),
+  };
 }
 
 /** Count of cross-agent near-duplicate output pairs (swarm guard). */
@@ -200,7 +218,8 @@ export function createDashboardWidget(ctx: ExtensionContext) {
           const elapsedMs = (Date.now() - agent.startedAt) - agentIdleMs(agent);
           const elapsed = formatElapsed(Math.max(0, elapsedMs));
           const timeStr = theme.fg("dim", ` ${elapsed}`);
-          const taskPreview = agent.task.length > 50 ? agent.task.slice(0, 50) + "…" : agent.task;
+          const shownTask = displayTaskOf(agent);
+          const taskPreview = shownTask.length > 50 ? shownTask.slice(0, 50) + "…" : shownTask;
           // Separate the model from the tier label so the two don't blend.
           const tierStr = modelName ? ` · ${formatTierLabel(agent.tier)}` : ` ${formatTierLabel(agent.tier)}`;
 
@@ -251,7 +270,7 @@ export function createDashboardWidget(ctx: ExtensionContext) {
           if (session.totalCost > 0) {
             sessionParts.push(`💰${fmtCost(session.totalCost)}`);
           }
-          const sSpeed = computeSessionSpeed();
+          const sSpeed = freshMetrics(Date.now());
           if (sSpeed.decodeSum > 0) {
             sessionParts.push(`Σ↓${fmtSpeed(sSpeed.decodeSum)}t/s`);
           }
@@ -336,18 +355,20 @@ export function createCompactWidget(ctx: ExtensionContext) {
 
         const aggParts: string[] = [];
         aggParts.push(theme.fg("accent", `${active} active`));
-        const sSpeed = computeSessionSpeed();
+        const sSpeed = freshMetrics(Date.now());
         if (sSpeed.decodeSum > 0) {
           aggParts.push(theme.fg("accent", `↓${fmtSpeed(sSpeed.decodeSum)}t/s`));
         }
         if (sSpeed.avgPrefill > 0) {
           aggParts.push(`↑${fmtSpeed(sSpeed.avgPrefill)}t/s`);
         }
-        if (session.activeOutput > 0) {
-          aggParts.push(`📤${fmtTokens(session.activeOutput)}`);
+        // Session totals are monotonic, so the token numbers only grow instead
+        // of dropping every time one of the churning agents finishes.
+        if (session.totalOutput > 0) {
+          aggParts.push(`📤${fmtTokens(session.totalOutput)}`);
         }
-        if (session.activeInput > 0) {
-          aggParts.push(`📥${fmtTokens(session.activeInput)}`);
+        if (session.totalInput > 0) {
+          aggParts.push(`📥${fmtTokens(session.totalInput)}`);
         }
         line += aggParts.join(" ");
 

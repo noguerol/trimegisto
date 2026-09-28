@@ -75,6 +75,7 @@ import { speed, MAIN_TARGET } from "./speed.ts";
 import { formatTmgStatus } from "./branding.ts";
 import { ProgressLogBuffer } from "./progress-log.ts";
 import { shouldDriveDashboardRender } from "./tui-refresh.ts";
+import { displayTaskOf } from "./task-display.ts";
 
 // ── Configuration entry type ────────────────────────────
 const CONFIG_ENTRY = "trimegisto-config-v1";
@@ -315,7 +316,9 @@ export default function (pi: ExtensionAPI) {
     return {
       agentId: a.agentId ?? a.id ?? "?",
       tier: a.tier ?? "?",
-      task: a.task ?? "",
+      // A live AgentInstance may carry `displayTask` (original task) while
+      // `task` holds the internal upstream preamble; never surface the latter.
+      task: a.displayTask ?? a.task ?? "",
       status: a.status ?? "killed",
       output: a.output ?? "",
       finalOutput: a.finalOutput ?? "",
@@ -602,6 +605,9 @@ export default function (pi: ExtensionAPI) {
         } else {
           agent = launchAgent(tier, launchTaskText, config[tier], spec?.cwd || batch.cwd, undefined, taskModelOverride, config.redundantAgents, spec?.context === "fresh");
         }
+        // The process got `launchTaskText` (with the upstream preamble); every
+        // human-facing render must use the original task instead.
+        agent.displayTask = taskText;
         batch.agentIds.push(agent.id);
         batch.waveAgentIds.push(agent.id);
         batch.nodeAgent.set(node.index, agent.id);
@@ -1811,7 +1817,7 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
         const elapsed = Math.round(((a.finishedAt || Date.now()) - a.startedAt) / 1000);
         const statusIcon = a.status === "done" ? "✅" : a.status === "running" || a.status === "waiting" ? "⏳" : "⚠️";
         lines.push(`### ${statusIcon} ${a.id} [${formatTierLabel(a.tier)}] — ${a.status} (${elapsed}s)`);
-        lines.push(`Task: ${a.task.slice(0, 180)}`);
+        lines.push(`Task: ${displayTaskOf(a).slice(0, 180)}`);
         if (includeOutput) {
           const out = a.output.trim();
           const err = a.stderr.trim();
