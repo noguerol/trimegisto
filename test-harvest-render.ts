@@ -83,6 +83,31 @@ console.log("edge: missing/odd content is safe:");
   check("collapsed with undefined result is empty", HIDDEN(collapsedBad), collapsedBad);
 }
 
+console.log("through pi's real ToolExecutionComponent (end-to-end render):");
+{
+  const { ToolExecutionComponent } = await import("@earendil-works/pi-coding-agent");
+  const uiStub: any = { requestRender: () => {}, getTheme: () => undefined };
+  const mk = () => new ToolExecutionComponent(
+    "trimegisto_harvest", "call-1", {}, { showImages: false, imageWidthCells: 40 },
+    harvest as any, uiStub, process.cwd(),
+  );
+  const result = { content: [{ type: "text", text: "## Trimegisto harvest\nsecret prompt excerpt" }], details: { agents: [] }, isError: false };
+
+  const collapsed = mk();
+  collapsed.markExecutionStarted();
+  collapsed.updateResult(result, false);
+  collapsed.setExpanded(false);
+  const cLines = collapsed.render(100);
+  check("collapsed pi block does not leak the text", !cLines.join("\n").includes("secret prompt"), cLines);
+
+  const expanded = mk();
+  expanded.markExecutionStarted();
+  expanded.updateResult(result, false);
+  expanded.setExpanded(true);
+  const eLines = expanded.render(100);
+  check("expanded pi block shows the text", eLines.join("\n").includes("secret prompt"), eLines);
+}
+
 fs.rmSync(dir, { recursive: true, force: true });
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
