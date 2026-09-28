@@ -1827,7 +1827,7 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
         }
         if (a.usage.turns > 0) lines.push(`*${a.usage.turns} turns, ↑${a.usage.input} ↓${a.usage.output}*`);
         lines.push("");
-        details.push({ agentId: a.id, tier: a.tier, task: a.task, status: a.status, output: a.output, stderr: a.stderr, usage: a.usage, elapsedSeconds: elapsed });
+        details.push({ agentId: a.id, tier: a.tier, task: displayTaskOf(a), status: a.status, output: a.output, stderr: a.stderr, usage: a.usage, elapsedSeconds: elapsed });
       }
       const active = agents.filter(a => a.status === "running" || a.status === "waiting").length;
       lines.push(active > 0 ? `_${active} agent(s) still running; this harvest did not wait._` : "_All agents settled._");
@@ -2366,7 +2366,7 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
     const activeAgents = getActiveAgents();
     const agentList = activeAgents.length > 0
       ? activeAgents
-          .map(a => `- ${a.id} [${a.status}]: ${a.task.slice(0, 80)}`)
+          .map(a => `- ${a.id} [${a.status}]: ${displayTaskOf(a).slice(0, 80)}`)
           .join("\n")
       : "- none";
     const pausedTierLines = ALL_TIERS
