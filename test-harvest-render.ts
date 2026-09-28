@@ -109,6 +109,18 @@ console.log("through pi's real ToolExecutionComponent (end-to-end render):");
   expanded.setExpanded(true);
   const eLines = expanded.render(100);
   check("expanded pi block shows the text", eLines.join("\n").includes("secret prompt"), eLines);
+
+  // The reported symptom: a frequently-called harvest left a TRAIL of black
+  // lines. Five collapsed calls must accumulate exactly zero rendered lines.
+  let accumulated = 0;
+  for (let i = 0; i < 5; i++) {
+    const c = mk();
+    c.markExecutionStarted();
+    c.updateResult(result, false);
+    c.setExpanded(false);
+    accumulated += c.render(100).length;
+  }
+  check("five collapsed harvests accumulate ZERO lines", accumulated === 0, accumulated);
 }
 
 fs.rmSync(dir, { recursive: true, force: true });
