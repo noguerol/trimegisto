@@ -18,6 +18,7 @@ import {
   effectiveCompactionThreshold,
   sanitizeLoopSupervisorConfig,
   formatModelLabel,
+  buildTierConfig,
 } from "./src/config.ts";
 import { runConfigUI } from "./src/config-ui.ts";
 import { createDashboardWidget } from "./src/dashboard.ts";
@@ -526,6 +527,40 @@ console.log("Persistence round-trip: saveConfig actually writes dashboardMode an
   }
 }
 
+
+console.log("buildTierConfig: user tools win, ESSENTIAL_TOOLS are unioned (no duplicates):");
+{
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  // Isolate both discovery roots: a temp agent dir AND a temp cwd (no .pi/agents
+  // ancestor), so no agent file can override the defaults under test.
+  const tmpAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "tmg-ess-"));
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = tmpAgentDir;
+  try {
+    const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), "tmg-cwd-"));
+    const ESSENTIAL = ["trimegisto_spawn", "file_read_track", "trimegisto_note", "file_lock", "file_unlock", "plan_manager"];
+
+    const cfg = buildTierConfig("t2", tmpCwd, { tools: ["read", "custom_tool"] });
+    check("saved user tools are kept", cfg.tools.includes("read") && cfg.tools.includes("custom_tool"), cfg.tools);
+    check("every essential tool is unioned in", ESSENTIAL.every(t => cfg.tools.includes(t)), cfg.tools);
+    check("the union has no duplicates", new Set(cfg.tools).size === cfg.tools.length, cfg.tools);
+    check("user tools keep their order, essentials append", cfg.tools[0] === "read" && cfg.tools[1] === "custom_tool", cfg.tools);
+
+    const empty = buildTierConfig("t3", tmpCwd, { tools: [] });
+    check("an empty tools list still gets every essential", ESSENTIAL.every(t => empty.tools.includes(t)), empty.tools);
+
+    const dflt = buildTierConfig("active", tmpCwd);
+    check("built-in defaults include plan_manager", dflt.tools.includes("plan_manager"), dflt.tools);
+
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  } finally {
+    if (prevAgentDir !== undefined) process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    else delete process.env.PI_CODING_AGENT_DIR;
+    fs.rmSync(tmpAgentDir, { recursive: true, force: true });
+  }
+}
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
