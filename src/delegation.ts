@@ -206,31 +206,40 @@ export function formatDecomposabilityNote(a: DecomposabilityAnalysis): string {
 export function formatDelegationContract(opts: { autoSpawn: boolean; capacity: CapacitySlot[] }): string {
   const capacity = formatCapacitySummary(opts.capacity ?? []);
   if (!opts.autoSpawn) {
-    return [
-      "DELEGATION: opt-in. Work solo unless the user explicitly asks for parallel agents or the request is large enough that delegation is obviously what they want.",
-      "When you do delegate, make it one `trimegisto` batch of disjoint units and integrate its reconciliation yourself.",
-    ].join("\n");
+    return "DELEGATION: opt-in. Work solo unless the user explicitly asks for parallel agents. When you delegate, send one `trimegisto` batch of disjoint units and integrate its reconciliation yourself.";
   }
 
   const lines = [
     "DELEGATION CONTRACT — the default is to delegate.",
-    "- Before your first edit, read the request as a set of independent work units. If it splits into two or more, your first action is one `trimegisto` batch carrying all of them; do not do the split work serially and delegate only the leftovers.",
-    "- ENFORCED: for a non-atomic request the first `edit`, `write` or mutating `bash` call is BLOCKED with an error until you have called `trimegisto` once. Read-only tools (read/grep/find/ls) stay open so you can plan the batch. There is no silent solo path; if you never launch, the run is nudged to launch before settling.",
-    "- Work solo only when the request is provably atomic: a single question or lookup, one small change in one file, or one command whose steps cannot run in parallel. \"Doing it myself is faster\" is not a reason to skip.",
+    "- Read the request as independent units; if it splits into 2+, your FIRST action is one `trimegisto` batch carrying all of them, not leftovers.",
+    "- ENFORCED: for a non-atomic request the first `edit`, `write` or mutating `bash` call is BLOCKED until `trimegisto` runs. Read-only tools stay open to plan; no silent solo path.",
+    "- Work solo only for a provably atomic request: a single question or lookup, one small change in one file, or one command whose steps cannot run in parallel. \"I am faster\" is not a reason.",
   ];
   if (capacity) {
     lines.push(
-      `- Fill the capacity. ${capacity} Split substantial requests along file/module/check boundaries until the batch uses the available slots, or until the remaining units stop being independent. Never pad the batch with redundant work.`,
+      `- Fill the capacity. ${capacity} Split along file/module/check boundaries until the slots fill or the rest stop being independent; never pad with redundant work.`,
     );
   } else {
     lines.push(
-      "- Fill the capacity: split substantial requests along file/module/check boundaries until the batch uses every available slot, or until the remaining units stop being independent.",
+      "- Fill the capacity: split along file/module/check boundaries until the batch uses every available slot, or until the remaining units stop being independent.",
     );
   }
   lines.push(
     "- Units stay disjoint: never two agents on the same file, question, or output.",
-    "- One batch, then integrate: the batch's reconciliation is the final answer; do not re-spawn the same work.",
-    "- If a tier is unavailable or the gate rejects the batch, adjust and relaunch instead of silently falling back to solo work.",
+    "- One batch, then integrate: its reconciliation is the final answer; do not re-spawn.",
+    "- If a tier is unavailable or the gate rejects the batch, adjust and relaunch rather than fall back to solo work.",
   );
   return lines.join("\n");
+}
+
+/**
+ * A compact, always-safe delegation summary for prompt-budget-tight callers
+ * (the lazy system-prompt path). It points at the `trimegisto` tool
+ * description for the full rules and never advertises live capacity.
+ */
+export function formatCompactPolicyHint(opts: { autoSpawn: boolean; capacity: CapacitySlot[] }): string {
+  if (!opts.autoSpawn) {
+    return "Delegation is opt-in: work solo unless the user asks for parallel agents. When you delegate, send one `trimegisto` batch of disjoint units and integrate it. Full rules: see the `trimegisto` tool description.";
+  }
+  return "Delegate by default: split a request into disjoint units and send them as one `trimegisto` batch, then integrate its reconciliation. Work solo only for a provably atomic request. Full rules: see the `trimegisto` tool description.";
 }

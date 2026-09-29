@@ -26,6 +26,9 @@
  */
 
 import { EXTENSION_CONTEXT_NOTICE } from "./src/tier-status.ts";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 let passed = 0;
 let failed = 0;
@@ -59,10 +62,12 @@ function makeFakePi() {
 const ctxStub: any = {
   cwd: process.cwd(),
   hasUI: false,
+  mode: "print",
   model: { contextWindow: 200_000 },
   getContextUsage: () => ({ tokens: 0, contextWindow: 200_000 }),
   compact: async () => {},
   ui: { notify: () => {}, setStatus: () => {} },
+  sessionManager: { getEntries: () => [], getBranch: () => [] },
 };
 
 /**
@@ -111,6 +116,21 @@ const userChannelText = (llmMsgs: any[]): string =>
 const REAL_REQUEST = "pues es que no veo los hints de ayuda en la config de pinball"; // 61 chars, verbatim
 
 async function main() {
+  // Hermetic config: the delegation gate only arms when the active tier has a
+  // free spawn slot, and the lazy full policy is only rendered on a gated
+  // (decomposable) turn. Give the extension its own temp config so the test is
+  // deterministic and never reads the developer's real ~/.pi config.
+  const cfgDir = fs.mkdtempSync(path.join(os.tmpdir(), "tmg-directive-framing-"));
+  fs.mkdirSync(path.join(cfgDir, "trimegisto"), { recursive: true });
+  fs.writeFileSync(
+    path.join(cfgDir, "trimegisto", "config.json"),
+    JSON.stringify({ enabled: true, autoSpawn: true, active: { maxParallel: 3 } }),
+  );
+  process.env.PI_CODING_AGENT_DIR = cfgDir;
+  // The gate is disabled for spawned workers (this test process may itself be
+  // a Trimegisto worker); the handler under test must be a plain coordinator.
+  delete process.env.TRIMEGISTO_AGENT_ID;
+
   const { pi, handlers } = makeFakePi();
   const mod = await import("./src/index.ts");
   const factory = (mod as any).default;
@@ -118,6 +138,13 @@ async function main() {
     console.log("  \u2717 extension factory missing"); failed++; return;
   }
   factory(pi);
+
+  // Merge the temp config the same way a real session does, so autoSpawn and
+  // the active tier's spawn capacity are in effect for the handler below.
+  const sessionStart = handlers.get("session_start");
+  if (sessionStart && sessionStart.length > 0) {
+    await sessionStart[sessionStart.length - 1]({}, ctxStub);
+  }
 
   const beforeStart = handlers.get("before_agent_start");
   check("the extension registers a before_agent_start handler", !!beforeStart && beforeStart.length > 0);
@@ -133,7 +160,8 @@ async function main() {
     check("handler returns a systemPrompt", typeof res?.systemPrompt === "string", typeof res?.systemPrompt);
     check("the caller's base prompt is preserved", (res?.systemPrompt ?? "").startsWith("BASE SYSTEM PROMPT"));
     check("the policy block is appended to the system prompt", (res?.systemPrompt ?? "").includes("<trimegisto-policy>"));
-    check("the policy carries the delegation rules", (res?.systemPrompt ?? "").includes("Delegation rules:"));
+    check("the policy carries the compact delegation hint", (res?.systemPrompt ?? "").includes("Delegate by default:"));
+    check("the full delegation rules are lazy (absent from the compact block)", !(res?.systemPrompt ?? "").includes("Delegation rules:"));
     check("the policy carries the tier capacity lines", (res?.systemPrompt ?? "").includes("parallel)"));
     check("the imperative that read as a hijack is gone",
       !/FIRST action MUST/i.test(res?.systemPrompt ?? ""), (res?.systemPrompt ?? "").match(/FIRST action MUST.*/) ?? "clean");
@@ -160,18 +188,27 @@ async function main() {
       a?.systemPrompt?.length !== b?.systemPrompt?.length ? `${a?.systemPrompt?.length} vs ${b?.systemPrompt?.length}` : "equal");
   }
 
-  console.log("\nPer-run note: a decomposable prompt adds the note WITHOUT breaking the stable prefix:");
+  console.log("\nLaziness + stability: compact prefix is byte-stable; the full policy loads only when needed:");
   {
-    const atomic = await handler({ systemPrompt: "BASE", prompt: "fix the typo" }, ctxStub);
-    const multi = await handler({ systemPrompt: "BASE", prompt: "arregla src/a.ts y a\u00f1ade un test en test-a.ts" }, ctxStub);
+    // Two DIFFERENT non-decomposable prompts must render the exact same block,
+    // so the provider cache prefix survives turn over turn.
+    const atomic = await handler({ systemPrompt: "BASE", prompt: "what does the dashboard widget show?" }, ctxStub);
+    const atomic2 = await handler({ systemPrompt: "BASE", prompt: "where is the config menu defined?" }, ctxStub);
     const a = atomic?.systemPrompt ?? "";
+    const b = atomic2?.systemPrompt ?? "";
+    check("two different non-decomposable prompts produce a byte-identical system prompt", a === b, `${a.length} vs ${b.length}`);
+    check("the compact block carries no decomposition note", !a.includes("Decomposability check:"));
+    check("the compact block omits the full delegation rules", !a.includes("Delegation rules:"));
+
+    // A decomposable prompt is the only case that pays for the full contract.
+    const multi = await handler({ systemPrompt: "BASE", prompt: "arregla src/a.ts y a\u00f1ade un test en test-a.ts" }, ctxStub);
     const m = multi?.systemPrompt ?? "";
-    check("an atomic prompt adds no note", !a.includes("Decomposability check:"));
-    check("a decomposable prompt adds the note with its signals", m.includes("Decomposability check:") && m.includes("2 files"));
-    // The note is the ONLY difference: everything before it must be byte-identical.
-    const head = (s: string) => s.slice(0, s.includes("Decomposability check:") ? s.indexOf("Decomposability check:") : s.indexOf("</trimegisto-policy>"));
-    check("the stable prefix is byte-identical across prompts (provider cache survives)", head(a) === head(m), `${head(a).length} vs ${head(m).length}`);
-    check("still no user-channel message for either turn", atomic?.message === undefined && multi?.message === undefined);
+    check("a decomposable prompt lazy-loads the full policy", m.includes("Delegation rules:"));
+    check("the decomposable prompt adds the note with its signals", m.includes("Decomposability check:") && m.includes("2 files"));
+    check("the decomposability note stays LAST before the closing tag",
+      /Decomposability check:[\s\S]*\n<\/trimegisto-policy>$/.test(m.trim()));
+    check("still no user-channel message for any turn",
+      atomic?.message === undefined && atomic2?.message === undefined && multi?.message === undefined);
   }
 
   console.log("\nFraming: whatever IS injected must never be mistaken for the user's words:");

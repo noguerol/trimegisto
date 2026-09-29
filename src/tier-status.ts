@@ -105,6 +105,11 @@ export function frameExtensionContext(body: string): string {
  * unless the user edits /tmg config, so the system prompt keeps its
  * provider-side cache prefix. Live values (circuit-breaker countdowns,
  * running agents) go through `formatDirectiveContent` instead.
+ *
+ * `compact: true` renders only the wrapper + intro + proactive policy + tier
+ * block: it drops the `Delegation rules:` header, the rules array and the
+ * roles line so a budget-tight caller can lazy-expand the full rules. Absent
+ * or false keeps the full output byte-for-byte.
  */
 export function formatSystemPolicyContent(opts: {
   proactivePolicy: string;
@@ -117,22 +122,23 @@ export function formatSystemPolicyContent(opts: {
    * cached prefix survives. "" (or omitted) renders nothing.
    */
   decomposabilityNote?: string;
+  /** When true, omit the delegation rules/rules array/roles line. */
+  compact?: boolean;
 }): string {
   const rules = (opts.rules ?? []).filter(r => r && r.trim().length > 0);
   const note = (opts.decomposabilityNote ?? "").trim();
+  const compact = opts.compact === true;
   return [
     "<trimegisto-policy>",
     "Injected by the Trimegisto extension. It gives this session a `trimegisto` tool that runs parallel sub-agents on other models. This block is stable reference; live agent status, if any, arrives separately in the user channel.",
     "",
     opts.proactivePolicy,
     "",
-    "Delegation rules:",
-    ...rules,
-    "",
+    ...(compact ? [] : ["Delegation rules:", ...rules, ""]),
     "Tiers (roles and capacity; live availability may differ, see the per-turn context):",
     joinTierStatusLines(opts.tierLines),
     "Spawn only tiers marked ✓ ENABLED, and respect each tier's max parallel.",
-    "Roles: active = mass worker; t1 = planning; t2 = reasoning; t3 = mechanical.",
+    ...(compact ? [] : ["Roles: active = mass worker; t1 = planning; t2 = reasoning; t3 = mechanical."]),
     ...(note ? [note] : []),
     "</trimegisto-policy>",
   ].join("\n");

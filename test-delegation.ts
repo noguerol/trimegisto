@@ -20,6 +20,7 @@ import {
   totalSlots,
   formatCapacitySummary,
   formatDelegationContract,
+  formatCompactPolicyHint,
   analyzeDecomposability,
   formatDecomposabilityNote,
 } from "./src/delegation.ts";
@@ -57,6 +58,7 @@ console.log("totalSlots / formatCapacitySummary: the capacity the coordinator mu
 console.log("formatDelegationContract: auto-spawn ON inverts the default:");
 {
   const out = formatDelegationContract({ autoSpawn: true, capacity: slots });
+  check("contract stays within the compact budget (<=1050 chars)", out.length <= 1050, out.length);
   check("declares delegate as the default", /default is to delegate/i.test(out), out);
   check("names the atomic allowlist (single question / one file / non-parallel command)",
     /single question/i.test(out) && /one small change in one file/i.test(out) && /cannot run in parallel/i.test(out));
@@ -66,6 +68,7 @@ console.log("formatDelegationContract: auto-spawn ON inverts the default:");
   check("requires one batch + integration", /one batch, then integrate/i.test(out));
   check("announces the enforced tool-call gate", /ENFORCED/.test(out) && /blocked/i.test(out), out);
   check("never contains the hijack phrasing", !/FIRST action MUST/i.test(out));
+  check("tells the coordinator to adjust and relaunch on gate rejection", /adjust and relaunch/i.test(out));
 }
 
 console.log("formatDelegationContract: ON without usable capacity still pushes the fill:");
@@ -77,11 +80,26 @@ console.log("formatDelegationContract: ON without usable capacity still pushes t
 console.log("formatDelegationContract: auto-spawn OFF stays opt-in:");
 {
   const out = formatDelegationContract({ autoSpawn: false, capacity: slots });
+  check("opt-in branch stays within its 200-char budget", out.length <= 200, out.length);
   check("says delegation is opt-in", /opt-in/i.test(out));
   check("does NOT advertise capacity (no batch is expected)", !out.includes("parallel slots configured"));
   check("still asks for disjoint units when it DOES delegate", /disjoint/i.test(out));
   check("does not carry the aggressive default", !/default is to delegate/i.test(out));
   check("does not announce any enforced block", !/ENFORCED/.test(out) && !/blocked/i.test(out), out);
+}
+
+console.log("formatCompactPolicyHint: always-safe default-delegate summary:");
+{
+  const hint = formatCompactPolicyHint({ autoSpawn: true, capacity: slots });
+  check("is a non-empty string", typeof hint === "string" && hint.length > 0);
+  check("stays within the 260-char lazy budget", hint.length <= 260, hint.length);
+  check("delegates by default", /delegate by default/i.test(hint), hint);
+  check("asks for disjoint units in one batch", /disjoint/i.test(hint) && /batch/i.test(hint));
+  check("points at the tool description for the full rules", /tool description/i.test(hint));
+  check("does not advertise live capacity", !hint.includes("parallel slots configured"));
+  const optIn = formatCompactPolicyHint({ autoSpawn: false, capacity: slots });
+  check("opt-in variant stays truthful and within budget", optIn.length <= 260 && /opt-in/i.test(optIn), optIn);
+  check("opt-in variant never claims delegation is the default", !/default is to delegate/i.test(optIn));
 }
 
 console.log("analyzeDecomposability: genuine one-liners must NOT be flagged:");

@@ -141,6 +141,30 @@ console.log("formatSystemPolicyContent: the per-run decomposability note is opti
   }).includes("Decomposability check:"));
 }
 
+console.log("formatSystemPolicyContent: compact mode drops rules + roles but keeps the tiers:");
+{
+  const base = {
+    proactivePolicy: "POLICY BODY",
+    rules: ["- Rule one", "- Rule two"],
+    tierLines: ["- T2: ✓ ENABLED [x] (max 2 parallel)"],
+  };
+  const full = formatSystemPolicyContent(base);
+  const fullFalse = formatSystemPolicyContent({ ...base, compact: false });
+  check("absent and explicit false are byte-identical to the full output", full === fullFalse);
+  const compact = formatSystemPolicyContent({ ...base, compact: true });
+  check("compact keeps the wrapper", compact.startsWith("<trimegisto-policy>") && compact.trimEnd().endsWith("</trimegisto-policy>"));
+  check("compact keeps the intro", compact.includes("Injected by the Trimegisto extension"));
+  check("compact keeps the proactive policy", compact.includes("POLICY BODY"));
+  check("compact keeps the Tiers header and capacity lines", compact.includes("Tiers (roles and capacity") && compact.includes("(max 2 parallel)"));
+  check("compact keeps the spawn-only rule", compact.includes("Spawn only tiers marked"));
+  check("compact omits the 'Delegation rules:' header", !compact.includes("Delegation rules:"));
+  check("compact omits every rule", !compact.includes("- Rule one") && !compact.includes("- Rule two"));
+  check("compact omits the roles line", !compact.includes("Roles: active"));
+  check("compact is shorter than the full block", compact.length < full.length, `${compact.length} vs ${full.length}`);
+  check("the full block still carries the rules and roles", full.includes("Delegation rules:") && full.includes("- Rule one") && full.includes("Roles: active"));
+  check("compact still supports the per-run note", formatSystemPolicyContent({ ...base, compact: true, decomposabilityNote: "NOTE-TAIL" }).includes("NOTE-TAIL"));
+}
+
 console.log("formatDirectiveContent: per-turn block is framed, short, and only live state:");
 {
   const out = formatDirectiveContent({

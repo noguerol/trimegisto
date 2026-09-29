@@ -8,7 +8,7 @@ import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { formatTierStatusLine, formatDirectiveContent, formatSystemPolicyContent, formatUnavailableTiersMessage } from "./tier-status.ts";
-import { formatDelegationContract, analyzeDecomposability, formatDecomposabilityNote, totalSlots, formatCapacitySummary, type CapacitySlot } from "./delegation.ts";
+import { formatDelegationContract, formatCompactPolicyHint, analyzeDecomposability, formatDecomposabilityNote, totalSlots, formatCapacitySummary, type CapacitySlot } from "./delegation.ts";
 import { shouldRequireDelegation, isMutatingToolCall, formatDelegationGateReason, MAX_GATE_BLOCKS } from "./enforcement.ts";
 import { fileURLToPath } from "node:url";
 
@@ -130,7 +130,7 @@ const TierEnum = StringEnum(["active", "t1", "t2", "t3"] as const, {
 });
 
 const LaneEnum = StringEnum(["open", "gated", "closed"] as const, {
-  description: "Blast radius. 'closed' = irreversible (deploy, migrate, drop, force-push, credentials) => REFUSED, ask the user. 'gated' = wide but reversible (shared utils, schema, public API, config). 'open' = contained (default).",
+  description: "Blast radius: 'closed' = the tool refuses it and asks the user; 'gated' = wide but reversible; 'open' = contained (default).",
 });
 
 const TrimegistoTaskItem = Type.Object({
@@ -138,26 +138,26 @@ const TrimegistoTaskItem = Type.Object({
   task: Type.String({ description: "Task: one bounded unit, one input in, one output out." }),
   cwd: Type.Optional(Type.String({ description: "Agent cwd" })),
   needs: Type.Optional(Type.Array(Type.Number(), {
-    description: "1-based indices of tasks in THIS call whose output this one consumes. Declare only real deps; no edge = parallel. e.g. [1,2].",
+    description: "1-based indices of tasks in THIS call whose output this one consumes; no edge = parallel.",
   })),
   why: Type.Optional(Type.String({
-    description: "One line: which part of the goal this serves. Omit it and the task should not spawn.",
+    description: "One line: which part of the goal this task serves.",
   })),
   writes: Type.Optional(Type.Array(Type.String(), {
-    description: "Files this task writes. Same-file writers are serialised, not raced.",
+    description: "Files this task writes; same-file writers are serialised.",
   })),
   lane: Type.Optional(LaneEnum),
   verify: Type.Optional(Type.String({
-    description: "Shell command that must exit 0 for this task to count as verified. Run by Trimegisto AFTER the worker finishes (not by the worker, so it cannot fake the verdict). A failure is reported as VERIFY FAILED and the agent's 'done' is not trusted. Opt-in, per task.",
+    description: "Shell command that must exit 0; Trimegisto runs it AFTER the worker, so a wrong 'done' is VERIFY FAILED.",
   })),
   context: Type.Optional(StringEnum(["ledger", "fresh"] as const, {
-    description: "Ambient context the worker starts with. 'ledger' (default) injects other agents' notes/read files; 'fresh' suppresses it so the worker gets an independent attempt. Explicit `needs` edges are injected either way.",
+    description: "'ledger' (default) injects other agents' notes; 'fresh' gives an independent attempt.",
   })),
   diversity: Type.Optional(Type.Boolean({
-    description: "Mark a deliberate parallel attempt (same question, different angle). Exempt from duplicate merging so a fresh twin runs alongside its ledger-aware counterpart. Cap: 3 per batch.",
+    description: "Parallel attempt (same question, different angle), exempt from merging; max 3 per batch.",
   })),
   sequential: Type.Optional(Type.Boolean({
-    description: "Run this task alone, awaited, on the ACTIVE/main model, even if the active tier is disabled or has no free slot; the coordinator blocks until it returns so it never runs concurrently with the principal.",
+    description: "Run alone, awaited, on the ACTIVE/main model even if the tier is disabled or full.",
   })),
 });
 
@@ -1263,20 +1263,15 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
   function buildToolDescription(): string {
     return [
       "Launch parallel Trimegisto sub-agents.",
-      "Default to delegating: for any request that splits into 2+ independent, disjoint units, your first action is one batch carrying them all — do not work serially first. Work solo only for provably atomic requests (one question, one small single-file change, one non-parallel command).",
-      "Assign DISJOINT subtasks so no two agents redo the same work; scouts only for verification.",
-      RULE_GRAPH,
-      RULE_VERIFY,
-      RULE_FRESH,
-      RULE_SETTLE,
+      "Delegate by default: for a request that splits into 2+ disjoint units, send one `trimegisto` batch first; work solo only for a provably atomic request (one question, one small single-file change, one non-parallel command).",
+      "Assign DISJOINT subtasks; redundant scouts only for verification/consensus.",
+      "Per task: `why` (need served), `needs:[i]` real deps, `writes` known files; `verify` for checkable output; `diversity:true`+`context:\"fresh\"` for an independent twin. Deliver ONE reconciliation; never re-spawn or poll.",
       "Tiers now:",
       tierStatusLine("active", { includePaused: false }),
       tierStatusLine("t1", { includePaused: false }),
       tierStatusLine("t2", { includePaused: false }),
       tierStatusLine("t3", { includePaused: false }),
-      "Default active/t0 = main pi model; prefer several active agents for mass parallel work across DIFFERENT files/areas.",
-      "Roles: active=t0 mass worker; t3 mechanical; t2 reasoning; t1 planning only.",
-      "Only spawn ✓ ENABLED tiers; ✗ fails. IDs: t0a,t1a,t2b,t3c. Disabled tool returns error.",
+      "IDs: t0a,t1a,t2b,t3c. Roles: active=t0 mass worker; t3 mechanical; t2 reasoning; t1 planning only. Spawn only ✓ ENABLED tiers.",
     ].join("\n");
   }
   // ── Register the main Trimegisto tool ──────────────────
@@ -2336,14 +2331,25 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
   }
 
   function buildSystemPolicy(event: any): string {
-    const decomposabilityNote = formatDecomposabilityNote(
-      analyzeDecomposability(typeof event?.prompt === "string" ? event.prompt : ""),
-    );
+    // Lazy full policy. The compact block (wrapper + short hint + tier lines)
+    // is the stable prefix sent every ordinary turn, so the provider cache
+    // prefix survives; the full contract + rules + note are only paid on a
+    // decomposable turn. autoSpawn=false keeps the old opt-in policy verbatim.
+    const full = !config.autoSpawn || turnDelegationRequired;
+    const decomposabilityNote = full
+      ? formatDecomposabilityNote(
+          analyzeDecomposability(typeof event?.prompt === "string" ? event.prompt : ""),
+        )
+      : "";
+    const capacity = computeCapacitySlots();
     return formatSystemPolicyContent({
-      proactivePolicy: formatDelegationContract({ autoSpawn: config.autoSpawn, capacity: computeCapacitySlots() }),
+      proactivePolicy: full
+        ? formatDelegationContract({ autoSpawn: config.autoSpawn, capacity })
+        : formatCompactPolicyHint({ autoSpawn: config.autoSpawn, capacity }),
       rules: COORDINATOR_RULES,
       tierLines: (["active", "t1", "t2", "t3"] as const).map(t => tierStatusLine(t, { includePaused: false })),
       ...(decomposabilityNote ? { decomposabilityNote } : {}),
+      compact: !full,
     });
   }
 
