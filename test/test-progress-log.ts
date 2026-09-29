@@ -15,7 +15,7 @@
  */
 
 import { Container, TuiMainScreen } from "@earendil-works/pi-tui";
-import { ProgressLogBuffer, MAX_DEFERRED_PROGRESS } from "./src/progress-log.ts";
+import { ProgressLogBuffer, MAX_DEFERRED_PROGRESS } from "../src/progress-log.ts";
 
 let passed = 0;
 let failed = 0;

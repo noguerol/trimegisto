@@ -19,7 +19,7 @@ import {
   agentControlDir,
   condenseForCompaction,
   CONTROL_REQUEST_TTL_MS,
-} from "./src/agent-control.ts";
+} from "../src/agent-control.ts";
 
 let passed = 0, failed = 0;
 function check(name: string, cond: boolean, detail?: unknown): void {

@@ -8,7 +8,7 @@
  * sees, so every render path can call it.
  */
 
-import { displayTaskOf } from "./src/task-display.ts";
+import { displayTaskOf } from "../src/task-display.ts";
 
 let passed = 0;
 let failed = 0;

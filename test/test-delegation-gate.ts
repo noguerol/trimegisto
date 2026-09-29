@@ -62,7 +62,7 @@ function makeCtx() {
   } as any;
 }
 
-const mod: any = await import("./src/index.ts");
+const mod: any = await import("../src/index.ts");
 const dir = withConfig({ enabled: true, autoSpawn: true, active: { maxParallel: 4 } });
 
 async function boot(withWorkerEnv: boolean) {

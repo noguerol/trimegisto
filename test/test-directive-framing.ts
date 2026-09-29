@@ -25,7 +25,7 @@
  *   3. volume    — an idle turn injects nothing; a busy turn stays small
  */
 
-import { EXTENSION_CONTEXT_NOTICE } from "./src/tier-status.ts";
+import { EXTENSION_CONTEXT_NOTICE } from "../src/tier-status.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -78,7 +78,7 @@ const ctxStub: any = {
 async function loadConvertToLlm(): Promise<((m: any[]) => any[]) | null> {
   const here = new URL(".", import.meta.url);
   const candidates = [
-    "./node_modules/@earendil-works/pi-coding-agent/dist/core/messages.js",
+    "../node_modules/@earendil-works/pi-coding-agent/dist/core/messages.js",
     "../pi-coding-agent/dist/core/messages.js",
   ];
   for (const rel of candidates) {
@@ -132,7 +132,7 @@ async function main() {
   delete process.env.TRIMEGISTO_AGENT_ID;
 
   const { pi, handlers } = makeFakePi();
-  const mod = await import("./src/index.ts");
+  const mod = await import("../src/index.ts");
   const factory = (mod as any).default;
   if (typeof factory !== "function") {
     console.log("  \u2717 extension factory missing"); failed++; return;
@@ -215,7 +215,7 @@ async function main() {
   {
     // Drive the busy path through the same formatter the handler uses, then
     // push it through pi's real conversion — the exact path that broke.
-    const { formatDirectiveContent } = await import("./src/tier-status.ts");
+    const { formatDirectiveContent } = await import("../src/tier-status.ts");
     const busy = formatDirectiveContent({
       activeAgentCount: 3,
       activeAgentsFormatted: "- t0a [running]: audit config menu\n- t0b [running]: read commands.ts\n- t2c [running]: review hints renderer",
@@ -240,7 +240,7 @@ async function main() {
   {
     // Two consecutive idle turns already proved the no-message path; here we
     // assert the guard is identity-based, so a real change still gets through.
-    const { formatDirectiveContent } = await import("./src/tier-status.ts");
+    const { formatDirectiveContent } = await import("../src/tier-status.ts");
     const a = formatDirectiveContent({ activeAgentCount: 1, activeAgentsFormatted: "- t0a [running]: x" });
     const b = formatDirectiveContent({ activeAgentCount: 1, activeAgentsFormatted: "- t0a [running]: x" });
     check("identical state → identical string (=== dedupe is sound)", a === b);

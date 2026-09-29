@@ -20,7 +20,7 @@ import {
   isMutatingToolCall,
   formatDelegationGateReason,
   formatGateStatus,
-} from "./src/enforcement.ts";
+} from "../src/enforcement.ts";
 
 let passed = 0;
 let failed = 0;

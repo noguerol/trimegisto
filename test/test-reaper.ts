@@ -20,9 +20,9 @@ import {
   reapFinishedAgents,
   removeAgent,
   getAgents,
-} from "./src/agent-manager.ts";
-import { sanitizeReaperConfig, getDefaultConfig } from "./src/config.ts";
-import { REAPER_DEFAULTS } from "./src/types.ts";
+} from "../src/agent-manager.ts";
+import { sanitizeReaperConfig, getDefaultConfig } from "../src/config.ts";
+import { REAPER_DEFAULTS } from "../src/types.ts";
 
 let passed = 0;
 let failed = 0;

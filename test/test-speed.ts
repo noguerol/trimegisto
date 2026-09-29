@@ -1,6 +1,6 @@
 // Functional tests for the prefill/decode speed tracker.
 // Run: node --experimental-strip-types test-speed.ts
-import { SpeedTracker, MAIN_TARGET } from "./src/speed.ts";
+import { SpeedTracker, MAIN_TARGET } from "../src/speed.ts";
 
 let passed = 0, failed = 0;
 function check(name: string, cond: boolean, extra = "") {

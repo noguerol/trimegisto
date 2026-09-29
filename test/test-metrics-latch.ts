@@ -8,7 +8,7 @@
  * grace window without changing the update frequency.
  */
 
-import { ValueLatch, METRICS_HOLD_MS } from "./src/metrics-latch.ts";
+import { ValueLatch, METRICS_HOLD_MS } from "../src/metrics-latch.ts";
 
 let passed = 0;
 let failed = 0;

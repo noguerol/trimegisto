@@ -139,14 +139,14 @@ Three opt-in additions, all zero-shot and deterministic (no training, no hidden 
 
 ## How it hangs together
 
-Sub-agents talk to the main extension through file-based IPC under a per-instance directory, so several pi processes running Trimegisto at once never interfere. Orphaned directories clean themselves up at startup. Beyond that, read the source or ask the agent — the behaviour is documented by ~900 regression checks that run with `node --experimental-strip-types test-*.ts`.
+Sub-agents talk to the main extension through file-based IPC under a per-instance directory, so several pi processes running Trimegisto at once never interfere. Orphaned directories clean themselves up at startup. Beyond that, read the source or ask the agent — the behaviour is documented by ~900 regression checks that run with `node --experimental-strip-types test/test-*.ts`.
 
 ## Development
 
 ```bash
 git clone https://github.com/noguerol/trimegisto && cd trimegisto
 pi install .
-node --experimental-strip-types test-loop.ts      # …each suite runs standalone; no build step
+node --experimental-strip-types test/test-loop.ts      # …each suite runs standalone; no build step
 ```
 
 ## License

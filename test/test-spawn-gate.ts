@@ -69,7 +69,7 @@ function makeCtx(notifications: Array<{ message: string; level?: string }>) {
 
 const dir1 = withConfig({ active: { maxParallel: 1 }, enabled: true, autoSpawn: true });
 const { pi, handlers, notifications } = makeFakePi();
-const mod: any = await import("./src/index.ts");
+const mod: any = await import("../src/index.ts");
 mod.default(pi);
 
 const sessionStart = handlers.get("session_start");
@@ -80,7 +80,7 @@ check("the extension registers an input handler", !!input && input.length > 0);
 // runtime config are both refreshed there).
 await sessionStart![sessionStart!.length - 1]({}, makeCtx(notifications));
 
-const { getAgents } = await import("./src/agent-manager.ts");
+const { getAgents } = await import("../src/agent-manager.ts");
 check("no agents are registered before the manual spawn", getAgents().size === 0, getAgents().size);
 
 const res: any = await input![input!.length - 1]({ text: "@t0 rewrite the deployment script" }, makeCtx(notifications));

@@ -9,7 +9,7 @@
  * of context and could not compact".
  */
 
-import { shouldIdleKill, DEFAULT_COMPACTION_GRACE_MS } from "./src/agent-manager.ts";
+import { shouldIdleKill, DEFAULT_COMPACTION_GRACE_MS } from "../src/agent-manager.ts";
 
 let passed = 0, failed = 0;
 function check(name: string, cond: boolean, detail?: unknown): void {

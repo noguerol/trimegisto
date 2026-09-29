@@ -17,10 +17,10 @@ import {
   CLOSED_LANE_KEYWORDS,
   GATED_LANE_KEYWORDS,
   GOAL_STOPWORDS,
-} from "./src/plan-graph.ts";
-import type { PlanTaskInput, WaveState } from "./src/plan-graph.ts";
-import { registerTask, forgetTask, isDuplicateTask } from "./src/task-dedup.ts";
-import { haltAll, isHalted, clearHalted } from "./src/agent-manager.ts";
+} from "../src/plan-graph.ts";
+import type { PlanTaskInput, WaveState } from "../src/plan-graph.ts";
+import { registerTask, forgetTask, isDuplicateTask } from "../src/task-dedup.ts";
+import { haltAll, isHalted, clearHalted } from "../src/agent-manager.ts";
 
 let passed = 0, failed = 0;
 function check(name: string, cond: boolean, detail?: unknown): void {

@@ -23,7 +23,7 @@ import {
   formatCompactPolicyHint,
   analyzeDecomposability,
   formatDecomposabilityNote,
-} from "./src/delegation.ts";
+} from "../src/delegation.ts";
 
 let passed = 0;
 let failed = 0;

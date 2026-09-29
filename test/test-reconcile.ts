@@ -20,8 +20,8 @@ import {
   isDoneStatus,
   isFailedStatus,
   isPendingStatus,
-} from "./src/reconcile.ts";
-import type { ReconResult } from "./src/reconcile.ts";
+} from "../src/reconcile.ts";
+import type { ReconResult } from "../src/reconcile.ts";
 
 let passed = 0;
 let failed = 0;

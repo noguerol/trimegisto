@@ -14,8 +14,8 @@
  *    number of diversity nodes per batch prevents it becoming a dedup bypass
  */
 
-import { planBatch } from "./src/plan-graph.ts";
-import type { PlanTaskInput } from "./src/plan-graph.ts";
+import { planBatch } from "../src/plan-graph.ts";
+import type { PlanTaskInput } from "../src/plan-graph.ts";
 
 let passed = 0, failed = 0;
 function check(name: string, cond: boolean, detail?: unknown): void {

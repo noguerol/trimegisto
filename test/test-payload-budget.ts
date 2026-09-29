@@ -38,7 +38,7 @@ async function main() {
     appendEntry: noop,
     sendMessage: noop,
   };
-  const mod = await import("./src/index.ts");
+  const mod = await import("../src/index.ts");
   const factory = (mod as any).default;
   if (typeof factory !== "function") {
     console.log("  \u2717 extension factory missing");

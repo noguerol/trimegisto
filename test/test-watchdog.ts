@@ -13,8 +13,8 @@ import {
   clampWatchdogSeconds,
   MAX_WATCHDOG_SECONDS,
   WATCHDOG_DEFAULTS,
-} from "./src/config.ts";
-import { setWatchdogTimeouts, getWatchdogTimeouts } from "./src/agent-manager.ts";
+} from "../src/config.ts";
+import { setWatchdogTimeouts, getWatchdogTimeouts } from "../src/agent-manager.ts";
 
 let passed = 0;
 let failed = 0;
@@ -164,7 +164,7 @@ console.log("Test 7 (persistence round-trip with watchdog):");
   const prev = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = tmp;
   try {
-    const { saveConfig, loadConfig } = await import("./src/persistence.ts");
+    const { saveConfig, loadConfig } = await import("../src/persistence.ts");
 
     const cfg = getDefaultConfig();
     cfg.watchdog = { firstResponseSeconds: 45, idleSeconds: 0, maxRuntimeSeconds: 900 };

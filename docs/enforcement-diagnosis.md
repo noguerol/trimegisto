@@ -85,10 +85,10 @@ subtracts the main session, so with `active.maxParallel = 1` the pool is **0** (
 
 ```bash
 cd /home/j/repos/trimegisto
-node --experimental-strip-types test-delegation.ts        # contract wording + detector
-node --experimental-strip-types test-spawn-gate.ts        # @t0 refusal when t0=1
-node --experimental-strip-types test-spawn-capacity.ts    # effectiveSpawnCapacity edges
-node --experimental-strip-types test-sequential-active.ts # sequential bypass of enabled/capacity
+node --experimental-strip-types test/test-delegation.ts        # contract wording + detector
+node --experimental-strip-types test/test-spawn-gate.ts        # @t0 refusal when t0=1
+node --experimental-strip-types test/test-spawn-capacity.ts    # effectiveSpawnCapacity edges
+node --experimental-strip-types test/test-sequential-active.ts # sequential bypass of enabled/capacity
 ```
 
 The new gate test (`test-delegation-gate.ts`, wired by #63) should drive the real extension factory the

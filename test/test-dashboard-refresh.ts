@@ -12,7 +12,7 @@
  * when the ticker may drive a repaint.
  */
 
-import { shouldDriveDashboardRender } from "./src/tui-refresh.ts";
+import { shouldDriveDashboardRender } from "../src/tui-refresh.ts";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 let passed = 0;

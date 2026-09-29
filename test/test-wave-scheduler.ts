@@ -22,7 +22,7 @@
  * running against sabotaged copies of the module).
  */
 
-import { advanceWaves, isAdvancing, MAX_WAVE_ITERATIONS, type WaveRunDeps, type WaveRunState } from "./src/wave-scheduler.ts";
+import { advanceWaves, isAdvancing, MAX_WAVE_ITERATIONS, type WaveRunDeps, type WaveRunState } from "../src/wave-scheduler.ts";
 
 let passed = 0, failed = 0;
 function check(name: string, cond: boolean, detail?: unknown): void {

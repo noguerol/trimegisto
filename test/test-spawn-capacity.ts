@@ -12,7 +12,7 @@
  * regression here would silently over- or under-spawn the whole swarm.
  */
 
-import { effectiveSpawnCapacity, canSpawnPooled, canSpawn, tierModelCandidates, formatSpawnCapacityRefusal } from "./src/agent-manager.ts";
+import { effectiveSpawnCapacity, canSpawnPooled, canSpawn, tierModelCandidates, formatSpawnCapacityRefusal } from "../src/agent-manager.ts";
 
 let passed = 0;
 let failed = 0;

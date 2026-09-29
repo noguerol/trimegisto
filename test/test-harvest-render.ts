@@ -47,7 +47,7 @@ const pi: any = {
   setActiveTools: noop, events: { on: noop, emit: noop },
 };
 
-const mod: any = await import("./src/index.ts");
+const mod: any = await import("../src/index.ts");
 mod.default(pi);
 
 const harvest = tools.find(t => t.name === "trimegisto_harvest");

@@ -116,8 +116,8 @@ weight or requiring ≥2 files for the hard block. **Any change here must keep `
 | 9 | `sequential:true` launch succeeds | gate cleared | P1 |
 | 10 | `spawnOnlyOnActive` + `active.maxParallel=1` | no deadlock: atomic/sequential path | P0 |
 
-Commands: `node --experimental-strip-types test-delegation-gate.ts` (new, #63), plus the existing
-`test-delegation.ts`, `test-spawn-gate.ts`, `test-spawn-capacity.ts`, `test-sequential-active.ts`.
+Commands: `node --experimental-strip-types test/test-delegation-gate.ts` (new, #63), plus the existing
+`test/test-delegation.ts`, `test/test-spawn-gate.ts`, `test/test-spawn-capacity.ts`, `test/test-sequential-active.ts`.
 
 ---
 

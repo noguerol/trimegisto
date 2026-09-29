@@ -17,7 +17,7 @@ import {
   sanitizePayload,
   redactSecrets,
   diagnosticsEnabledFromEnv,
-} from "./src/diagnostics.ts";
+} from "../src/diagnostics.ts";
 
 let passed = 0, failed = 0;
 function check(name: string, cond: boolean, detail?: unknown): void {

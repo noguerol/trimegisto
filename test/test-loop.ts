@@ -5,12 +5,12 @@
 // (redundancy) detection.
 //
 // Run: node --experimental-strip-types test-loop.ts
-import { LoopSupervisor, DEFAULT_LOOP_CONFIG } from "./src/loop-supervisor.ts";
-import { sanitizeLoopSupervisorConfig, applyGuardConfig } from "./src/config.ts";
-import { formatGuardTurnLimit } from "./src/commands.ts";
-import { foldDedupeFlagIntoGuard } from "./src/config.ts";
-import { setAgentStatus, agentIdleMs } from "./src/agent-manager.ts";
-import type { AgentInstance } from "./src/types.ts";
+import { LoopSupervisor, DEFAULT_LOOP_CONFIG } from "../src/loop-supervisor.ts";
+import { sanitizeLoopSupervisorConfig, applyGuardConfig } from "../src/config.ts";
+import { formatGuardTurnLimit } from "../src/commands.ts";
+import { foldDedupeFlagIntoGuard } from "../src/config.ts";
+import { setAgentStatus, agentIdleMs } from "../src/agent-manager.ts";
+import type { AgentInstance } from "../src/types.ts";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -368,7 +368,7 @@ console.log("Guard push folds the top-level dedupe flag:");
 console.log("Guard choke point (static invariant):");
 {
   const here = path.dirname(fileURLToPath(import.meta.url));
-  const srcDir = path.join(here, "src");
+  const srcDir = path.join(here, "..", "src");
   const violations: string[] = [];
   let chokeHits = 0;
   for (const f of fs.readdirSync(srcDir)) {

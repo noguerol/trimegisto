@@ -29,8 +29,8 @@ import {
   MAX_VERIFY_TIMEOUT_MS,
   MAX_VERIFY_OUTPUT_CHARS,
   type VerificationResult,
-} from "./src/verify.ts";
-import { reconcileBatch, distillConclusion, isVerifyFailed } from "./src/reconcile.ts";
+} from "../src/verify.ts";
+import { reconcileBatch, distillConclusion, isVerifyFailed } from "../src/reconcile.ts";
 
 let passed = 0, failed = 0;
 function check(name: string, cond: boolean, detail?: unknown): void {

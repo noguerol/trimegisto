@@ -19,11 +19,11 @@ import {
   sanitizeLoopSupervisorConfig,
   formatModelLabel,
   buildTierConfig,
-} from "./src/config.ts";
-import { runConfigUI } from "./src/config-ui.ts";
-import { createDashboardWidget } from "./src/dashboard.ts";
-import { getAgents } from "./src/agent-manager.ts";
-import type { AgentInstance } from "./src/types.ts";
+} from "../src/config.ts";
+import { runConfigUI } from "../src/config-ui.ts";
+import { createDashboardWidget } from "../src/dashboard.ts";
+import { getAgents } from "../src/agent-manager.ts";
+import type { AgentInstance } from "../src/types.ts";
 
 let passed = 0;
 let failed = 0;
@@ -244,7 +244,7 @@ console.log("Test 9 (load + migrate real persisted v2 config):");
       t2: { compactionThreshold: 70 }, // explicit non-default
       t3: { compactionThreshold: 85 },
     }));
-    const { loadConfig } = await import("./src/persistence.ts");
+    const { loadConfig } = await import("../src/persistence.ts");
     const saved = loadConfig();
     const migrated = migrateSavedCompaction(saved as any, saved?._schemaVersion);
     check("loaded schema 2", saved?._schemaVersion === 2, saved?._schemaVersion);
@@ -252,7 +252,7 @@ console.log("Test 9 (load + migrate real persisted v2 config):");
     check("explicit t2=70 preserved (not in migration)", migrated.t2 === undefined, migrated.t2);
 
     // Simulate what index.ts does after migrating: persist once -> schema bumps.
-    const { saveConfig } = await import("./src/persistence.ts");
+    const { saveConfig } = await import("../src/persistence.ts");
     const cfg = getDefaultConfig();
     saveConfig(cfg);
     const afterSave = loadConfig();
@@ -493,7 +493,7 @@ console.log("Persistence round-trip: saveConfig actually writes dashboardMode an
   process.env.HOME = tmpHome;
   process.env.USERPROFILE = tmpHome;
   try {
-    const { saveConfig, loadConfig } = await import("./src/persistence.ts");
+    const { saveConfig, loadConfig } = await import("../src/persistence.ts");
     const base = getDefaultConfig();
     base.dashboardMode = "widget";
     base.dashboardVisible = true;

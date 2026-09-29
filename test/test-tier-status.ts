@@ -18,7 +18,7 @@ import {
   frameExtensionContext,
   EXTENSION_CONTEXT_NOTICE,
   formatUnavailableTiersMessage,
-} from "./src/tier-status.ts";
+} from "../src/tier-status.ts";
 
 let passed = 0;
 let failed = 0;

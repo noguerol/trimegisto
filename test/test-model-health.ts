@@ -15,7 +15,7 @@ import {
   modelKey,
   sanitizeModelHealthConfig,
   MODEL_HEALTH_DEFAULTS,
-} from "./src/model-health.ts";
+} from "../src/model-health.ts";
 import {
   setModelHealth,
   selectAvailableModel,
@@ -26,12 +26,12 @@ import {
   processSpawnRequests,
   getAgents,
   setInstanceDir,
-} from "./src/agent-manager.ts";
-import { writeSpawnRequest } from "./src/ipc.ts";
+} from "../src/agent-manager.ts";
+import { writeSpawnRequest } from "../src/ipc.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { TierConfig } from "./src/types.ts";
+import type { TierConfig } from "../src/types.ts";
 
 let passed = 0;
 let failed = 0;

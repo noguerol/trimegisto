@@ -81,7 +81,7 @@ const dir1 = withConfig({
   autoSpawn: true,
 });
 const { pi, handlers, tools, notifications } = makeFakePi();
-const mod: any = await import("./src/index.ts");
+const mod: any = await import("../src/index.ts");
 mod.default(pi);
 
 const sessionStart = handlers.get("session_start");
@@ -96,7 +96,7 @@ check("the extension registers the trimegisto tool", !!tool);
 const seqSchema = tool?.parameters?.properties?.tasks?.items?.properties?.sequential;
 check("the tool schema exposes the optional sequential parameter", !!seqSchema && seqSchema.type === "boolean", seqSchema);
 
-const { getAgents } = await import("./src/agent-manager.ts");
+const { getAgents } = await import("../src/agent-manager.ts");
 
 // Make sure no real subprocess can start: getPiInvocation() falls back to the
 // `pi` binary when process.argv[1] is not an existing script, and with an

@@ -28,8 +28,8 @@ import {
   pruneLedgers,
   DEFAULT_LEDGER_MAX_AGE_MS,
   type LedgerState,
-} from "./src/ledger.ts";
-import { readNotesSnapshot, publishNote } from "./src/shared-context.ts";
+} from "../src/ledger.ts";
+import { readNotesSnapshot, publishNote } from "../src/shared-context.ts";
 
 let passed = 0, failed = 0;
 function check(name: string, cond: boolean, detail?: unknown): void {

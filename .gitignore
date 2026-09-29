@@ -30,3 +30,11 @@ plan_*.md
 # package-lock: the package has no installable deps (peer-only, optional)
 # and CI publishes without npm install; the lock would be dead weight.
 package-lock.json
+
+# Build/test artifacts and local env files
+coverage/
+.nyc_output/
+*.tsbuildinfo
+.env
+.env.*
+probe-*.ts

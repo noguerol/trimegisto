@@ -17,7 +17,7 @@ import {
   messageText,
   MAX_PROGRESS_MESSAGES,
   type PrunableMessage,
-} from "./src/context-prune.ts";
+} from "../src/context-prune.ts";
 
 let passed = 0;
 let failed = 0;
