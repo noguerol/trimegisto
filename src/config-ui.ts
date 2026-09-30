@@ -45,6 +45,8 @@ export interface ConfigUIRuntime {
   ctxRef: any;
   updateDashboard: () => void | Promise<void>;
   haltAll: () => number;
+  /** Lift the sticky halt flag (the inverse of the OFF branch's haltAll). */
+  clearHalted?: () => void;
   saveConfig: () => void;
   registerMainTool: () => void;
   syncLoopSupervisor?: () => void;
@@ -169,6 +171,11 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
         config.enabled = value === "ON";
         rt.registerMainTool();
         if (config.enabled) {
+          // The OFF branch calls haltAll(), which sets the STICKY halt flag.
+          // Turning the master switch back ON is the user starting work again,
+          // so lift it here too; otherwise the tool path settles every batch as
+          // "not launched" (isHalted() is checked before launchWave).
+          rt.clearHalted?.();
           void rt.updateDashboard();
           try { rt.ctxRef?.ui.setStatus("trimegisto", formatTmgStatus(true)); } catch { /* stale ctx */ }
         } else {

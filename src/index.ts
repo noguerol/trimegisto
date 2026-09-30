@@ -1947,6 +1947,7 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
         ctxRef,
         updateDashboard,
         haltAll,
+        clearHalted,
         saveConfig,
         registerMainTool,
         syncLoopSupervisor: () => {
