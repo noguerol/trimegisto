@@ -29,6 +29,7 @@ import {
   launchAgent,
   haltAll,
   isHalted,
+  clearHalted,
   killAgent,
   getAgent,
   getAgentCounts,
@@ -1605,6 +1606,13 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
         ledger: ledgerState,
         ledgerDir: batchLedgerDir,
       };
+      // A brand-new batch is an explicit launch: clear any sticky halt left over
+      // from a previous `/tmg halt` (or a disable/enable cycle). Without this the
+      // scheduler's `isHalted()` check settles wave 0 before `launchWave` runs,
+      // and `clearHalted()` (only called by `launchAgent`) stays unreachable.
+      // Halting a batch that is legitimately queued for capacity still works:
+      // the flag is set after this point and the deferred wave settles then.
+      clearHalted();
       pendingBatches.push(batch);
       advanceBatch(batch);
 
@@ -1889,6 +1897,12 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
     setEnabled: (v: boolean) => {
       config.enabled = v;
       if (v) {
+        // `/tmg disable` follows with haltAll(), which sets the STICKY halt flag.
+        // Enabling again is the user starting work, so the halt must be lifted
+        // here: the scheduler checks isHalted() BEFORE launchWave, so the flag
+        // would otherwise never be cleared (clearHalted only runs inside
+        // launchAgent) and every batch would settle as "not launched".
+        clearHalted();
         updateDashboard();
         try { if (ctxRef) ctxRef.ui.setStatus("trimegisto", formatTmgStatus(true)); } catch {}
       } else {
