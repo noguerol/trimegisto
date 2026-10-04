@@ -23,6 +23,18 @@
 
 import { spawn } from "node:child_process";
 
+/** On Windows, `shell: true` means cmd.exe; route verify through Git Bash so
+ * POSIX verify commands (test -f, /c/ paths, &&) work as the coordinator writes them.
+ * Override the shell path with TRIMEGISTO_VERIFY_SHELL. */
+function verifySpawn(command: string, cwd: string, env: NodeJS.ProcessEnv) {
+  if (process.platform !== "win32") {
+    return spawn(command, { cwd, shell: true, stdio: ["ignore", "pipe", "pipe"] as const, env });
+  }
+  const bash = process.env.TRIMEGISTO_VERIFY_SHELL
+    || "C:/Program Files/Git/bin/bash.exe";
+  return spawn(bash, ["-c", command], { cwd, stdio: ["ignore", "pipe", "pipe"] as const, env });
+}
+
 /**
  * Light, prefix-only redaction for verify output. Deliberately NOT the
  * diagnostics redactor: that one treats any digit+letter token as a credential,
@@ -184,12 +196,11 @@ export function runVerification(
 
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(command, {
-        cwd: cwd && typeof cwd === "string" ? cwd : process.cwd(),
-        shell: true,
-        stdio: ["ignore", "pipe", "pipe"],
+      child = verifySpawn(
+        command,
+        cwd && typeof cwd === "string" ? cwd : process.cwd(),
         env,
-      });
+      );
     } catch (err) {
       resolve({ ...base, error: errMessage(err), durationMs: Math.max(0, Date.now() - startedAt) });
       return;
