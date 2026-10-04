@@ -936,7 +936,9 @@ export default function (pi: ExtensionAPI) {
   async function updateDashboard(): Promise<void> {
     try {
       if (!ctxRef?.hasUI) return;
-      ctxRef.ui.setFooter(undefined);
+      // do NOT setFooter(undefined) here: the footer slot is shared with other
+      // extensions (e.g. @narumitw/pi-statusline) and this runs every ~500ms
+      // tick, which would stomp their footer. (zackchiutw/statusline-footer-fix)
       if (dashboardMode === "off") {
         ctxRef.ui.setWidget("trimegisto", undefined);
         ctxRef.ui.setWidget("trimegisto-compact", undefined);
