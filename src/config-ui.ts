@@ -181,7 +181,7 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
         } else {
           rt.haltAll();
           try {
-            rt.ctxRef?.ui.setFooter(undefined);
+            // ponytail: removed setFooter(undefined) — stomps @narumitw/pi-statusline footer (zackchiutw/statusline-footer-fix); trimegisto never sets a footer itself.
             rt.ctxRef?.ui.setWidget("trimegisto", undefined);
             rt.ctxRef?.ui.setWidget("trimegisto-compact", undefined);
             rt.ctxRef?.ui.setStatus("trimegisto", formatTmgStatus(false));
