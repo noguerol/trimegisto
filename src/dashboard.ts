@@ -18,6 +18,7 @@ import {
 import { formatTierLabel, formatModelLabel } from "./config.ts";
 import { speed, MAIN_TARGET, type SpeedSnapshot } from "./speed.ts";
 import { TMG_SHORT, formatTmgStatus } from "./branding.ts";
+import { pickAgents, statusGlyph } from "./agent-list.ts";
 import { displayTaskOf } from "./task-display.ts";
 import { ValueLatch, METRICS_HOLD_MS } from "./metrics-latch.ts";
 
@@ -152,17 +153,6 @@ function statusIcon(status: string): string {
   }
 }
 
-function countDisplay(counts: AgentCounts, tier: "active" | "t1" | "t2" | "t3"): string {
-  const t = counts[tier];
-  const parts: string[] = [];
-  if (t.running > 0) parts.push(`${t.running}r`);
-  if (t.waiting > 0) parts.push(`${t.waiting}w`);
-  if (t.done > 0) parts.push(`${t.done}✓`);
-  if (t.error > 0) parts.push(`${t.error}✗`);
-  if (t.killed > 0) parts.push(`${t.killed}⊘`);
-  return parts.length > 0 ? parts.join(" ") : "—";
-}
-
 /**
  * Build a widget (above editor) showing detailed agent list.
  */
@@ -294,7 +284,7 @@ export function createDashboardWidget(ctx: ExtensionContext) {
 
 /**
  * Build a compact widget (below editor) showing aggregate metrics first,
- * then tier breakdown.
+ * then the live agents by their REAL id (the name you can mention).
  */
 export function createCompactWidget(ctx: ExtensionContext) {
   return (tui: any, theme: any) => {
@@ -334,9 +324,23 @@ export function createCompactWidget(ctx: ExtensionContext) {
 
         const lines: string[] = [];
 
+        // Agent ids once, used by both branches: a done agent can still be
+        // mentioned (`@t2b`) to read its last answer, so the idle line names
+        // them too instead of a bare count.
+        const { shown, hidden } = pickAgents(
+          Array.from(getAgents().values()).map(a => ({ id: a.id, status: a.status, startedAt: a.startedAt })),
+          6,
+        );
+        const chipList = (): string => {
+          const parts = shown.map(a => theme.fg(statusDot(a.status), `${statusGlyph(a.status)}${a.id}`));
+          if (hidden > 0) parts.push(theme.fg("dim", `+${hidden}`));
+          return parts.join(" ");
+        };
+
         if (active === 0 && done > 0) {
           // Idle: show session totals
           let line = theme.fg("dim", formatTmgStatus(true, `${done}✓`));
+          if (shown.length > 0) line += " · " + chipList();
           if (session.totalOutput > 0) {
             line += ` · 📥${fmtTokens(session.totalInput)} 📤${fmtTokens(session.totalOutput)}`;
           }
@@ -373,22 +377,9 @@ export function createCompactWidget(ctx: ExtensionContext) {
         }
         line += aggParts.join(" ");
 
-        // Tier breakdown
-        const tierParts: string[] = [];
-        if (counts.active.total > 0 || counts.active.running > 0) {
-          tierParts.push(theme.fg("text", `T0${countDisplay(counts, "active")}`));
-        }
-        if (counts.t1.total > 0 || counts.t1.running > 0) {
-          tierParts.push(theme.fg("accent", `T1${countDisplay(counts, "t1")}`));
-        }
-        if (counts.t2.total > 0) {
-          tierParts.push(theme.fg("warning", `T2${countDisplay(counts, "t2")}`));
-        }
-        if (counts.t3.total > 0) {
-          tierParts.push(theme.fg("success", `T3${countDisplay(counts, "t3")}`));
-        }
-        if (tierParts.length > 0) {
-          line += " · " + tierParts.join(" ");
+        // Agent list with the REAL ids (see src/agent-list.ts).
+        if (shown.length > 0) {
+          line += " · " + chipList();
         }
 
         if (done > 0) {

@@ -49,8 +49,9 @@ You need a working pi with at least one usable model. Sub-agents inherit your pr
 ```
 /tmg config                # pick a model per tier, tune the knobs
 /t2 fix the failing test in src/parser.ts
+@t2b                                          # mention: status, model, tokens, task
 @t2b now also cover the empty-input case      # steer a running agent in place
-@t2b halt                                     # stop only that agent
+@t2b kill                                     # stop only that agent
 @t2b compact                                  # free its context now
 "Review the diff, run the tests, summarize risks."   # or just ask — if
                                                  # auto-spawn is on, the main
@@ -72,7 +73,7 @@ Results land in the chat as agents finish, with per-agent logs, tokens and cost,
 
 **Failure** — a per-model circuit breaker: two model-level failures in a row pause that model (60 s, doubling to 600 s) so a dead provider can't trigger a spawn storm; it clears on a success, a model change, or `/tmg reset-models`. And when a provider answers `400`, a post-mortem window captures the next requests for 10 minutes — secrets always redacted — so you can finally see what killed the coordinator.
 
-**UI** — dashboard in three modes (compact / full / off): live prefill and decode speeds per agent measured from the token stream, model used per worker, timers that freeze honestly when an agent dies.
+**UI** — dashboard in three modes (compact / full / off): live prefill and decode speeds per agent measured from the token stream, model used per worker, timers that freeze honestly when an agent dies. The compact widget lists agents by their **id** (`◌t2a ◌t2b ✓t3a`), so the name you type after `@` is always on screen.
 
 **What the coordinator reads** — split so it never competes with your own message. The stable policy (delegation preference, the disjoint/verify/fresh rules, tier roles and capacity) is appended to the **system prompt**, where it does not crowd the conversation and keeps the provider cache warm because it carries no live counters. The **user channel** carries only live state — running agents, and any tier under a circuit breaker — wrapped in a `<trimegisto-context>` block that states plainly that it was injected by the extension, is not a new request, and can be ignored when the request needs no delegation. Nothing running and nothing changed means nothing is injected at all.
 
@@ -129,9 +130,10 @@ Three opt-in additions, all zero-shot and deterministic (no training, no hidden 
 | | |
 |---|---|
 | `/t0 … /t3 <task>` | spawn an agent in that tier |
-| `/t2b <ins>` or `@t2b <ins>` | steer a running agent **in place** (the instruction is injected into the live run; nothing is killed or respawned) |
-| `@t2b halt` · `@t2b compact` | stop only that agent · free that agent's context (since a sub-agent is a one-shot process, this restarts it with a bounded progress digest) |
-| `/tmg launch · tell · kill · halt · list · switch · locks` | direct control; **Ctrl+Alt+H** halts everything; `/tmg kill <id>` and `@<id> halt` stop one agent |
+| `@<id>` | **mention** an agent: status, model, elapsed, tokens, task — and how to intervene. `@t2` alone mentions the tier and lists its agents |
+| `@t2b <ins>` | steer a running agent **in place** (the instruction is injected into the live run; nothing is killed or respawned). `@t2b: <ins>` / `@t2b, <ins>` also work |
+| `@t2b kill` | stop only that agent (`halt`/`stop` are aliases). `@t2b compact` frees its context (a one-shot sub-agent is restarted with a bounded progress digest) |
+| `/tmg launch · tell · kill · halt · list · switch · locks` | direct control; **Ctrl+Alt+H** halts everything; `/tmg kill <id>` and `@<id> kill` stop one agent. The compact widget (below the editor) lists agents **by id**, so they can always be named |
 | `/tmg dashboard` | cycle compact → full → off |
 | `/tmg guard` `/tmg models` | live state of limits and circuit breakers; `reset-guard` / `reset-models` clear them |
 | `/tmg enable · disable` | master switch |

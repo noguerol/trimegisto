@@ -29,17 +29,18 @@ function check(name: string, cond: boolean, detail?: unknown): void {
 
 console.log("Parser (@tier[letter] + verb):");
 {
-  const halt = parseAgentCommand("@t2b halt");
-  check("@t2b halt -> halt", halt?.verb === "halt" && halt.agentId === "t2b" && halt.tier === "t2", halt);
-  check("@t2b halt has no instruction text", halt?.text === "", halt?.text);
+  const halt = parseAgentCommand("@t2b kill");
+  check("@t2b kill -> halt", halt?.verb === "halt" && halt.agentId === "t2b" && halt.tier === "t2", halt);
+  check("@t2b kill has no instruction text", halt?.text === "", halt?.text);
 
-  check("verb is case-insensitive", parseAgentCommand("@t2b HALT")?.verb === "halt");
-  check("kill maps to halt", parseAgentCommand("/t2b kill")?.verb === "halt");
-  check("stop maps to halt", parseAgentCommand("@t2b stop")?.verb === "halt");
+  check("verb is case-insensitive", parseAgentCommand("@t2b KILL")?.verb === "halt");
+  check("halt is still an alias", parseAgentCommand("@t2b halt")?.verb === "halt");
+  check("stop maps to halt", parseAgentCommand("/t2b stop")?.verb === "halt");
+  check("trailing punctuation does not turn kill into a steer", parseAgentCommand("@t2b kill.")?.verb === "halt" && parseAgentCommand("@t2b kill!")?.verb === "halt");
   check("compact maps to compact", parseAgentCommand("@t2b compact")?.verb === "compact");
   check("compaction maps to compact", parseAgentCommand("/t2b compaction")?.verb === "compact");
 
-  const active = parseAgentCommand("@t0a halt");
+  const active = parseAgentCommand("@t0a kill");
   check("@t0a collapses to the active tier", active?.tier === "active" && active.agentId === "t0a", active);
 
   const steer = parseAgentCommand("@t2b rewrite the parser to reject NaN");
@@ -64,10 +65,29 @@ console.log("Parser (@tier[letter] + verb):");
   check("`compact the logs` is a steer", parseAgentCommand("@t2b compact the logs")?.verb === "steer");
   check("`@t2b kill-9 the process` is a steer", parseAgentCommand("@t2b kill-9 the process")?.verb === "steer");
 
-  check("empty body is not a command", parseAgentCommand("@t2b ") === null);
+  // MENTION: `@name` alone names the agent instead of being ignored.
+  const mention = parseAgentCommand("@t2b");
+  check("@t2b alone -> mention", mention?.verb === "mention" && mention.agentId === "t2b" && mention.text === "", mention);
+  check("trailing space still mentions", parseAgentCommand("@t2b ")?.verb === "mention");
+  check("UPPERCASE id mentions", parseAgentCommand("@T2B")?.verb === "mention" && parseAgentCommand("@T2B")?.agentId === "t2b");
+  check("a bare tier alone mentions the tier", parseAgentCommand("@t2")?.verb === "mention" && parseAgentCommand("@t2")?.agentId === null);
+  check("@t0 alone mentions the active tier", parseAgentCommand("@t0")?.tier === "active" && parseAgentCommand("@t0")?.verb === "mention");
+
+  // Tolerant separators: "@t2b: fix it" must steer with "fix it", not ": fix it".
+  const colon = parseAgentCommand("@t2b: fix it");
+  check("colon separator is not part of the instruction", colon?.verb === "steer" && colon.text === "fix it", colon);
+  const comma = parseAgentCommand("@t2b, fix it");
+  check("comma separator is not part of the instruction", comma?.verb === "steer" && comma.text === "fix it", comma);
+  const dash = parseAgentCommand("@t2b \u2014 fix it");
+  check("em dash separator is not part of the instruction", dash?.verb === "steer" && dash.text === "fix it", dash);
+  const slur = parseAgentCommand("@t2bdo this");
+  check("an id needs a separator before the body", slur === null, slur);
+
   check("unknown tier is not a command", parseAgentCommand("@t5 do x") === null);
   check("plain text is not a command", parseAgentCommand("hello world") === null);
   check("email-ish text is not a command", parseAgentCommand("mail me at a@t2b.com") === null);
+  check("a glued domain is not agent t2b", parseAgentCommand("@t2b.com") === null);
+  check("a bare @ is not a command", parseAgentCommand("@") === null);
 }
 
 console.log("Mailbox (write / drain / clear):");

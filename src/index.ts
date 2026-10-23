@@ -67,7 +67,7 @@ import {
 } from "./ledger.ts";
 import { readNotesSnapshot } from "./shared-context.ts";
 import { planBatch, type PlanNode, type PlanTaskInput } from "./plan-graph.ts";
-import { parseAgentCommand, writeAgentControl, type AgentCommand } from "./agent-control.ts";
+import { parseAgentCommand, writeAgentControl } from "./agent-control.ts";
 import { advanceWaves } from "./wave-scheduler.ts";
 import { LoopSupervisor, type LoopAlert } from "./loop-supervisor.ts";
 import { ModelHealth, sanitizeModelHealthConfig, MODEL_HEALTH_DEFAULTS } from "./model-health.ts";
@@ -1049,73 +1049,15 @@ export default function (pi: ExtensionAPI) {
     return launchAgent(tier, task, tierConfig, cwd, parentId, modelOverride, config.redundantAgents, sequential === true && freshContext === true);
   }
 
-  // ── @tier[letter] / /tier[letter] interception ─────────
-  // ONE handler for both prefixes, parsed by the pure `parseAgentCommand`:
-  //   @t2 <task>          -> spawn a new T2 agent (a bare tier has no target)
+  // ── `@tier[letter] [body]` / `/tier[letter] [body]` interception ─────────
+  // The chat interceptor and the `/@` command share ONE implementation
+  // (handleMentionCommand). Whatever the user types means the same thing in
+  // both paths — the old copy here drifted from the command one:
+  //   @t2b                -> mention: show t2b (status, model, tokens, task)
+  //   @t2 <task>          -> spawn a new T2 agent
   //   @t2b <instruction>  -> STEER the running t2b (never kill/respawn it)
-  //   @t2b halt           -> kill ONLY t2b
+  //   @t2b kill           -> kill ONLY t2b (halt/stop are aliases)
   //   @t2b compact        -> free t2b's context (restart with a progress digest)
-  // The old code killed the target and launched a new agent for a steer, which
-  // is the reported "it spawned a new agent instead of sending my instruction".
-  function dispatchAgentTarget(cmd: AgentCommand, ctx: any): void {
-    const targetId = cmd.agentId as string;
-
-    if (cmd.verb === "halt") {
-      const killed = killAgent(targetId);
-      ctx.ui.notify(
-        killed ? `Halted ${targetId}.` : `Agent ${targetId} not found or already stopped.`,
-        killed ? "info" : "warning",
-      );
-      return;
-    }
-
-    const existing = getAgent(targetId);
-    if (!existing) {
-      ctx.ui.notify(`Agent ${targetId} not found. Spawn one with @${targetId.slice(0, 2)} <task>.`, "error");
-      return;
-    }
-
-    if (existing.status !== "running" && existing.status !== "waiting") {
-      ctx.ui.notify(
-        `Agent ${targetId} is ${existing.status} — ${cmd.verb} only works while it runs. ` +
-        `Launch a new one with @${targetId.slice(0, 2)} <task>.`,
-        "warning",
-      );
-      return;
-    }
-
-    if (cmd.verb === "compact") {
-      // pi's manual compaction aborts the one-shot process before it finishes,
-      // so Trimegisto compacts by restarting the agent with a bounded digest of
-      // its progress. See compactAgent() in agent-manager.ts.
-      const replacement = compactAgent(
-        targetId,
-        { active: config.active, t1: config.t1, t2: config.t2, t3: config.t3 },
-        ctx.cwd,
-        config.spawnOnlyOnActive,
-        config.redundantAgents,
-      );
-      ctx.ui.notify(
-        replacement
-          ? `Compacted ${targetId} → relaunched as ${replacement.id} with a condensed context.`
-          : `Could not compact ${targetId}.`,
-        replacement ? "info" : "error",
-      );
-      return;
-    }
-
-    // steer
-    if (!instanceId) {
-      ctx.ui.notify("Trimegisto: control channel unavailable (no instance directory).", "error");
-      return;
-    }
-    const ok = writeAgentControl(getInstanceDir(), targetId, "steer", { text: cmd.text });
-    ctx.ui.notify(
-      ok ? `Steering ${targetId}: ${cmd.text.slice(0, 60)}` : `Could not reach ${targetId}.`,
-      ok ? "info" : "error",
-    );
-  }
-
   pi.on("input", async (event, ctx) => {
     if (!config.enabled) return { action: "continue" as const };
     const cmd = parseAgentCommand(event.text);
@@ -1124,25 +1066,9 @@ export default function (pi: ExtensionAPI) {
     // Echo the command to chat so it stays visible.
     safeSendMessage({ customType: "trimegisto-command", content: cmd.raw, display: true });
 
-    // Explicit agent id -> control an EXISTING agent (halt/compact/steer).
-    if (cmd.agentId) {
-      dispatchAgentTarget(cmd, ctx);
-      return { action: "handled" as const };
-    }
-
-    // Bare tier -> spawn a new agent.
-    if (cmd.tier !== "active" && !config[cmd.tier].model) {
-      ctx.ui.notify(`No model configured for ${formatTierLabel(cmd.tier)}. Use /tmg config.`, "error");
-      return { action: "handled" as const };
-    }
-    ctx.ui.notify(`Launching ${formatTierLabel(cmd.tier)} agent...`, "info");
-    const agent = doLaunch(cmd.tier, cmd.text, ctx.cwd);
-    if ("status" in agent && agent.status === "error") {
-      ctx.ui.notify(`${(agent as any).agentId} failed: ${agent.stderr.slice(0, 100)}`, "error");
-    } else {
-      const a = agent as AgentInstance;
-      ctx.ui.notify(`${a.id} [${formatTierLabel(cmd.tier)}] launched`, "info");
-    }
+    // Hand the raw text (without its `@`/`/`) to the shared mention handler.
+    const { handleMentionCommand } = await import("./commands.ts");
+    await handleMentionCommand(cmd.raw.replace(/^[@/]\s*/, ""), ctx, commandRuntime());
     return { action: "handled" as const };
   });
   // ── Auto-spawning logic ────────────────────────────────
@@ -1920,6 +1846,7 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
     },
     haltAll,
     haltAgent: (agentId: string) => killAgent(agentId),
+    tierStatusLine: (tier: AgentTier) => tierStatusLine(tier),
     steerAgent: (agentId: string, text: string) => {
       if (!instanceId) return false;
       return writeAgentControl(getInstanceDir(), agentId, "steer", { text });

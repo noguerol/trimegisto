@@ -4,6 +4,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getAgents, killAgent, haltAll as haltAllAgents, getAgent, getLoopSupervisor, getModelHealth } from "./agent-manager.ts";
 import { getActiveLocks } from "./file-lock.ts";
 import { parseAgentCommand } from "./agent-control.ts";
+import { formatAgentMention, formatTierMention, MENTION_USAGE } from "./mention.ts";
 import { displayTaskOf } from "./task-display.ts";
 import { formatTierLabel } from "./config.ts";
 import type { AgentTier, TierConfig } from "./types.ts";
@@ -21,6 +22,8 @@ export interface CommandRuntime {
   steerAgent?: (agentId: string, text: string) => boolean;
   /** Compact a running agent's context (restarts it with a bounded digest). */
   compactAgent?: (agentId: string) => any | null;
+  /** Live tier line (availability, model, cap) for a bare `@t2` mention. */
+  tierStatusLine?: (tier: AgentTier) => string;
   toggleDashboard?: () => void;
   openConfig?: (ctx: any) => void | Promise<void>;
   /** Persisted guard config (what the UI edits) — used to spot a live/disk divergence. */
@@ -257,7 +260,7 @@ export async function handleTmgCommand(pi: ExtensionAPI, args: string | undefine
         "  /tmg dashboard | locks | guard | reset-guard [tier]\n" +
         "  /tmg models | reset-models [model]\n" +
         "  /tmg enable | disable\n" +
-        "  @t2b <instruction> | @t2b halt | @t2b compact | @t2 <task>",
+        MENTION_USAGE,
         "info",
       );
   }
@@ -274,27 +277,65 @@ export async function handleTierCommand(tier: AgentTier, cmd: string, args: stri
 
 export async function handleMentionCommand(args: string | undefined, ctx: any, rt: CommandRuntime): Promise<void> {
   if (!enabled(rt, ctx)) return;
+  // ONE parser for every `@…`/`/…` mention, shared with the chat input
+  // interceptor: whatever the user types means the same thing in both paths.
   const cmd = parseAgentCommand(`@${(args || "").trim()}`);
-  if (!cmd) {
-    return ctx.ui.notify("Usage: @<agent-id> <instruction>\nExamples: @t2b parse logs | @t2b halt | @t2b compact | @t2 <task>", "error");
+  if (!cmd) return ctx.ui.notify(MENTION_USAGE, "error");
+
+  const cwd = ctx?.cwd || rt.cwd;
+  const spawnPrefix = (tier: AgentTier) => (tier === "active" ? "t0" : tier);
+
+  // ── mention: look, never change ────────────────────────
+  if (cmd.verb === "mention") {
+    if (cmd.agentId) {
+      const agent = getAgent(cmd.agentId);
+      if (!agent) {
+        return ctx.ui.notify(
+          `Agent ${cmd.agentId} not found (nothing to mention). Launch one with @${spawnPrefix(cmd.tier)} <task>.`,
+          "warning",
+        );
+      }
+      ctx.ui.notify(formatAgentMention(agent, { tierLabel: formatTierLabel }), "info");
+      return;
+    }
+    // Bare tier (`@t2`): the tier itself, its agents, and the launch hint.
+    const tierAgents = [...getAgents().values()]
+      .filter(a => a.tier === cmd.tier)
+      .sort((a, b) => b.startedAt - a.startedAt);
+    ctx.ui.notify(
+      formatTierMention(formatTierLabel(cmd.tier), tierAgents, {
+        statusLine: rt.tierStatusLine?.(cmd.tier),
+        spawnId: spawnPrefix(cmd.tier),
+      }),
+      "info",
+    );
+    return;
   }
 
-  // Bare tier: no target to steer, so spawn a new agent.
+  // ── kill: stop ONLY that agent ─────────────────────────
+  if (cmd.verb === "halt") {
+    const targetId = cmd.agentId as string;
+    const killed = rt.haltAgent ? rt.haltAgent(targetId) : killAgent(targetId);
+    ctx.ui.notify(killed ? `Killed ${targetId}.` : `Agent ${targetId} not found or already stopped.`, killed ? "info" : "warning");
+    return;
+  }
+
+  // ── bare tier + task: launch a new agent ───────────────
   if (!cmd.agentId) {
     ctx.ui.notify(`Launching ${formatTierLabel(cmd.tier)}...`, "info");
-    const newAgent = await rt.launchFn(cmd.tier, cmd.text, rt.cwd);
-    ctx.ui.notify(`${agentName(newAgent)} launched: ${cmd.text.slice(0, 60)}`, newAgent?.status === "error" ? "error" : "info");
+    const newAgent = await rt.launchFn(cmd.tier, cmd.text, cwd);
+    const failed = newAgent?.status === "error";
+    ctx.ui.notify(
+      failed
+        ? `${agentName(newAgent)} failed: ${String(newAgent?.stderr || "").slice(0, 120)}`
+        : `${agentName(newAgent)} [${formatTierLabel(cmd.tier)}] launched: ${cmd.text.slice(0, 60)}`,
+      failed ? "error" : "info",
+    );
     return;
   }
 
+  // ── steer / compact: need a LIVE target ────────────────
   const targetId = cmd.agentId;
-
-  if (cmd.verb === "halt") {
-    const killed = rt.haltAgent ? rt.haltAgent(targetId) : killAgent(targetId);
-    ctx.ui.notify(killed ? `Halted ${targetId}.` : `Agent ${targetId} not found or already stopped.`, killed ? "info" : "warning");
-    return;
-  }
-
   const agent = getAgent(targetId);
   if (!agent) return ctx.ui.notify(`Agent ${targetId} not found. Spawn one with @${targetId.slice(0, 2)} <task>.`, "error");
 
@@ -311,7 +352,13 @@ export async function handleMentionCommand(args: string | undefined, ctx: any, r
   }
 
   if (agent.status !== "running" && agent.status !== "waiting") {
-    return ctx.ui.notify(`Agent ${targetId} is ${agent.status} — steer only works while it runs. Launch a new one with @${targetId.slice(0, 2)} <task>.`, "warning");
+    // A finished agent cannot be steered: show what it produced and how to
+    // launch the follow-up, instead of a bare refusal.
+    return ctx.ui.notify(
+      `Agent ${targetId} is ${agent.status} — nothing left to steer.\n` +
+      formatAgentMention(agent, { tierLabel: formatTierLabel }),
+      "warning",
+    );
   }
   const steered = rt.steerAgent?.(targetId, cmd.text) ?? false;
   ctx.ui.notify(steered ? `Steering ${targetId}: ${cmd.text.slice(0, 60)}` : `Could not reach ${targetId}.`, steered ? "info" : "error");
