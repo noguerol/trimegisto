@@ -14,6 +14,7 @@
 
 import { shouldDriveDashboardRender } from "../src/tui-refresh.ts";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { readFileSync, readdirSync } from "node:fs";
 
 let passed = 0;
 let failed = 0;
@@ -64,6 +65,23 @@ console.log("metric line: padded to a constant width so digits never shift the l
   }
   check("overlong lines still truncate to exactly the width",
     visibleWidth(truncateToWidth("x".repeat(200), width, "\u2026", true)) === width);
+}
+
+console.log("footer ownership: the shared footer slot is never touched:");
+{
+  // pi's footer is a SINGLE shared slot. Trimegisto renders its dashboard as a
+  // widget and never installs a footer, so it must not call ui.setFooter() at
+  // all: `setFooter(undefined)` clears the slot and erases whatever another
+  // extension put there (@narumitw/pi-statusline being the usual victim). This
+  // regressed twice, so it is pinned as a source-level policy. If trimegisto
+  // ever genuinely needs a footer, record ownership and clear only its own.
+  const srcDir = new URL("../src/", import.meta.url);
+  const offenders: string[] = [];
+  for (const entry of readdirSync(srcDir, { recursive: true, encoding: "utf8" })) {
+    if (!entry.endsWith(".ts")) continue;
+    if (/\.setFooter\s*\(/.test(readFileSync(new URL(entry, srcDir), "utf8"))) offenders.push(entry);
+  }
+  check("no src/**.ts calls ui.setFooter()", offenders.length === 0, offenders);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -1837,7 +1837,10 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
         haltAll();
         try {
           if (ctxRef) {
-            ctxRef.ui.setFooter(undefined);
+            // No setFooter(undefined): trimegisto installs its dashboard as a
+            // widget and never owns the footer slot. Clearing it would only
+            // erase another extension's footer (e.g. @narumitw/pi-statusline)
+            // on the shared slot.
             ctxRef.ui.setWidget("trimegisto", undefined);
             ctxRef.ui.setWidget("trimegisto-compact", undefined);
             ctxRef.ui.setStatus("trimegisto", formatTmgStatus(false));
@@ -2064,7 +2067,8 @@ let contextPruneImport: Promise<typeof import("./context-prune.ts")> | null = nu
       updateDashboard();
       ctx.ui.setStatus("trimegisto", formatTmgStatus(true));
     } else {
-      ctx.ui.setFooter(undefined);
+      // Same rule on session restore: we never set a footer, so never clear
+      // the shared footer slot — it may belong to another extension.
       ctx.ui.setWidget("trimegisto", undefined);
       ctx.ui.setWidget("trimegisto-compact", undefined);
       ctx.ui.setStatus("trimegisto", formatTmgStatus(false));

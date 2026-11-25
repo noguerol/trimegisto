@@ -181,7 +181,8 @@ export async function runConfigUI(ctx: any, rt: ConfigUIRuntime): Promise<void> 
         } else {
           rt.haltAll();
           try {
-            rt.ctxRef?.ui.setFooter(undefined);
+            // No setFooter(undefined): trimegisto never installs a footer, and
+            // the slot is shared — clearing it erases another extension's.
             rt.ctxRef?.ui.setWidget("trimegisto", undefined);
             rt.ctxRef?.ui.setWidget("trimegisto-compact", undefined);
             rt.ctxRef?.ui.setStatus("trimegisto", formatTmgStatus(false));
