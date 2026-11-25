@@ -83,6 +83,8 @@ console.log("isMutatingBashCommand: allowlist-first, unknown defaults to mutatin
     ["find . -delete", "find -delete"],
     ["patch < p.diff", "patch"],
     ["curl -o f http://x", "curl -o"],
+    ["cat x > real.txt", "cat redirect to real file"],
+    ["echo hi | tee f", "tee pipe"],
     ["tee /etc/hosts", "tee"],
     ["dd if=/dev/zero of=f", "dd"],
     ["git push", "git push"],
@@ -90,6 +92,7 @@ console.log("isMutatingBashCommand: allowlist-first, unknown defaults to mutatin
   for (const [cmd, label] of mutating) check(`mutating: ${label}`, isMutatingBashCommand(cmd) === true, cmd);
 
   const readOnly = [
+    ["grep -ril foo /c/tmp 2>/dev/null", "grep with null redirect"],
     ["rg foo", "rg"],
     ["grep -rn bar src", "grep"],
     ["git diff", "git diff"],

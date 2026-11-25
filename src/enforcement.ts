@@ -156,6 +156,11 @@ export function shouldRequireDelegation(input: GateDecisionInput): boolean {
 
 /** Output redirection `>` / `>>`, ignoring `=>`, `->` and fd redirection `>&`. */
 const REDIRECT_RE = /(?:^|[^-=<>])>{1,2}(?![=&])/;
+
+/** Redirections to the null device (`/dev/null`, Windows `NUL`) discard
+ * output and cannot mutate the workspace — strip them before the redirect
+ * check so `grep -x 2>/dev/null` stays read-only. */
+const NULL_REDIRECT_RE = /(?:^|[\s;|&\d])>{1,2}\s*(?:\/dev\/null|nul)\b/gi;
 /** Heredoc. */
 const HEREDOC_RE = /<</;
 /** `tee <file>` writes through a pipe to a file. */
@@ -270,7 +275,8 @@ export function isMutatingBashCommand(command: string): boolean {
   const cmd = stripEnvAssignments(String(command ?? ""));
   if (cmd.length === 0) return false;
 
-  if (REDIRECT_RE.test(cmd)) return true;
+  const nullStripped = cmd.replace(NULL_REDIRECT_RE, " ");
+  if (REDIRECT_RE.test(nullStripped)) return true;
   if (HEREDOC_RE.test(cmd)) return true;
   if (TEE_RE.test(cmd)) return true;
   if (SED_INPLACE_RE.test(cmd)) return true;
