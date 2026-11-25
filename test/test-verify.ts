@@ -24,6 +24,7 @@ import {
   verificationBadge,
   waveHasPendingVerification,
   lightRedact,
+  resolveVerifyShell,
   runVerification,
   DEFAULT_VERIFY_TIMEOUT_MS,
   MAX_VERIFY_TIMEOUT_MS,
@@ -66,6 +67,31 @@ async function main(): Promise<void> {
   check("explicit arg beats env", verifyTimeoutMs(4_000) === 4_000);
   if (savedEnv === undefined) delete process.env.TRIMEGISTO_VERIFY_TIMEOUT_MS;
   else process.env.TRIMEGISTO_VERIFY_TIMEOUT_MS = savedEnv;
+
+  // ── resolveVerifyShell ──────────────────────────────────
+  console.log("\nresolveVerifyShell — win32 verify must not fall back to cmd.exe");
+  {
+    const cmd = "test -f package.json && echo OK";
+    const posix = resolveVerifyShell(cmd, "linux", {}, () => false);
+    check("posix: platform shell, command as-is",
+      posix.shell === true && posix.file === cmd && posix.args.length === 0);
+
+    const winDefault = resolveVerifyShell(cmd, "win32", {}, (p) => p === "C:/Program Files/Git/bin/bash.exe");
+    check("win32: default Git Bash path when it exists",
+      winDefault.shell === false && winDefault.file === "C:/Program Files/Git/bin/bash.exe");
+    check("win32: command passed to `bash -c`",
+      winDefault.args.length === 2 && winDefault.args[0] === "-c" && winDefault.args[1] === cmd);
+
+    const relocated = resolveVerifyShell(cmd, "win32", { ProgramFiles: "D:\\Tools" }, (p) => p === "D:/Tools/Git/bin/bash.exe");
+    check("win32: follows a relocated ProgramFiles", relocated.file === "D:/Tools/Git/bin/bash.exe", relocated.file);
+
+    const missing = resolveVerifyShell(cmd, "win32", {}, () => false);
+    check("win32: no Git Bash → bash on PATH (MSYS2/Cygwin/scoop)", missing.file === "bash");
+
+    const override = resolveVerifyShell(cmd, "win32", { TRIMEGISTO_VERIFY_SHELL: "C:/msys64/usr/bin/bash.exe" }, () => false);
+    check("win32: TRIMEGISTO_VERIFY_SHELL wins over discovery", override.file === "C:/msys64/usr/bin/bash.exe");
+    check("win32: blank override is ignored", resolveVerifyShell(cmd, "win32", { TRIMEGISTO_VERIFY_SHELL: "   " }, () => false).file === "bash");
+  }
 
   // ── truncateVerifyOutput ────────────────────────────────
   console.log("\ntruncateVerifyOutput");

@@ -85,6 +85,8 @@ console.log("isMutatingBashCommand: allowlist-first, unknown defaults to mutatin
     ["curl -o f http://x", "curl -o"],
     ["cat x > real.txt", "cat redirect to real file"],
     ["echo hi | tee f", "tee pipe"],
+    ["rm -rf build >/dev/null", "null redirect must not hide a mutation"],
+    ["echo hi >/dev/nullish", "only the real null device is exempt"],
     ["tee /etc/hosts", "tee"],
     ["dd if=/dev/zero of=f", "dd"],
     ["git push", "git push"],
@@ -93,6 +95,9 @@ console.log("isMutatingBashCommand: allowlist-first, unknown defaults to mutatin
 
   const readOnly = [
     ["grep -ril foo /c/tmp 2>/dev/null", "grep with null redirect"],
+    ["grep -rn x . >/dev/null", "stdout discarded to /dev/null"],
+    ["command -v pi >/dev/null 2>&1", "probe with both streams discarded"],
+    ["test -f package.json 1>/dev/null", "explicit fd 1 to /dev/null"],
     ["rg foo", "rg"],
     ["grep -rn bar src", "grep"],
     ["git diff", "git diff"],

@@ -21,18 +21,44 @@
  * `ran: false` result, never an exception that could take the host down.
  */
 
+import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 
-/** On Windows, `shell: true` means cmd.exe; route verify through Git Bash so
- * POSIX verify commands (test -f, /c/ paths, &&) work as the coordinator writes them.
- * Override the shell path with TRIMEGISTO_VERIFY_SHELL. */
+/** Git for Windows' default install location, honouring a relocated ProgramFiles. */
+function defaultGitBash(env: NodeJS.ProcessEnv): string {
+  const base = (env.ProgramFiles ?? env.PROGRAMFILES ?? "C:/Program Files")
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
+  return `${base}/Git/bin/bash.exe`;
+}
+
+/**
+ * Decide how to run a verify command. POSIX keeps the platform shell
+ * (`shell: true`). On Windows `shell: true` means cmd.exe, which cannot run the
+ * POSIX one-liners a coordinator writes (`test -f`, `/c/...`, `&&`), so the
+ * command goes through Git Bash instead — the same shell the pi Bash tool uses
+ * on those hosts. `TRIMEGISTO_VERIFY_SHELL` overrides the bash binary; without
+ * Git for Windows the fallback is `bash` on PATH (MSYS2/Cygwin/scoop).
+ *
+ * Exported (and injectable) so the platform branches are unit-tested on CI
+ * machines that are not Windows.
+ */
+export function resolveVerifyShell(
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+  exists: (p: string) => boolean = existsSync,
+): { file: string; args: string[]; shell: boolean } {
+  if (platform !== "win32") return { file: command, args: [], shell: true };
+  const override = String(env.TRIMEGISTO_VERIFY_SHELL ?? "").trim();
+  if (override) return { file: override, args: ["-c", command], shell: false };
+  const gitBash = defaultGitBash(env);
+  return { file: exists(gitBash) ? gitBash : "bash", args: ["-c", command], shell: false };
+}
+
 function verifySpawn(command: string, cwd: string, env: NodeJS.ProcessEnv) {
-  if (process.platform !== "win32") {
-    return spawn(command, { cwd, shell: true, stdio: ["ignore", "pipe", "pipe"] as const, env });
-  }
-  const bash = process.env.TRIMEGISTO_VERIFY_SHELL
-    || "C:/Program Files/Git/bin/bash.exe";
-  return spawn(bash, ["-c", command], { cwd, stdio: ["ignore", "pipe", "pipe"] as const, env });
+  const { file, args, shell } = resolveVerifyShell(command, process.platform, env);
+  return spawn(file, args, { cwd, shell, stdio: ["ignore", "pipe", "pipe"] as const, env });
 }
 
 /**
@@ -202,7 +228,7 @@ export function runVerification(
         env,
       );
     } catch (err) {
-      resolve({ ...base, error: errMessage(err), durationMs: Math.max(0, Date.now() - startedAt) });
+      resolve({ ...base, error: verifyErrorHint(err), durationMs: Math.max(0, Date.now() - startedAt) });
       return;
     }
 
@@ -223,7 +249,7 @@ export function runVerification(
       if (typeof (timer as any)?.unref === "function") (timer as any).unref();
     }, timeoutMs);
 
-    child.on("error", (err) => finish({ ran: false, error: errMessage(err) }));
+    child.on("error", (err) => finish({ ran: false, error: verifyErrorHint(err) }));
     child.on("close", (code, signal) => {
       const timedOut = !settled && Date.now() - startedAt >= timeoutMs;
       finish({
@@ -240,6 +266,14 @@ export function runVerification(
 function errMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   return String(err ?? "unknown error");
+}
+
+/** A missing shell is the one Windows verify failure the user can fix, so name
+ * the knob instead of reporting a bare ENOENT from spawn. */
+function verifyErrorHint(err: unknown): string {
+  const msg = errMessage(err);
+  if (process.platform !== "win32" || !/ENOENT|not found/i.test(msg)) return msg;
+  return `${msg} — install Git for Windows or point TRIMEGISTO_VERIFY_SHELL at bash.exe`;
 }
 
 function oneLine(s: string, max: number): string {
